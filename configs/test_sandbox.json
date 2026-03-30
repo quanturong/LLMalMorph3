@@ -1,0 +1,53 @@
+{
+  "runtime": {
+    "max_wait_s": 3600,
+    "status_interval_s": 15,
+    "sandbox_timeout_s": 900,
+    "quiet_console": false
+  },
+  "broker": {
+    "mode": "memory",
+    "redis_url": "redis://localhost:6379/0"
+  },
+  "storage": {
+    "db_path": "state_test_{timestamp}.db",
+    "artifact_dir": "artifacts_test_{timestamp}",
+    "report_dir": "reports_test_{timestamp}",
+    "work_dir": "work_test_{timestamp}"
+  },
+  "logging": {
+    "level": "INFO"
+  },
+  "sandbox": {
+    "cape_base_url": "http://192.168.1.12:8000",
+    "cape_api_token": ""
+  },
+  "llm": {
+    "enabled": true,
+    "mode": "runpod",
+    "cloud_provider": "runpod",
+    "cloud_model": "qwen2.5:32b",
+    "cache_ttl_s": 3600
+  },
+  "mutation": {
+    "num_functions_per_project": 1,
+    "default_strategy": "strat_0",
+    "retry_attempts": 3,
+    "max_feedback_loops": 2
+  },
+  "samples": [
+    {
+      "sample_id": "pos_test",
+      "project_name": "POSGrabber_Test",
+      "source_path": "samples/experiment_samples/extracted/samples/experiment_samples/trojan_posgrabber/Trojan-Banker.Win32.Dexter_EXPERIMENT/Dexter",
+      "language": "c",
+      "sandbox_backend": "cape",
+      "priority": 5,
+      "requested_strategies": ["strat_0"],
+      "num_functions": 1,
+      "metadata": {
+        "profile": "test_sandbox"
+      }
+    }
+  ]
+}

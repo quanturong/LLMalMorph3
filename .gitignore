@@ -1,0 +1,97 @@
+# API Keys and sensitive data
+*.key
+*.pem
+.env
+.env.local
+.env.*
+!.env.example
+config.json
+secrets.json
+*secret*
+*password*
+original_executables/
+# Logs
+*.log
+logs/
+llmalmorph.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output directories
+samples/
+output/
+example_output/
+selected_samples/*/llm_generated/
+*.txt
+!requirements.txt
+project_mutation_output/
+reports/
+llm_logs/
+configs/generated_batches/
+configs/generated_patches/
+# Runtime output & work directories
+artifacts/
+artifacts_*/
+batch_compile_output/
+production_runs/
+test_results/
+work_*/
+# SQLite state databases
+*.db
+# Pytest cache
+.pytest_cache/
+# Tree-sitter builds
+build/my-languages.so
+tree-sitter-c/
+tree-sitter-cpp/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Notebooks with sensitive data (API keys)
+# Uncomment dòng sau nếu llmalmorph.ipynb chứa API key thật và không muốn commit
+llmalmorph.ipynb
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+

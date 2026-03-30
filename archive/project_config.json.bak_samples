@@ -1,0 +1,105 @@
+{
+    "environment":  {
+                        "project_root":  "E:\\LLMalMorph2",
+                        "output_dir":  "E:\\LLMalMorph2\\project_mutation_output",
+                        "api_key_env":  "MISTRAL_API_KEY"
+                    },
+    "project_detection":  {
+                              "base_directory":  "E:\\LLMalMorph2\\samples\\experiment_samples\\extracted\\samples\\experiment_samples",
+                              "min_files_for_project":  2,
+                              "recursive_search":  true,
+                              "filters":  {
+                                              "language":  null,
+                                              "min_files":  2,
+                                              "max_files":  50
+                                          }
+                          },
+    "mutation":  {
+                     "num_functions_per_project":  5,
+                     "function_selection_strategy":  "largest",
+                     "strategy":  "strat_1",
+                     "llm_model":  "codestral-2508",
+                     "trials":  1,
+                     "batch_mutations":  false,
+                     "preserve_signatures":  true,
+                     "preserve_entry_points":  true,
+                     "preserve_system_includes":  true,
+                     "preserve_critical_functions":  true,
+                     "filter_unsafe_candidates":  true,
+                     "use_hybrid_llm":  true,
+                     "hybrid_mode":  "hybrid",
+                     "hybrid_local_model":  "qwen2.5-coder:7b-instruct-q4_K_M",
+                     "hybrid_cloud_file_size_limit":  15000
+                 },
+    "compilation":  {
+                        "enabled":  true,
+                        "compiler":  "auto",
+                        "optimization":  "O2",
+                        "static_linking":  true,
+                        "strip_symbols":  true,
+                        "compile_variants":  true,
+                        "compile_timeout":  300,
+                        "auto_fix":  true,
+                        "max_fix_attempts":  10,
+                        "use_llm_fixer":  true,
+                        "llm_fixer_max_code_length":  50000,
+                        "permissive_mode":  true,
+                        "pre_validate":  true,
+                        "auto_generate_headers":  true,
+                        "use_enhanced_categorization":  true,
+                        "use_project_context":  true,
+                        "protect_headers":  true,
+                        "inject_forward_declarations":  true,
+                        "apply_compiler_compatibility":  true,
+                        "validate_llm_fixes":  true,
+                        "use_hybrid_llm":  true,
+                        "hybrid_mode":  "hybrid",
+                        "hybrid_local_model":  "qwen2.5-coder:7b-instruct-q4_K_M",
+                        "hybrid_cloud_file_size_limit":  15000,
+                        "use_mahoraga":  true,
+                        "mahoraga_memory_file":  "mahoraga_fix_memory.json"
+                    },
+    "output":  {
+                   "save_variants":  true,
+                   "save_parse_results":  true,
+                   "save_mutation_results":  true,
+                   "save_compilation_results":  true,
+                   "export_formats":  [
+                                          "json"
+                                      ]
+               },
+    "logging":  {
+                    "level":  "INFO",
+                    "file":  "project_based_pipeline.log",
+                    "console":  true
+                },
+    "_comments":  {
+                      "function_selection_strategy":  "Options: \u0027largest\u0027, \u0027random\u0027, \u0027all\u0027",
+                      "strategy":  "strat_1 = Code Obfuscation",
+                      "optimization":  "Options: O0, O1, O2, O3, Os",
+                      "language_filter":  "Options: null, \u0027c\u0027, \u0027cpp\u0027",
+                      "auto_fix":  "Enable automatic error fixing when compilation fails",
+                      "max_fix_attempts":  "Maximum number of fix attempts (INCREASED from 5 to 10 for better success rate)",
+                      "use_llm_fixer":  "Use LLM-powered fixer (true) or simple pattern-based fixer (false)",
+                      "llm_fixer_max_code_length":  "Maximum source code length in characters for LLM fixer (default: 50000). Files larger than this will use pattern-based fixer",
+                      "permissive_mode":  "Try permissive compilation flags on first failure",
+                      "pre_validate":  "Run validation checks before compilation (checks for duplicate symbols, missing entry points, system redefinitions)",
+                      "auto_generate_headers":  "Automatically generate project-wide header with all declarations",
+                      "use_enhanced_categorization":  "Use enhanced error categorization to separate syntax vs linker errors",
+                      "use_project_context":  "Provide LLM fixer with project-wide context (functions, types, dependencies)",
+                      "protect_headers":  "NEW: Use protected mode when fixing header files (only add includes/declarations, never modify existing code)",
+                      "inject_forward_declarations":  "NEW: Automatically inject forward declarations for missing symbols",
+                      "apply_compiler_compatibility":  "NEW: Apply GCC/MinGW compatibility fixes (wrap MSVC SEH, fix wide strings, etc.)",
+                      "validate_llm_fixes":  "NEW: Validate LLM-generated fixes before applying (check for syntax errors, invalid characters, etc.)",
+                      "use_hybrid_llm":  "HYBRID MODE: Use local Ollama for simple cases, Mistral API for complex cases (saves cost)",
+                      "hybrid_local_model":  "Local Ollama model name (e.g., qwen2.5-coder:7b-instruct-q4_K_M for RTX 4050)",
+                      "hybrid_cloud_file_size_limit":  "Max file size (chars) for using cloud API. Files BELOW this use cloud (fast), ABOVE use local (cost-effective)",
+                      "use_mahoraga":  "MAHORAGA MODE: Enable adaptive auto-fixer that learns from successful LLM fixes and replays them instantly on future encounters (saves API calls)",
+                      "mahoraga_memory_file":  "Path to JSON file where Mahoraga stores learned fix patterns (adaptation memory)",
+                      "preserve_signatures":  "Keep function signatures unchanged during mutation (only modify body)",
+                      "preserve_entry_points":  "Never mutate entry points (main, WinMain, DllMain)",
+                      "preserve_system_includes":  "Keep all system includes unchanged",
+                      "preserve_critical_functions":  "Don\u0027t mutate functions with critical prefixes or export markers",
+                      "filter_unsafe_candidates":  "Filter out cross-file referenced and exported functions from mutation"
+                  }
+}

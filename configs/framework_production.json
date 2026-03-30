@@ -1,0 +1,85 @@
+{
+  "runtime": {
+    "max_wait_s": 7200,
+    "status_interval_s": 30,
+    "sandbox_timeout_s": 1200,
+    "quiet_console": true
+  },
+  "broker": {
+    "mode": "memory",
+    "redis_url": "${REDIS_URL}"
+  },
+  "storage": {
+    "db_path": "project_mutation_output/state_prod_{timestamp}.db",
+    "artifact_dir": "project_mutation_output/artifacts_prod_{timestamp}",
+    "report_dir": "project_mutation_output/reports_prod_{timestamp}",
+    "work_dir": "project_mutation_output/work_prod_{timestamp}"
+  },
+  "logging": {
+    "level": "DEBUG"
+  },
+  "sandbox": {
+    "cape_base_url": "${CAPE_BASE_URL}",
+    "cape_api_token": "${CAPE_API_TOKEN}",
+    "virustotal_api_key": "${VIRUSTOTAL_API_KEY}",
+    "virustotal_api_url": "https://www.virustotal.com"
+  },
+  "llm": {
+    "enabled": true,
+    "mode": "hybrid",
+    "cloud_provider": "runpod",
+    "cloud_model": "qwen2.5:32b",
+    "cloud_base_url": "${RUNPOD_OPENAI_BASE_URL}",
+    "api_key": "${RUNPOD_API_KEY}",
+    "fallback_provider": "deepseek",
+    "fallback_model": "deepseek-chat",
+    "cache_ttl_s": 3600
+  },
+  "mutation": {
+    "num_functions_per_project": 3,
+    "default_strategy": "strat_0",
+    "retry_attempts": 5,
+    "max_feedback_loops": 3
+  },
+  "behavioral_equivalence": {
+    "enabled": true,
+    "compile_original": true,
+    "submit_original_to_sandbox": true,
+    "equivalence_thresholds": {
+      "equivalent": 0.85,
+      "mostly_equivalent": 0.65
+    },
+    "api_jaccard_weight": 0.50,
+    "ttp_preservation_weight": 0.25,
+    "resource_ops_weight": 0.15,
+    "detection_preservation_weight": 0.10
+  },
+  "samples": [
+    {
+      "sample_id": "prosto_prod",
+      "project_name": "prosto_stealer_source_code",
+      "source_path": "samples/experiment_samples/extracted/samples/experiment_samples/Prosto_Stealer/prosto_stealer_source_code",
+      "language": "cpp",
+      "sandbox_backend": "cape",
+      "priority": 5,
+      "requested_strategies": ["strat_0"],
+      "num_functions": 2,
+      "metadata": {
+        "profile": "production"
+      }
+    },
+    {
+      "sample_id": "pos_prod",
+      "project_name": "Trojan-Banker.Win32.Dexter_EXPERIMENT",
+      "source_path": "samples/experiment_samples/extracted/samples/experiment_samples/trojan_posgrabber/Trojan-Banker.Win32.Dexter_EXPERIMENT/Dexter",
+      "language": "c",
+      "sandbox_backend": "cape",
+      "priority": 5,
+      "requested_strategies": ["strat_0"],
+      "num_functions": 2,
+      "metadata": {
+        "profile": "production"
+      }
+    }
+  ]
+}
