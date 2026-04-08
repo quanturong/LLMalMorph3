@@ -31,7 +31,7 @@
   },
   "mutation": {
     "num_functions_per_project": 1,
-    "default_strategy": "strat_0",
+    "default_strategy": "strat_1",
     "retry_attempts": 3,
     "max_feedback_loops": 2
   },
@@ -43,7 +43,7 @@
       "language": "c",
       "sandbox_backend": "cape",
       "priority": 5,
-      "requested_strategies": ["strat_0"],
+      "requested_strategies": ["strat_1"],
       "num_functions": 1,
       "metadata": {
         "profile": "test_sandbox"

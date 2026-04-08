@@ -234,15 +234,16 @@ class CompilationValidator:
         issues = []
         
         # Common functions and their required headers
+        # Each value is (required_header, set_of_equivalent_headers)
         common_apis = {
-            'socket': 'winsock2.h',
-            'WSAStartup': 'winsock2.h',
-            'CreateFile': 'windows.h',
-            'CreateProcess': 'windows.h',
-            'RegOpenKey': 'windows.h',
-            'malloc': 'stdlib.h',
-            'printf': 'stdio.h',
-            'strlen': 'string.h',
+            'socket': ('winsock2.h', {'winsock.h', 'winsock2.h'}),
+            'WSAStartup': ('winsock2.h', {'winsock.h', 'winsock2.h'}),
+            'CreateFile': ('windows.h', {'windows.h'}),
+            'CreateProcess': ('windows.h', {'windows.h'}),
+            'RegOpenKey': ('windows.h', {'windows.h'}),
+            'malloc': ('stdlib.h', {'stdlib.h'}),
+            'printf': ('stdio.h', {'stdio.h'}),
+            'strlen': ('string.h', {'string.h'}),
         }
         
         for source_file in project.source_files:
@@ -255,9 +256,9 @@ class CompilationValidator:
                 include_set = set(includes)
                 
                 # Check for common API usage without includes
-                for api_func, required_header in common_apis.items():
+                for api_func, (required_header, equivalents) in common_apis.items():
                     if re.search(rf'\b{api_func}\s*\(', content):
-                        if required_header not in include_set:
+                        if not (include_set & equivalents):
                             issues.append(ValidationIssue(
                                 severity='warning',
                                 category='missing_include',

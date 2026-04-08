@@ -16,6 +16,7 @@ import json
 import re
 import sys
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -245,6 +246,7 @@ class BehaviorAnalysisAgent(BaseAgent):
                             verdict=equiv.verdict,
                             score=equiv.overall_equivalence_score,
                             api_jaccard=equiv.api_call_jaccard_similarity,
+                            api_sequence=equiv.api_call_sequence_similarity,
                         )
                     else:
                         log.warning("original_report_artifact_empty_skipping_equivalence")
@@ -390,6 +392,19 @@ def _normalize_cape_report(raw: dict) -> dict:
     # API call count
     total_calls = sum(len(p.get("calls", [])) for p in procs if isinstance(p, dict))
     normalized["api_call_count"] = total_calls
+
+    # API calls (ordered sequence from process call traces)
+    api_calls: List[dict] = []
+    for p in procs:
+        if not isinstance(p, dict):
+            continue
+        for call in p.get("calls", []):
+            if not isinstance(call, dict):
+                continue
+            api_name = call.get("api") or call.get("name") or call.get("call")
+            if api_name:
+                api_calls.append({"api": str(api_name)})
+    normalized["api_calls"] = api_calls
 
     # Registry operations
     reg_ops: List[dict] = []
@@ -605,6 +620,36 @@ def _extract_api_call_names(report: dict) -> List[str]:
     return sorted(calls)
 
 
+def _extract_api_call_sequence(report: dict) -> List[str]:
+    """Return ordered API call sequence from a sandbox report."""
+    sequence: List[str] = []
+
+    # Prefer flattened/normalized api_calls when present.
+    for entry in report.get("api_calls", []):
+        if isinstance(entry, dict):
+            name = entry.get("api", "") or entry.get("name", "") or entry.get("call", "")
+        else:
+            name = str(entry)
+        if name:
+            sequence.append(str(name))
+
+    # Fallback: raw CAPE behavior.processes[*].calls[*]
+    if not sequence:
+        behavior = report.get("behavior", {})
+        if isinstance(behavior, dict):
+            for proc in behavior.get("processes", []):
+                if not isinstance(proc, dict):
+                    continue
+                for call in proc.get("calls", []):
+                    if not isinstance(call, dict):
+                        continue
+                    name = call.get("api", "") or call.get("name", "") or call.get("call", "")
+                    if name:
+                        sequence.append(str(name))
+
+    return sequence
+
+
 def _extract_resource_names(report: dict, key: str, name_field: str) -> List[str]:
     """Extract unique resource names (registry/file/network) from a sandbox report."""
     items: set[str] = set()
@@ -627,6 +672,15 @@ def _jaccard(set_a: set, set_b: set) -> float:
     return len(set_a & set_b) / len(union)
 
 
+def _sequence_similarity(seq_a: List[str], seq_b: List[str]) -> float:
+    """Order-aware similarity ratio for API call sequences."""
+    if not seq_a and not seq_b:
+        return 1.0
+    if not seq_a or not seq_b:
+        return 0.0
+    return SequenceMatcher(a=seq_a, b=seq_b, autojunk=False).ratio()
+
+
 def _compute_behavioral_equivalence(
     job_id: str,
     sample_id: str,
@@ -644,6 +698,11 @@ def _compute_behavioral_equivalence(
     orig_apis = set(_extract_api_call_names(original_report))
     mut_apis = set(_extract_api_call_names(mutated_report))
     api_jaccard = _jaccard(orig_apis, mut_apis)
+    orig_api_seq = _extract_api_call_sequence(original_report)
+    mut_api_seq = _extract_api_call_sequence(mutated_report)
+    api_seq_similarity = _sequence_similarity(orig_api_seq, mut_api_seq)
+    # Blend set-based overlap and order-aware similarity.
+    api_similarity = (api_jaccard * 0.60) + (api_seq_similarity * 0.40)
 
     # ── Registry ──────────────────────────────────────────────────────────
     orig_regs = set(_extract_resource_names(original_report, "registry_operations", "key"))
@@ -678,7 +737,7 @@ def _compute_behavioral_equivalence(
         + _jaccard(orig_net, mut_net) * 0.2
     )
     overall = (
-        api_jaccard * 0.50
+        api_similarity * 0.50
         + ttp_preservation * 0.25
         + resource_sim * 0.15
         + sig_preservation * 0.10
@@ -701,6 +760,10 @@ def _compute_behavioral_equivalence(
         limitations.append("No API calls captured in original report; Jaccard may be underestimated")
     if not mut_apis:
         limitations.append("No API calls captured in mutated report; Jaccard may be underestimated")
+    if not orig_api_seq:
+        limitations.append("No API sequence captured in original report; sequence similarity may be underestimated")
+    if not mut_api_seq:
+        limitations.append("No API sequence captured in mutated report; sequence similarity may be underestimated")
     if not orig_ttps and not mut_ttps:
         limitations.append("No TTP mappings in either report; TTP preservation not measurable")
     if not original_report.get("network_operations"):
@@ -709,6 +772,7 @@ def _compute_behavioral_equivalence(
     summary = (
         f"Mutated variant shows {verdict.value} behavior relative to original "
         f"(overall score={overall:.2f}, API Jaccard={api_jaccard:.2f}, "
+        f"API sequence={api_seq_similarity:.2f}, "
         f"TTP preservation={ttp_preservation:.2f}). "
         + (
             f"API calls removed: {sorted(orig_apis - mut_apis)[:5]}. "
@@ -730,6 +794,7 @@ def _compute_behavioral_equivalence(
         api_calls_only_in_original=sorted(orig_apis - mut_apis),
         api_calls_only_in_mutated=sorted(mut_apis - orig_apis),
         api_call_jaccard_similarity=round(api_jaccard, 4),
+        api_call_sequence_similarity=round(api_seq_similarity, 4),
         registry_keys_only_in_original=sorted(orig_regs - mut_regs),
         registry_keys_only_in_mutated=sorted(mut_regs - orig_regs),
         file_paths_only_in_original=sorted(orig_files - mut_files),

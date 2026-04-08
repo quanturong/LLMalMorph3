@@ -54,7 +54,7 @@ class DeepSeekProvider(LLMProviderInterface):
                 {"role": "user",   "content": request.user_prompt},
             ],
             "temperature": request.temperature,
-            "max_tokens": request.max_tokens,
+            "max_tokens": min(request.max_tokens, 8192),
         }
         if request.response_format == "json_object":
             body["response_format"] = {"type": "json_object"}

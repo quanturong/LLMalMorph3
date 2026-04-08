@@ -201,6 +201,7 @@ class CoordinatorAgent(BaseAgent):
             mutation_strategy=strategy,
             requested_strategies=data.get("requested_strategies", []),
             num_functions=state.num_functions,
+            target_functions=state.target_functions,
         )
         await self._ctx.broker.publish(Topic.CMD_MUTATE, cmd)
         logger.info("dispatched_mutate", job_id=data["job_id"], strategy=strategy)
@@ -447,6 +448,7 @@ class CoordinatorAgent(BaseAgent):
                 mutation_strategy=strategy,
                 requested_strategies=state.requested_strategies,
                 num_functions=3,
+                target_functions=state.target_functions,
                 retry_count=state.mutation_cycle_count,
             )
             await self._ctx.broker.publish(Topic.CMD_MUTATE, cmd)

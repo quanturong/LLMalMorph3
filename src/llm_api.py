@@ -4,6 +4,7 @@ Provides error handling, retry mechanism, and logging.
 """
 
 import os
+import re
 import time
 import logging
 import requests
@@ -292,7 +293,7 @@ class OllamaProvider(LLMProvider):
                 },
             )
             elapsed = time.time() - start
-            content = resp["message"]["content"]
+            content = re.sub(r'<think>.*?</think>', '', resp["message"]["content"], flags=re.DOTALL).strip()
             logger.info(f"Ollama call successful. Model: {model}, Time: {elapsed:.2f}s")
             return content
         except Exception as e:
@@ -308,7 +309,7 @@ class OllamaProvider(LLMProvider):
                 options={"seed": seed},
             )
             elapsed = time.time() - start
-            content = resp["message"]["content"]
+            content = re.sub(r'<think>.*?</think>', '', resp["message"]["content"], flags=re.DOTALL).strip()
             logger.info(f"Ollama multi-turn call successful. Model: {model}, Time: {elapsed:.2f}s")
             return content
         except Exception as e:
@@ -348,10 +349,17 @@ class OpenAICompatibleProvider(LLMProvider):
     ) -> str:
         model = model or self.model
         timeout = timeout or self.timeout
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        # SaladCloud uses Salad-Api-Key header instead of Bearer token
+        if "salad.cloud" in self.base_url:
+            headers = {
+                "Salad-Api-Key": self.api_key,
+                "Content-Type": "application/json",
+            }
+        else:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
         data: Dict[str, Any] = {
             "model": model,
             "messages": [
@@ -375,7 +383,11 @@ class OpenAICompatibleProvider(LLMProvider):
             result = resp.json()
             if "choices" not in result or not result["choices"]:
                 raise LLMAPIRequestError("Invalid response from OpenAI-compatible API")
-            content = result["choices"][0]["message"]["content"]
+            msg = result["choices"][0]["message"]
+            content = re.sub(r'<think>.*?</think>', '', msg.get("content") or "", flags=re.DOTALL).strip()
+            # Ollama reasoning models return chain-of-thought in "reasoning" field
+            if not content and msg.get("reasoning"):
+                content = msg["reasoning"].strip()
             elapsed = time.time() - start
             logger.info(f"OpenAI-compat call OK. model={model}, time={elapsed:.1f}s")
             return content
@@ -409,19 +421,101 @@ class OpenAICompatibleProvider(LLMProvider):
 
 
 # =========================
+# Parallel Race Provider
+# =========================
+class RaceLLMProvider(LLMProvider):
+    """Fire identical requests to multiple providers in parallel; return the first success."""
+
+    def __init__(self, providers: list, label: str = "race"):
+        if not providers:
+            raise ValueError("RaceLLMProvider needs at least one provider")
+        self.providers = providers
+        self.label = label
+        self._win_counts: dict = {}  # track which provider wins most often
+        logger.info(f"RaceLLMProvider({label}): {len(providers)} contestants")
+
+    def generate(self, system_prompt: str, user_prompt: str, **kwargs) -> str:
+        return self._race("generate", system_prompt=system_prompt, user_prompt=user_prompt, **kwargs)
+
+    def generate_chat(self, messages: list, **kwargs) -> str:
+        return self._race("generate_chat", messages=messages, **kwargs)
+
+    def _race(self, method: str, **kwargs) -> str:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        cancel = threading.Event()
+
+        def _call(idx, provider):
+            if cancel.is_set():
+                return None
+            try:
+                fn = getattr(provider, method)
+                result = fn(**kwargs)
+                return (idx, result)
+            except NotImplementedError:
+                # generate_chat not supported → fall back to generate
+                if method == "generate_chat" and hasattr(provider, "generate"):
+                    msgs = kwargs.get("messages", [])
+                    sys_parts, usr_parts = [], []
+                    for m in msgs:
+                        (sys_parts if m.get("role") == "system" else usr_parts).append(m.get("content", ""))
+                    return (idx, provider.generate(
+                        system_prompt="\n".join(sys_parts),
+                        user_prompt="\n".join(usr_parts),
+                        **{k: v for k, v in kwargs.items() if k != "messages"},
+                    ))
+                return None
+            except Exception as e:
+                logger.warning(f"Race contestant {idx} failed: {e}")
+                return None
+
+        errors = []
+        with ThreadPoolExecutor(max_workers=len(self.providers)) as pool:
+            futures = {pool.submit(_call, i, p): i for i, p in enumerate(self.providers)}
+            for fut in as_completed(futures):
+                try:
+                    pair = fut.result()
+                    if pair is not None:
+                        idx, text = pair
+                        if text:
+                            cancel.set()  # signal others to stop
+                            winner = type(self.providers[idx]).__name__
+                            self._win_counts[idx] = self._win_counts.get(idx, 0) + 1
+                            logger.info(f"Race winner: contestant {idx} ({winner})")
+                            return text
+                except Exception as e:
+                    errors.append(e)
+
+        raise LLMAPIRequestError(
+            f"All {len(self.providers)} race contestants failed: "
+            + "; ".join(str(e) for e in errors[:3])
+        )
+
+
+# =========================
 # Factory
 # =========================
 def get_llm_provider(model_name: str, api_key: Optional[str] = None) -> LLMProvider:
     # Mistral models
     if model_name.startswith("codestral-") or model_name == "codestral-latest" or model_name.startswith("mistral-"):
         return MistralAPIProvider(api_key=api_key)
-    # DeepSeek models
-    if model_name.startswith("deepseek-"):
+    # DeepSeek models (API-only, not Ollama format like deepseek-r1:32b)
+    if model_name.startswith("deepseek-") and ":" not in model_name:
         return DeepSeekProvider(api_key=api_key)
     # RunPod / remote OpenAI-compatible endpoint (env var takes priority over local Ollama)
-    runpod_url = os.getenv("RUNPOD_BASE_URL") or os.getenv("OLLAMA_CLOUD_BASE_URL")
+    runpod_url = os.getenv("CLOUD_URL")
     if runpod_url:
         runpod_key = api_key or os.getenv("RUNPOD_API_KEY", "ollama")
+        # Check for secondary cloud URLs for parallel race
+        cloud_urls_raw = os.getenv("CLOUD_URLS", "")  # comma-separated
+        extra_urls = [u.strip().rstrip("/") for u in cloud_urls_raw.split(",") if u.strip()]
+        if extra_urls:
+            providers = [OpenAICompatibleProvider(base_url=runpod_url, api_key=runpod_key, model=model_name)]
+            for url in extra_urls:
+                # Each extra endpoint uses the same API key (SaladCloud)
+                providers.append(OpenAICompatibleProvider(base_url=url, api_key=runpod_key, model=model_name))
+            logger.info(f"Building RaceLLMProvider with {len(providers)} endpoints")
+            return RaceLLMProvider(providers, label="cloud_race")
         return OpenAICompatibleProvider(base_url=runpod_url, api_key=runpod_key, model=model_name)
     # Default: local Ollama
     return OllamaProvider(model=model_name)
@@ -485,7 +579,7 @@ class HybridLLMProvider:
             if resolved_type == "auto":
                 if cloud_model.startswith("deepseek-"):
                     resolved_type = "deepseek"
-                elif os.getenv("RUNPOD_BASE_URL") or os.getenv("OLLAMA_CLOUD_BASE_URL"):
+                elif os.getenv("CLOUD_URL"):
                     resolved_type = "runpod"
                 else:
                     resolved_type = "mistral"
@@ -495,7 +589,7 @@ class HybridLLMProvider:
                 self.cloud_provider = DeepSeekProvider(api_key=deepseek_key)
                 logger.info(f"☁️ Cloud provider: DeepSeek ({cloud_model})")
             elif resolved_type in ("runpod", "openai_compatible"):
-                runpod_url = os.getenv("RUNPOD_BASE_URL") or os.getenv("OLLAMA_CLOUD_BASE_URL", "")
+                runpod_url = os.getenv("CLOUD_URL", "")
                 runpod_key = api_key or os.getenv("RUNPOD_API_KEY", "ollama")
                 self.cloud_provider = OpenAICompatibleProvider(
                     base_url=runpod_url, api_key=runpod_key, model=cloud_model

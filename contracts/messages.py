@@ -68,6 +68,7 @@ class MutateCommand(BaseModel):
     mutation_strategy: str = "strat_1"
     requested_strategies: list[str] = Field(default_factory=list)
     num_functions: int = 3
+    target_functions: list[str] = Field(default_factory=list)
     retry_attempts: int = 5
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     retry_count: int = 0

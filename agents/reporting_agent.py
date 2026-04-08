@@ -50,11 +50,40 @@ class ReportingAgent(BaseAgent):
 
     capabilities = {"stage": "reporting", "uses_llm": True}
 
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self._pending_report_events: dict = {}
+
     async def handle_event(self, data: dict, claimed_state) -> None:
-        """Only handle continue_to_report decisions."""
+        """Handle decision events — generate report for continue_to_report, close otherwise."""
         action = data.get("action", "")
+        job_id = data.get("job_id", "")
+        log = logger.bind(job_id=job_id, action=action)
+
         if action != "continue_to_report":
-            return  # Not for us — MutationAgent handles retry_with_mutation
+            # State was already claimed DECISION_ISSUED → REPORTING by activates_on CAS.
+            # We must close the job here — no other agent can claim REPORTING state.
+            # (Mutation dispatch for retry_with_mutation was already done by DecisionAgent.)
+            log.info("non_report_action_closing_job",
+                     reason="state_claimed_reporting_must_close")
+            if self._ctx.state_store:
+                state = await self._ctx.state_store.get(job_id)
+                if state and state.current_status == JobStatus.REPORTING:
+                    await self.transition_and_save(state, JobStatus.REPORT_READY,
+                                                   reason=f"action={action}, skipping report generation")
+                    await self.transition_and_save(state, JobStatus.CLOSED,
+                                                   reason=f"job closed via action={action}")
+                    from contracts.messages import JobClosedEvent
+                    closed_event = JobClosedEvent(
+                        job_id=state.job_id,
+                        sample_id=state.sample_id,
+                        correlation_id=state.correlation_id,
+                        final_status="CLOSED",
+                        report_id=state.report_id,
+                    )
+                    await self.publish_event(closed_event)
+                    log.info("job_closed_non_report_action")
+            return
 
         cmd_data = {
             "job_id": data["job_id"],
@@ -65,14 +94,26 @@ class ReportingAgent(BaseAgent):
             "output_dir": f"{self._ctx.work_dir}/run_{data['job_id'][:8]}",
         }
         await self.handle(cmd_data)
+        log.info("after_handle_completed", step="checkpoint_1")
         # Transition to REPORT_READY then CLOSED
         if self._ctx.state_store:
+            log.info("state_store_available", step="checkpoint_2")
             state = await self._ctx.state_store.get(data["job_id"])
+            log.info("state_fetched", current_status=(state.current_status.value if state else None), step="checkpoint_3")
             if state and state.current_status == JobStatus.REPORTING:
+                log.info("transition_condition_true", step="checkpoint_4")
                 await self.transition_and_save(state, JobStatus.REPORT_READY,
                                                reason="report generated")
+                log.info("transitioned_to_report_ready", step="checkpoint_5")
                 await self.transition_and_save(state, JobStatus.CLOSED,
                                                reason="job completed")
+                log.info("transitioned_to_closed", step="checkpoint_6")
+                # Publish deferred ReportGeneratedEvent after transitions
+                pending = self._pending_report_events.pop(data["job_id"], None)
+                if pending:
+                    log.info("publishing_deferred_report_event", step="checkpoint_7")
+                    await self._ctx.broker.publish(Topic.EVENTS_ALL, pending)
+                    log.info("deferred_report_event_published", step="checkpoint_8")
                 # Emit JobClosedEvent
                 from contracts.messages import JobClosedEvent
                 closed_event = JobClosedEvent(
@@ -83,6 +124,8 @@ class ReportingAgent(BaseAgent):
                     report_id=state.report_id,
                 )
                 await self.publish_event(closed_event)
+            else:
+                log.warning("transition_condition_false", current_status=(state.current_status.value if state else "state_is_none"), step="checkpoint_cond_false")
 
     async def handle(self, data: dict) -> None:
         job_id = data["job_id"]
@@ -179,7 +222,8 @@ class ReportingAgent(BaseAgent):
             report_path=report_path,
             summary_path=summary_path or "",
         )
-        await self._ctx.broker.publish(Topic.EVENTS_ALL, event)
+        self._pending_report_events[job_id] = event
+        # event will be published by handle_event() after transition_and_save()
 
     async def _perform_comparison(self, original_dict: dict, mutated_dict: dict, log) -> Optional[ComparisonResultModel]:
         """Generate comparison between original and mutated sample analysis results."""

@@ -16,6 +16,7 @@ Output:
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -438,6 +439,14 @@ def compile_project(project: dict) -> dict:
                 print(f"    {e.strip()}")
 
         (out_dir / "compile_output.txt").write_text(combined, encoding="utf-8")
+
+        # ── Wipe build intermediates (.obj, .pdb, .ilk, .exp) ─────────────
+        for ext in ("*.obj", "*.pdb", "*.ilk", "*.exp", "*.idb"):
+            for f in glob.glob(str(out_dir / ext)):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
 
         return {
             "name": name, "patch": patch,

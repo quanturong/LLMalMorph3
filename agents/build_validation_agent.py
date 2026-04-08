@@ -53,6 +53,20 @@ _MALWARE_COMPILE_FLAGS = [
     "/OPT:ICF",            # Identical COMDAT folding
 ]
 
+
+def _resolve_fixer_model() -> str:
+    """Resolve the LLM model for auto-fixer from environment.
+
+    Prefers CLOUD_URL model (e.g. qwen2.5:32b on RunPod) over deepseek-chat.
+    Returns a model name suitable for get_llm_provider().
+    """
+    cloud_url = os.environ.get("CLOUD_URL", "")
+    if cloud_url:
+        # CLOUD_URL is set -> use a generic model name so get_llm_provider
+        # routes through OpenAICompatibleProvider instead of DeepSeek.
+        return os.environ.get("FIXER_MODEL", "qwen2.5:32b")
+    return "deepseek-chat"
+
 # Event signature: VariantGeneratedEvent
 _SIG_VARIANT_GENERATED = frozenset({"variant_artifact_id", "num_files_generated", "mutation_artifact_id"})
 
@@ -466,7 +480,15 @@ class BuildValidationAgent(BaseAgent):
             log.warning("mutation_no_target_source_file")
             return None
 
-        num_functions_merge_back = max(1, int(source_payload.get("num_functions", 2)))
+        # When num_functions=0 (adaptive mode), use the actual number of mutated
+        # functions stored in the payload, falling back to 2.
+        _cfg_num = int(source_payload.get("num_functions", 0))
+        if _cfg_num > 0:
+            num_functions_merge_back = _cfg_num
+        else:
+            # Try to infer from existing mutation data
+            _mutated = source_payload.get("mutated_functions", [])
+            num_functions_merge_back = max(1, len(_mutated)) if _mutated else 2
         func_gen_scheme = os.getenv("VSG_FUNC_GEN_SCHEME", "sequential")
 
         cmd = [
@@ -568,6 +590,7 @@ class BuildValidationAgent(BaseAgent):
 
         # Tier 1: Standard compilation with auto-fix
         log.info("compile_attempt_standard", attempt=1)
+        _fixer_model = _resolve_fixer_model()
         try:
             result = compiler.compile_project(
                 project=project,
@@ -575,7 +598,7 @@ class BuildValidationAgent(BaseAgent):
                 output_name=output_name,
                 max_fix_attempts=_MAX_FIX_ATTEMPTS,
                 auto_fix=True,
-                llm_model="qwen2.5:32b",
+                llm_model=_fixer_model,
             )
             fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
             fix_stats["standard_attempts"] += getattr(result, "auto_fix_attempts", 0)
@@ -600,7 +623,7 @@ class BuildValidationAgent(BaseAgent):
                     max_fix_attempts=2,
                     auto_fix=True,
                     permissive_mode=True,
-                    llm_model="qwen2.5:32b",
+                    llm_model=_fixer_model,
                 )
                 fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
                 fix_stats["permissive_attempts"] += getattr(result, "auto_fix_attempts", 0)
@@ -629,7 +652,7 @@ class BuildValidationAgent(BaseAgent):
                 max_fix_attempts=_MAX_SURGICAL_FIX_ATTEMPTS,
                 auto_fix=True,
                 llm_fixer_max_code_length=1,  # Force surgical mode on all files
-                llm_model="qwen2.5:32b",
+                llm_model=_fixer_model,
             )
             fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
             fix_stats["surgical_attempts"] += getattr(result, "auto_fix_attempts", 0)

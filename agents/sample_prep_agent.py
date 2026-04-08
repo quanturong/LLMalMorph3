@@ -116,7 +116,7 @@ class SamplePrepAgent(BaseAgent):
             ],
             "functions": [
                 {
-                    "name": fn.get("name", ""),
+                    "name": fn.get("name_only", "") or fn.get("name", ""),
                     "file": str(fn.get("source_file", "")),
                     "start_line": fn.get("start_line", 0),
                     "end_line": fn.get("end_line", 0),
@@ -124,6 +124,18 @@ class SamplePrepAgent(BaseAgent):
                 }
                 for fn in getattr(parse_result, "all_functions", [])
             ],
+            "structs": [
+                {
+                    "name": s.get("name", "") if isinstance(s, dict) else str(s),
+                    "body": s.get("body", "") if isinstance(s, dict) else "",
+                    "file": str(s.get("source_file", "")) if isinstance(s, dict) else "",
+                }
+                for s in getattr(parse_result, "all_structs", [])
+            ],
+            "globals": [
+                (g if isinstance(g, str) else g.get("name", str(g)))
+                for g in getattr(parse_result, "all_globals", [])
+            ][:50],  # cap to avoid oversized artifacts
             "raw_project": (
                 target_project.to_dict()
                 if hasattr(target_project, "to_dict")

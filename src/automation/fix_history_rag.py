@@ -35,7 +35,7 @@ class FixRecord:
     """A single stored fix record."""
     __slots__ = (
         'record_id', 'error_codes', 'error_keywords', 'error_text_sample',
-        'fix_summary', 'language', 'timestamp', 'metadata',
+        'fix_summary', 'language', 'timestamp', 'metadata', 'is_negative',
     )
 
     def __init__(
@@ -48,6 +48,7 @@ class FixRecord:
         language: str = "c",
         timestamp: float = 0.0,
         metadata: Optional[Dict] = None,
+        is_negative: bool = False,
     ):
         self.record_id = record_id
         self.error_codes = error_codes
@@ -57,6 +58,7 @@ class FixRecord:
         self.language = language
         self.timestamp = timestamp or time.time()
         self.metadata = metadata or {}
+        self.is_negative = is_negative
 
     def to_dict(self) -> dict:
         return {
@@ -68,6 +70,7 @@ class FixRecord:
             'language': self.language,
             'timestamp': self.timestamp,
             'metadata': self.metadata,
+            'is_negative': self.is_negative,
         }
 
     @classmethod
@@ -81,6 +84,7 @@ class FixRecord:
             language=d.get('language', 'c'),
             timestamp=d.get('timestamp', 0.0),
             metadata=d.get('metadata', {}),
+            is_negative=d.get('is_negative', False),
         )
 
 
@@ -319,9 +323,18 @@ class FixHistoryRAG:
         id_source = "|".join(error_codes) + "|" + (errors[0][:100] if errors else "")
         record_id = hashlib.md5(id_source.encode()).hexdigest()[:12]
 
-        # Check for near-duplicate (same error codes)
+        # Check for near-duplicate (>= 60% error code overlap, same polarity)
         for existing in self.records:
-            if existing.error_codes == error_codes and existing.language == language:
+            if existing.language != language or existing.is_negative:
+                continue
+            if not existing.error_codes and not error_codes:
+                continue
+            # Jaccard-like overlap: |intersection| / |union|
+            s_old = set(existing.error_codes)
+            s_new = set(error_codes)
+            union = s_old | s_new
+            overlap = len(s_old & s_new) / len(union) if union else 0.0
+            if overlap >= 0.60:
                 # Update existing record with newer fix
                 existing.fix_summary = self._compute_fix_summary(original_code, fixed_code)
                 existing.error_keywords = error_keywords
@@ -359,6 +372,101 @@ class FixHistoryRAG:
             f"codes={error_codes} | keywords={error_keywords[:5]}"
         )
         return record_id
+
+    def store_negative_fix(
+        self,
+        errors: List[str],
+        original_code: str,
+        failed_code: str,
+        language: str = "c",
+        failure_reason: str = "",
+    ) -> str:
+        """Store a FAILED fix pattern so it can be used as anti-example.
+
+        Negative records are stored but excluded from positive retrieval;
+        they are surfaced via ``retrieve_anti_examples()``.
+        """
+        error_codes = self._extract_error_codes(errors)
+        error_keywords = self._extract_error_keywords(errors)
+        id_source = "NEG|" + "|".join(error_codes) + "|" + (errors[0][:80] if errors else "")
+        record_id = "neg_" + hashlib.md5(id_source.encode()).hexdigest()[:10]
+
+        fix_summary = self._compute_fix_summary(original_code, failed_code)
+        if failure_reason:
+            fix_summary = f"❌ FAILED ({failure_reason}):\n{fix_summary}"
+
+        record = FixRecord(
+            record_id=record_id,
+            error_codes=error_codes,
+            error_keywords=error_keywords,
+            error_text_sample="\n".join(errors[:3]),
+            fix_summary=fix_summary,
+            language=language,
+            timestamp=time.time(),
+            is_negative=True,
+        )
+        self.records.append(record)
+
+        # FIFO eviction (keep ratio: max 20% negative)
+        negatives = [r for r in self.records if r.is_negative]
+        max_neg = max(self.MAX_RECORDS // 5, 20)
+        if len(negatives) > max_neg:
+            # Remove oldest negatives
+            to_remove = set(id(r) for r in negatives[:-max_neg])
+            self.records = [r for r in self.records if id(r) not in to_remove]
+
+        if len(self.records) > self.MAX_RECORDS:
+            self.records = self.records[-self.MAX_RECORDS:]
+
+        self._dirty = True
+        self._save()
+        logger.info(f"[RAG] Stored NEGATIVE fix: {record_id} | codes={error_codes}")
+        return record_id
+
+    def retrieve_anti_examples(
+        self,
+        errors: List[str],
+        language: str = "c",
+        top_k: int = 1,
+        min_similarity: float = 0.35,
+    ) -> List[Tuple[FixRecord, float]]:
+        """Retrieve similar FAILED fixes as anti-examples for the prompt."""
+        negatives = [r for r in self.records if r.is_negative]
+        if not negatives:
+            return []
+
+        # Quick TF-IDF similarity against negative records only
+        query_terms = self._build_query_document(errors, language)
+        results = []
+        for rec in negatives:
+            # Jaccard on error codes as fast proxy
+            q_codes = set(self._extract_error_codes(errors))
+            r_codes = set(rec.error_codes)
+            union = q_codes | r_codes
+            score = len(q_codes & r_codes) / len(union) if union else 0.0
+            if score >= min_similarity:
+                results.append((rec, score))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:top_k]
+
+    def format_anti_examples(self, retrieved: List[Tuple[FixRecord, float]]) -> str:
+        """Format anti-examples as a warning section for the prompt."""
+        if not retrieved:
+            return ""
+        parts = [
+            "\n⚠️ ANTI-EXAMPLES — these fix approaches FAILED before:",
+            "─" * 50,
+        ]
+        for i, (rec, score) in enumerate(retrieved, 1):
+            codes_str = ", ".join(rec.error_codes[:5]) if rec.error_codes else "unknown"
+            parts.append(
+                f"Failed attempt {i} (errors: {codes_str}):\n"
+                f"  {rec.fix_summary[:300]}\n"
+                f"  → Do NOT repeat this pattern.\n"
+            )
+        parts.append("─" * 50 + "\n")
+        return "\n".join(parts)
 
     # ──────────────────────────── Retrieve ────────────────────────────
 
@@ -402,13 +510,18 @@ class FixHistoryRAG:
         # Cosine similarity
         similarities = self._tfidf_matrix @ query_vector
 
-        # Get top-k
-        top_indices = np.argsort(similarities)[::-1][:top_k]
+        # Get top-k (skip negative records — they are anti-examples)
+        top_indices = np.argsort(similarities)[::-1]
         results = []
         for idx in top_indices:
+            if len(results) >= top_k:
+                break
+            rec = self.records[idx]
+            if rec.is_negative:
+                continue
             score = float(similarities[idx])
             if score >= min_similarity:
-                results.append((self.records[idx], score))
+                results.append((rec, score))
 
         if results:
             logger.info(

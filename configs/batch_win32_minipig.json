@@ -1,0 +1,74 @@
+{
+  "runtime": {
+    "max_wait_s": 1800,
+    "status_interval_s": 15,
+    "sandbox_timeout_s": 600,
+    "quiet_console": false
+  },
+  "broker": {
+    "mode": "memory",
+    "redis_url": "${REDIS_URL}"
+  },
+  "storage": {
+    "db_path": "project_mutation_output/win32_minipig_{timestamp}.db",
+    "artifact_dir": "project_mutation_output/win32_minipig_{timestamp}/artifacts",
+    "report_dir": "project_mutation_output/win32_minipig_{timestamp}/reports",
+    "work_dir": "project_mutation_output/win32_minipig_{timestamp}/work"
+  },
+  "logging": {
+    "level": "INFO"
+  },
+  "sandbox": {
+    "cape_base_url": "${CAPE_BASE_URL}",
+    "cape_api_token": "${CAPE_API_TOKEN}",
+    "virustotal_api_key": "${VIRUSTOTAL_API_KEY}",
+    "virustotal_api_url": "https://www.virustotal.com"
+  },
+  "llm": {
+    "enabled": true,
+    "mode": "hybrid",
+    "cloud_provider": "runpod",
+    "cloud_model": "qwen2.5:32b",
+    "cloud_base_url": "${CLOUD_URL}",
+    "api_key": "${RUNPOD_API_KEY}",
+    "fallback_provider": "deepseek",
+    "fallback_model": "deepseek-chat",
+    "cache_ttl_s": 3600
+  },
+  "mutation": {
+    "num_functions_per_project": 1,
+    "default_strategy": "strat_1",
+    "retry_attempts": 3,
+    "max_feedback_loops": 2
+  },
+  "behavioral_equivalence": {
+    "enabled": true,
+    "compile_original": true,
+    "submit_original_to_sandbox": true,
+    "equivalence_thresholds": {
+      "equivalent": 0.85,
+      "mostly_equivalent": 0.65
+    },
+    "api_jaccard_weight": 0.5,
+    "ttp_preservation_weight": 0.25,
+    "resource_ops_weight": 0.15,
+    "detection_preservation_weight": 0.1
+  },
+  "samples": [
+    {
+      "sample_id": "win32_minipig",
+      "project_name": "Win32.MiniPig_Nov2006",
+      "source_path": "samples/Samples/Win32.MiniPig_Nov2006/Win32.MiniPig - Nov 2006",
+      "language": "c",
+      "sandbox_backend": "cape",
+      "priority": 5,
+      "requested_strategies": [
+        "strat_1"
+      ],
+      "num_functions": 1,
+      "metadata": {
+        "profile": "win32_minipig"
+      }
+    }
+  ]
+}

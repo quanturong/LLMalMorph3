@@ -120,8 +120,13 @@ def parse_code_any_format(llm_response, language, source_code_response_format='b
         if result_json_object is None:
             return None, None
         
-        code = result_json_object['modified code'] if 'modified code' in result_json_object else None
-        mapping_information = result_json_object['replacer'] if 'replacer' in result_json_object else None
+        # Unified keys: "modified_code" and "function_map"
+        # Also accept legacy keys for backward compatibility
+        code = (result_json_object.get('modified_code')
+                or result_json_object.get('modified code'))
+        mapping_information = (result_json_object.get('function_map')
+                               or result_json_object.get('mapping')
+                               or result_json_object.get('replacer'))
         
     elif source_code_response_format == 'backticks':
         # Extract all code blocks

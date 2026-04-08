@@ -59,13 +59,20 @@ samples/
 output/
 example_output/
 selected_samples/*/llm_generated/
-*.txt
-!requirements.txt
 project_mutation_output/
 reports/
 llm_logs/
 configs/generated_batches/
 configs/generated_patches/
+
+# Pipeline output logs (archived in _old_pipeline_logs/)
+pipeline_*_output.txt
+
+# General text files (except requirements and documentation)
+*.txt
+!requirements.txt
+!README*.txt
+!LICENSE.txt
 # Runtime output & work directories
 artifacts/
 artifacts_*/
@@ -73,6 +80,30 @@ batch_compile_output/
 production_runs/
 test_results/
 work_*/
+
+# Deprecated and archived content
+_deprecated_scripts/
+_old_pipeline_logs/
+archive/
+legacy/
+build_test_50_v10/
+
+# Test/batch results (comment out if needed for analysis)
+batch_11_results/
+batch_*_results/
+
+# Storage and temporary data
+storage/
+fix_history_global.json
+compile_test_50_v*_results.json
+
+# Build artifacts
+*.obj
+*.o
+*.exe
+*.dll
+*.so
+*.dylib
 # SQLite state databases
 *.db
 # Pytest cache
@@ -94,4 +125,18 @@ llmalmorph.ipynb
 temp/
 tmp/
 *.tmp
+
+# ============================================
+# OPTIONAL: Documentation and Reports
+# ============================================
+# Uncomment below if you don't want to track generated reports
+# BEHAVIORAL_METRICS.md
+# MALWARE_50_REPORT.md
+# STRATEGY_REPORT.md
+
+# Keep these documentation files tracked by default:
+# - README.md
+# - BEHAVIORAL_METRICS.md (metrics reference)
+# - MALWARE_50_REPORT.md (dataset documentation)
+# - STRATEGY_REPORT.md (strategy analysis)
 

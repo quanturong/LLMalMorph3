@@ -107,37 +107,58 @@ class SandboxSubmitAgent(BaseAgent):
             if not adapter:
                 raise RuntimeError("CapeAdapter not configured in SandboxSubmitAgent")
 
-        # ── 1. Resolve binary path from artifact store ────────────────────
-        binary_path: Path | None = None
-        if self._ctx.artifact_store:
-            binary_path = await self._ctx.artifact_store.get_path(
-                job_id, compiled_artifact_id
-            )
+        # ── 1. Resolve binary and submit to sandbox ────────────────────────
+        # If artifact is encrypted, decrypt in-memory and upload bytes directly
+        # to CAPE — no plaintext .exe ever touches disk.
+        task_id = None
+        binary_abs_path = "(in-memory)"
+        store = self._ctx.artifact_store
 
-        if binary_path is None or not binary_path.exists():
-            recovered = self._recover_binary_from_build_output(job_id)
-            if recovered is not None and recovered.exists():
-                binary_path = recovered
-                log.warning("artifact_missing_recovered_from_build", recovered_path=str(binary_path))
-            else:
-                raise FileNotFoundError(
-                    f"Compiled binary artifact not found: {compiled_artifact_id}"
-                )
+        if store and hasattr(store, 'decrypt_to_bytes'):
+            try:
+                pe_bytes = store.decrypt_to_bytes(compiled_artifact_id)
+                if pe_bytes and hasattr(adapter, 'submit_bytes'):
+                    # Determine original filename for CAPE
+                    raw_path = store.get_path_sync(compiled_artifact_id)
+                    fname = Path(raw_path).stem + ".exe" if raw_path else "sample.exe"
+                    task_id = await adapter.submit_bytes(pe_bytes, filename=fname)
+                    binary_abs_path = f"(encrypted:{fname})"
+                    log.info("submitted_from_memory", filename=fname, size=len(pe_bytes))
+                    del pe_bytes  # release memory immediately
+            except Exception as exc:
+                log.debug("in_memory_submit_failed_fallback_to_file", error=str(exc))
+                task_id = None  # fall through to file-based path
 
-        binary_abs_path = str(binary_path.resolve())
-        log.info("submitting_to_sandbox", binary=binary_abs_path)
-
-        # ── 2. Submit to sandbox (CAPE or VT) ────────────────────────────
-        task_id = await adapter.submit_file(binary_abs_path)
+        # Fallback: file-based submit (unencrypted artifacts or adapters without submit_bytes)
         if task_id in (None, "", "None"):
-            # One recovery retry if the artifact disappeared mid-run (e.g., AV quarantine)
-            recovered = self._recover_binary_from_build_output(job_id)
-            if recovered is not None and recovered.exists():
-                recovered_abs = str(recovered.resolve())
-                if recovered_abs != binary_abs_path:
-                    log.warning("retry_submit_with_recovered_binary", recovered_path=recovered_abs)
-                    task_id = await adapter.submit_file(recovered_abs)
-                    binary_abs_path = recovered_abs
+            binary_path: Path | None = None
+            if store:
+                binary_path = await store.get_path(job_id, compiled_artifact_id)
+
+            if binary_path is None or not binary_path.exists():
+                recovered = self._recover_binary_from_build_output(job_id)
+                if recovered is not None and recovered.exists():
+                    binary_path = recovered
+                    log.warning("artifact_missing_recovered_from_build", recovered_path=str(binary_path))
+                else:
+                    raise FileNotFoundError(
+                        f"Compiled binary artifact not found: {compiled_artifact_id}"
+                    )
+
+            binary_abs_path = str(binary_path.resolve())
+            log.info("submitting_to_sandbox", binary=binary_abs_path)
+
+            # ── 2. Submit file to sandbox (CAPE or VT) ────────────────────
+            task_id = await adapter.submit_file(binary_abs_path)
+            if task_id in (None, "", "None"):
+                # One recovery retry if the artifact disappeared mid-run (e.g., AV quarantine)
+                recovered = self._recover_binary_from_build_output(job_id)
+                if recovered is not None and recovered.exists():
+                    recovered_abs = str(recovered.resolve())
+                    if recovered_abs != binary_abs_path:
+                        log.warning("retry_submit_with_recovered_binary", recovered_path=recovered_abs)
+                        task_id = await adapter.submit_file(recovered_abs)
+                        binary_abs_path = recovered_abs
 
         if task_id in (None, "", "None"):
             raise RuntimeError("Sandbox submit returned empty task_id")

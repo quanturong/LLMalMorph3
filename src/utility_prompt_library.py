@@ -1,197 +1,820 @@
-strategy_prompt_dict = {
-    # Strategy 0: Simple Optimization (NEW - clearer instructions) 
-    "strat_0": (
-        "Apply simple performance optimizations to the function:\n"
-        "1. Remove any duplicate calculations or redundant operations\n"
-        "2. Combine similar operations where possible\n"
-        "3. Use more efficient patterns (e.g., early returns, simpler conditions)\n"
-        "4. Keep all original variables and function calls unchanged\n"
-        "5. Preserve the exact same functionality and behavior\n"
-        "\nIMPORTANT: Your output must be a complete, working function with the same signature."
-    ),
-    # Strategy 1: Code Optimization
-    # Optimizes code by removing redundancies, addressing performance bottlenecks,
-    # and simplifying logic. Uses alternative data structures/algorithms or modern
-    # library features to change execution profile without altering core functionality.
+def _get_language_specific_prohibitions(language: str, compiler_type: str = 'msvc') -> str:
+    """Return language-specific absolute prohibitions for mutation prompts."""
+    if language == "python":
+        return (
+            "\nABSOLUTE PROHIBITIONS:\n"
+            "- NEVER delete, remove, or shorten ANY existing logic. Only ADD, REPLACE, or WRAP with equivalents.\n"
+            "- NEVER replace function bodies with stubs, comments, or placeholders like 'pass # todo'.\n"
+            "- NEVER output empty function bodies or bodies with only 'pass' or 'raise NotImplementedError'.\n"
+            "- Your output MUST execute ALL original variable assignments and ALL original logic. Nothing removed.\n"
+            "- Keep ALL original function/method calls. Only change HOW or WHERE they are resolved, not WHETHER they are called.\n"
+            "- NEVER rename calls to existing project functions/classes imported from other project modules. Keep their exact names and call sites.\n"
+            "- If the function is a class method (has 'self' parameter), keep 'self' as the first parameter name. You may rename other parameters only as part of strat_5.\n"
+            "- NEVER change 4-space indentation of the function body. All added code must also use 4-space indentation.\n"
+            "- When using dynamic __import__ or getattr: ensure the resolved name exactly matches the original module/attribute name. Wrong names cause runtime failures.\n"
+            "- For strat_4/strat_2 (fragmentation/state machine): define ALL helper functions at MODULE level (outside the class if in a class), not nested inside the main function.\n"
+        )
+    elif language == "javascript":
+        return (
+            "\nABSOLUTE PROHIBITIONS:\n"
+            "- NEVER delete, remove, or shorten ANY existing logic. Only ADD, REPLACE, or WRAP with equivalents.\n"
+            "- NEVER replace function bodies with stubs, comments, or placeholders.\n"
+            "- NEVER output empty function bodies or bodies with only 'return;' or 'return undefined;'.\n"
+            "- Your output MUST execute ALL original variable declarations and ALL original logic. Nothing removed.\n"
+            "- Keep ALL original function calls. Only change HOW or WHERE they are resolved.\n"
+            "- NEVER rename calls to existing project functions/modules required from other project files. Keep their exact call-site names.\n"
+            "- Preserve the function signature (name, parameters) exactly unless explicitly rewriting to an arrow function equivalent.\n"
+            "- When using dynamic require() or bracket notation: the resolved string MUST equal the original module/property name exactly.\n"
+            "- For strat_4/strat_2 (fragmentation/state machine): define ALL helper functions at the FILE/MODULE level, not nested inside the main function.\n"
+        )
+    else:  # C/C++
+        base = (
+            "\nABSOLUTE PROHIBITIONS:\n"
+            "- NEVER delete or remove ANY variable declaration, function call, or logic statement. Only ADD, REPLACE, or WRAP.\n"
+            "- NEVER output empty/stub function bodies. Your output MUST contain ALL original logic.\n"
+            "- Keep ALL original function/API calls. Only change HOW they are called, not WHETHER.\n"
+            "- NEVER rename calls to existing project helper functions (e.g. _memcpy, _memset, _xor).\n"
+            "- ONLY use Windows/CRT APIs that actually exist. NEVER invent fake API names.\n"
+            "- GetProcAddress function name strings MUST exactly match documented Windows API names.\n"
+            "- Function pointer typedefs MUST exactly match the real API signature (return type, calling convention, all param types).\n"
+            "- NEVER shadow an existing variable with a different type (e.g. declaring `int hFile` when `HANDLE hFile` already exists).\n"
+            "- NEVER merge two distinct variables into one (each original variable must keep its own storage).\n"
+            "- Every helper function you create MUST have a complete body — no forward declarations without definitions.\n"
+        )
+        if language == "c":
+            base += (
+                "\nC-ONLY RULES (pure C, NOT C++):\n"
+                "- NO C++ syntax: no static_cast, class, namespace, template, new, delete, throw, try, nullptr, auto, references (type&).\n"
+                "- NO C++ headers: <iostream>, <vector>, <string>, <map>, <memory>, <algorithm>.\n"
+                "- Use C-style casts: (type)expr. Use NULL not nullptr. Use BOOL/TRUE/FALSE not bool/true/false.\n"
+                "- NEVER define functions inside another function body — C has NO nested functions.\n"
+            )
+            if compiler_type == 'msvc':
+                base += "- Declare ALL variables at the TOP of a block before any statements (MSVC C89 compat).\n"
+            else:
+                base += "- Variables CAN be declared anywhere in a block (C99+). For-loop initializers like `for(int i=0;...)` are valid.\n"
+            base += "- Every struct field access via pointer (e.g. `ctx->X`) MUST have a matching field defined in the struct.\n"
+        return base
+
+
+def _get_language_specific_features(language: str, strategy: str, compiler_type: str = 'msvc') -> str:
+    """Return language-specific feature suggestions for a given strategy."""
+    if language == "python":
+        hints = {
+            # strat_1: String & Constant Obfuscation
+            "strat_1": (
+                "PYTHON-SPECIFIC TECHNIQUES:\n"
+                "- Define a decode lambda at top: `_d = lambda _b, _k=0x5A: ''.join(chr(_c ^ _k) for _c in _b)`\n"
+                "- Encode a string like 'kernel32.dll' as: `_d([0x21^0x5A, 0x1f^0x5A, ...])` (pre-compute each byte XOR'd with 0x5A)\n"
+                "- Alternative: split string across a list and join: `''.join(['ker','nel','32','.dll'])`\n"
+                "- Alternative: reversed+slice: `'lld.23lenrek'[::-1]`\n"
+                "- For module names being imported: encode 'os' as `chr(111)+chr(115)`, 'sys' as `chr(115)+chr(121)+chr(115)`\n"
+                "- Replace numeric literals: `4096` → `(1<<12)`, `255` → `(0x100-1)`, `7` → `(0xf>>1)`\n"
+            ),
+            # strat_2: Control Flow Flattening
+            "strat_2": (
+                "PYTHON-SPECIFIC TECHNIQUES:\n"
+                "- State machine pattern:\n"
+                "  ```\n"
+                "  def _s0(ctx): ctx['v'] = prepare(ctx['input']); return 1\n"
+                "  def _s1(ctx): ctx['v'] = process(ctx['v']); return 2 if ctx['v'] else 99\n"
+                "  def _s99(ctx): return None  # dead state with plausible code\n"
+                "  _dispatch = {0: _s0, 1: _s1, 2: _s2, 99: _s99}\n"
+                "  _ctx = {'input': arg, 'v': None}; _st = 0\n"
+                "  while _st is not None: _st = _dispatch[_st](_ctx)\n"
+                "  return _ctx['result']\n"
+                "  ```\n"
+                "- Opaque predicate example: `if (len(str(id(self))) | 1) > 0:` (always True, looks like a guard)\n"
+                "- Opaque predicate example: `if not (False and __import__('os').getpid() < 0):` (always True)\n"
+            ),
+            # strat_3: Dynamic Import/API Resolution
+            "strat_3": (
+                "PYTHON-SPECIFIC TECHNIQUES:\n"
+                "- Dynamic import with encoded name: `_os = __import__(''.join(chr(x) for x in [111,115]))`  # 'os'\n"
+                "- fromlist import: `_req = getattr(__import__(''.join(chr(x) for x in [114,101,113,117,101,115,116,115])), 'get')`  # requests.get\n"
+                "- getattr chain: `_winreg = getattr(__import__('winreg'), 'OpenKey')`\n"
+                "- For ctypes: `_k32 = getattr(__import__('ctypes').windll, 'kerne'+'l32')`; then `getattr(_k32, 'VirtualAlloc')(...)` \n"
+                "- For subprocess: `_sp = __import__('subproc'+'ess'); _run = getattr(_sp, 'run')`\n"
+                "- Encode module names: 'ctypes' → `'cty'+'pes'`, 'socket' → `'so'+'cket'`, 'base64' → `'base'+'64'`\n"
+            ),
+            # strat_4: Function Fragmentation
+            "strat_4": (
+                "PYTHON-SPECIFIC TECHNIQUES:\n"
+                "- Use closures to share state without globals:\n"
+                "  ```\n"
+                "  def _make_pipeline(raw):\n"
+                "      _state = {'data': raw}\n"
+                "      def _normalize(_s): _s['data'] = _s['data'].strip(); return _s\n"
+                "      def _encode(_s): _s['data'] = _s['data'].encode(); return _s\n"
+                "      return _state\n"
+                "  ```\n"
+                "- Or use a pipeline list: `_ops = [_normalize_input, _build_payload, _encode_data, _dispatch_result]`\n"
+                "  then: `_ctx = {'v': arg}; [op(_ctx) for op in _ops]; return _ctx['v']`\n"
+                "- Name helpers generically: `_normalize_input`, `_build_request_data`, `_handle_response`, `_finalize`\n"
+            ),
+            # strat_5: Semantic Substitution
+            "strat_5": (
+                "PYTHON-SPECIFIC TECHNIQUES:\n"
+                "- String concatenation: `a + b` → `''.join([a, b])` or `'%s%s' % (a, b)`\n"
+                "- String contains: `sub in s` → `s.find(sub) != -1`\n"
+                "- List append: `lst.append(x)` → `lst[len(lst):] = [x]`\n"
+                "- Dict lookup: `d[k]` → `d.get(k)` (safe) or `(lambda _d,_k: _d[_k])(d, k)` (obfuscated)\n"
+                "- isinstance check: `isinstance(x, str)` → `type(x).__name__ == 'str'`\n"
+                "- For loop: `for i,v in enumerate(lst)` → `_i=0; _it=iter(lst); \ntry:\n    while True: v=next(_it); ...; _i+=1\nexcept StopIteration: pass`\n"
+                "- `os.path.join(a,b)` → `str(__import__('pathlib').Path(a) / b)` (always safe for all path types)\n"
+                "- `open(f).read()` → `__import__('io').open(f, mode='r', encoding='utf-8').read()`\n"
+                "- Arithmetic: `x + 1` → `x - ~0`, `x * 4` → `x << 2`, `x % 2` → `x & 1`, `x == 0` → `not x`\n"
+                "- SAFETY: Only apply substitutions that preserve exact behavior for ALL inputs including edge cases.\n"
+            ),
+            "strat_all": (
+                "PYTHON-SPECIFIC TECHNIQUES:\n"
+                "- Encode ALL strings: `_d = lambda _b, _k=0x37: ''.join(chr(_c ^ _k) for _c in _b)` then use _d([...]) everywhere.\n"
+                "- All imports dynamic: `__import__(''.join(chr(x) for x in [<codes>]))`\n"
+                                "- Replace 50% of ops with alternatives: join for concat, find for 'in', manual loop for enumerate.\n"
+            ),
+        }
+        return hints.get(strategy, "")
+    elif language == "javascript":
+        hints = {
+            # strat_1: String & Constant Obfuscation
+            "strat_1": (
+                "JAVASCRIPT-SPECIFIC TECHNIQUES:\n"
+                "- Define decode helper at top: `const _d = (_b, _k=0x5A) => _b.map(_c => String.fromCharCode(_c ^ _k)).join('')`\n"
+                "- Encode 'kernel32' as: `_d([0x21^0x5A, 0x1f^0x5A, ...])` — pre-compute each char code XOR'd with 0x5A\n"
+                "- Alternative: split and join: `['ker','nel','32','.dll'].join('')`\n"
+                "- Alternative: reverse: `'lld.23lenrek'.split('').reverse().join('')`\n"
+                "- Char-code form: `String.fromCharCode(107,101,114,110,101,108)` for 'kernel'\n"
+                "- Replace numeric literals: `4096` → `(1<<12)`, `255` → `(0x100-1)`, `443` → `(0x1bb)`\n"
+            ),
+            # strat_2: Control Flow Flattening
+            "strat_2": (
+                "JAVASCRIPT-SPECIFIC TECHNIQUES:\n"
+                "- State machine pattern:\n"
+                "  ```js\n"
+                "  const _s0 = ctx => { ctx.v = prepare(ctx.input); return 1; };\n"
+                "  const _s1 = ctx => { ctx.v = process(ctx.v); return ctx.v ? 2 : 99; };\n"
+                "  const _s99 = ctx => null;  // dead state\n"
+                "  const _disp = {0:_s0, 1:_s1, 2:_s2, 99:_s99};\n"
+                "  const _ctx = {input: arg, v: null}; let _st = 0;\n"
+                "  while (_st !== null) _st = _disp[_st](_ctx);\n"
+                "  return _ctx.result;\n"
+                "  ```\n"
+                "- Opaque predicate: `if ((Object.keys(_ctx).length | 1) !== 0)` (always True)\n"
+                "- Opaque predicate: `if (typeof undefined !== 'number')` (always True)\n"
+            ),
+            # strat_3: Dynamic Import/API Resolution
+            "strat_3": (
+                "JAVASCRIPT-SPECIFIC TECHNIQUES:\n"
+                "- Dynamic require: `const _fs = (require)(['f','s'].join(''))` or `require('f'+'s')`\n"
+                "- Build module name: `require(['ht','tp'].join(''))` for 'http'\n"
+                "- Property access via bracket notation: `obj['meth'+'od']()` instead of `obj.method()`\n"
+                "- Chained dynamic access: `const _exec = require('child_'+'process')['exec'+'Sync']`\n"
+                "- Encode module names: 'https' → `'htt'+'ps'`, 'crypto' → `'cry'+'pto'`, 'path' → `'pa'+'th'`\n"
+                "- Function-based require resolution: `const _req = Function('return require')()`; then `_req('fs')`\n"
+            ),
+            # strat_4: Function Fragmentation
+            "strat_4": (
+                "JAVASCRIPT-SPECIFIC TECHNIQUES:\n"
+                "- Use closures for shared state:\n"
+                "  ```js\n"
+                "  function _makeCtx(raw) { return { data: raw }; }\n"
+                "  function _normalizeData(ctx) { ctx.data = ctx.data.trim(); return ctx; }\n"
+                "  function _encodePayload(ctx) { ctx.data = Buffer.from(ctx.data); return ctx; }\n"
+                "  ```\n"
+                "  Then in main: `const _ctx = _makeCtx(arg); [_normalizeData, _encodePayload, _dispatch].forEach(f => f(_ctx)); return _ctx.result;`\n"
+                "- Name helpers generically: `_normalizeInput`, `_buildRequestData`, `_handleResponse`, `_finalizeOutput`\n"
+            ),
+            # strat_5: Semantic Substitution
+            "strat_5": (
+                "JAVASCRIPT-SPECIFIC TECHNIQUES:\n"
+                "- String concat: `a + b` → `[a, b].join('')` or `` `${a}${b}` ``\n"
+                "- Includes: `str.includes(sub)` → `str.indexOf(sub) !== -1`\n"
+                "- Array push: `arr.push(x)` → `Array.prototype.push.call(arr, x)`\n"
+                "- Array length: `arr.length` → `arr['len'+'gth']` (computed property — identical for sparse arrays and typed arrays)\n"
+                "- toLowerCase: `s.toLowerCase()` → `s.replace(/[A-Z]/g, c => String.fromCharCode(c.charCodeAt(0)+32))`\n"
+                "- forEach: `arr.forEach(fn)` → `for (let _i=0,_l=arr.length; _i<_l; _i++) fn(arr[_i], _i, arr)`\n"
+                "- Equality: `a === b` → `!(a !== b)` or `Object.is(a, b)`\n"
+                "- Arithmetic: `a + 1` → `a - ~0`, `a * 4` → `a << 2`, `a % 2` → `a & 1`\n"
+                "- require('fs').readFileSync → dynamic: `require('f'+'s')['readFile'+'Sync'](...)`\n"
+                "- SAFETY: Only apply substitutions that preserve exact behavior for ALL inputs including edge cases.\n"
+            ),
+            "strat_all": (
+                "JAVASCRIPT-SPECIFIC TECHNIQUES:\n"
+                "- Encode ALL strings: `const _d = (_b,_k=0x37)=>_b.map(_c=>String.fromCharCode(_c^_k)).join('');`\n"
+                "- All require() dynamic: `require(['mo','du','le'].join(''))`\n"
+                                "- 50% ops via alternatives: join for concat, indexOf for includes, bracket notation for all props.\n"
+            ),
+        }
+        return hints.get(strategy, "")
+    else:  # C/C++
+        hints = {
+            # strat_1: String & Constant Obfuscation
+            "strat_1": (
+                "C/C++-SPECIFIC TECHNIQUES (STRING PROTECTION ONLY — NO STATE MACHINES):\n"
+                "FORBIDDEN: Do NOT use state machines. Do NOT restructure control flow.\n"
+                "ONLY CHANGE: Replace string literals with runtime-built equivalents. Nothing else changes.\n\n"
+                "PREFERRED TECHNIQUE — Per-character stack construction (heuristic-safe):\n"
+                "Replace `\"kernel32.dll\"` with:\n"
+                "  `char _s0[13]; _s0[0]='k'; _s0[1]='e'; _s0[2]='r'; _s0[3]='n'; _s0[4]='e';\n"
+                "   _s0[5]='l'; _s0[6]='3'; _s0[7]='2'; _s0[8]='.'; _s0[9]='d'; _s0[10]='l'; _s0[11]='l'; _s0[12]=0;`\n\n"
+                "ALTERNATIVE — Arithmetic character construction (mix with above):\n"
+                "  `char _s1[4]; _s1[0]=(char)(0x60+4); _s1[1]=(char)(0x60+12); _s1[2]=(char)(0x60+12); _s1[3]=0;`\n\n"
+                "ALTERNATIVE — Add/subtract offset (vary offset per string, NOT uniform XOR):\n"
+                "  `unsigned char _b0[]={0x72+7,0x6c+7,0x79+7}; char _s2[4];\n"
+                "   for(int _i=0;_i<3;_i++) _s2[_i]=_b0[_i]-7; _s2[3]=0;`\n\n"
+                "AVOID — Classic XOR decode loops (triggers AV heuristic rules):\n"
+                "  BAD: `for(i=0;i<len;i++) dst[i]=src[i]^key;` — flagged as crypto/decode pattern\n"
+                "  BAD: Variable names like _enc, _dec, _xor, _key — flagged as crypto indicators\n\n"
+                "RULES:\n"
+                "1. Use UNIQUE variable names per string (_s0, _s1, _s2, _b0, _b1, etc.).\n"
+                "2. Replace ALL string literals (file paths, DLL names, registry keys, URLs, commands).\n"
+                "3. Replace numeric constants: `4096` → `(1<<12)`, `255` → `(0x100-1)`, `443` → `(0x1bb)`\n"
+                "4. Keep ALL original function calls, ALL original logic, ALL variable declarations.\n"
+                "5. MIX techniques — use at least 2 different methods across strings in the function.\n"
+                "6. Do NOT define helper functions INSIDE the function body. C does not support nested functions.\n"
+            ),
+            # strat_2: Control Flow Flattening
+            "strat_2": (
+                "C/C++-SPECIFIC TECHNIQUES:\n"
+                "- Opaque predicate example: `if ((uintptr_t)ctx | 1)` (always true)\n\n"
+                "CORRECT PATTERN (follow this EXACTLY — deviations cause compile errors):\n"
+                "```\n"
+                "// 1. UNIQUE struct name per function: _Ctx_<FuncName>\n"
+                "// 2. ONE field per original variable — PRESERVE THE EXACT TYPE\n"
+                "//    char* stays char* (NOT char[260]) — pointer params are POINTERS\n"
+                "//    SOCKET stays SOCKET, struct sockaddr_in stays struct sockaddr_in\n"
+                "// 3. Only include fields you actually USE — do NOT add padding/dummy fields\n"
+                "typedef struct {\n"
+                "    char *host;              // was: char *host parameter\n"
+                "    char *file;              // was: char *file parameter\n"
+                "    unsigned int addr;       // was: local variable\n"
+                "    struct sockaddr_in sa;   // was: local struct\n"
+                "    SOCKET sock;             // was: local SOCKET\n"
+                "    char buf[4096];          // was: local char buf[4096]\n"
+                "    int result;              // return value\n"
+                "} _Ctx_OriginalFunc;\n\n"
+                "// State functions defined OUTSIDE (C has NO nested functions)\n"
+                "static int _of_s0(void *_p) {\n"
+                "    _Ctx_OriginalFunc *ctx = (_Ctx_OriginalFunc*)_p;\n"
+                "    ctx->addr = Resolve(ctx->host);  // use ctx->host (pointer), NOT strcpy\n"
+                "    return (ctx->addr == 0) ? -1 : 1;\n"
+                "}\n"
+                "static int _of_s1(void *_p) {\n"
+                "    _Ctx_OriginalFunc *ctx = (_Ctx_OriginalFunc*)_p;\n"
+                "    ctx->sa.sin_family = AF_INET;\n"
+                "    ctx->sa.sin_addr.s_addr = ctx->addr;\n"
+                "    return 2;\n"
+                "}\n"
+                "static int _of_s2(void *_p) {\n"
+                "    _Ctx_OriginalFunc *ctx = (_Ctx_OriginalFunc*)_p;\n"
+                "    closesocket(ctx->sock);  // void-returning → call as STATEMENT, NO assignment\n"
+                "    return -1;\n"
+                "}\n"
+                "static int _of_s99(void *_p) { return -1; } // dead state\n"
+                "typedef int (*_STATE_FN_OriginalFunc)(void*);\n"
+                "static _STATE_FN_OriginalFunc _dispatch_OriginalFunc[] = {_of_s0, _of_s1, _of_s99};\n\n"
+                "// Entry: assign pointer params directly (they are already pointers)\n"
+                "int OriginalFunc(char *host, char *file) {\n"
+                "    _Ctx_OriginalFunc _c; memset(&_c, 0, sizeof(_c));\n"
+                "    _c.host = host;  // pointer assignment — correct\n"
+                "    _c.file = file;  // pointer assignment — correct\n"
+                "    int _st = 0;\n"
+                "    while (_st >= 0) _st = _dispatch_OriginalFunc[_st](&_c);\n"
+                "    return _c.result;\n"
+                "}\n"
+                "```\n\n"
+                "CRITICAL RULES:\n"
+                "- Pointer params (char*, BYTE*, void*) → store as POINTER in struct, assign with `=`\n"
+                "- Array locals (char buf[N]) → store as array in struct, copy with strcpy/memcpy\n"
+                "- NEVER convert char* param to char[260] — causes C3863 (array not assignable)\n"
+                "- NEVER add unused/padding fields — only fields that map to real variables\n"
+                "- Keep ORIGINAL variable names as field names when possible (readable + fewer mistakes)\n\n"
+                "VOID FUNCTION HANDLING:\n"
+                "- If the original function returns void → entry function returns void, NO 'result' field.\n"
+                "- If a CALLED function returns void (e.g. free(), memset(), sendReport(), closesocket()):\n"
+                "  CORRECT: sendReport(ctx->buf); return 3;\n"
+                "  WRONG:   ctx->result = sendReport(ctx->buf);  // C2186 void cannot be assigned!\n"
+                "- If unsure whether a function returns void, call it as a STATEMENT (never assign).\n\n"
+                "COMMON MISTAKES (each causes compile errors):\n"
+                "- Assigning void function result to a field → C2186 (see VOID HANDLING above)\n"
+                "- Defining struct/state functions INSIDE the main function → C has NO nested functions\n"
+                "- Reusing `_Ctx` name for multiple functions → use _Ctx_FuncA, _Ctx_FuncB (avoids C2371)\n"
+                "- Naming function pointers after Win32 APIs (e.g. `int (*GetUserNameA)(...)`) → causes C2365\n"
+                "- Missing struct fields → every `ctx->X` access needs a matching field (C2039)\n"
+                "- Converting pointer params to fixed arrays → causes C3863\n"
+                "- Using `_st` variable inside state functions (it's only in the entry function) → causes C2065\n"
+                "- Using array subscript [] on non-array/non-pointer field → C2109\n"
+            ),
+            # strat_3: Dynamic Import/API Resolution
+            "strat_3": (
+                "C/C++-SPECIFIC TECHNIQUES:\n"
+                "- Use ONLY real Windows APIs that actually exist. NEVER invent API names.\n"
+                "- CRITICAL: Suffix ALL new variables with the FUNCTION NAME to avoid collisions:\n"
+                "  For function 'download_file': _s_dll_download_file, _s_fn_download_file, _hM_download_file\n\n"
+                "--- STEP 1: BUILD DLL AND API NAME STRINGS ON THE STACK ---\n"
+                "Build ALL DLL and API name strings via per-character stack assignment (PREFERRED — heuristic-safe):\n"
+                "  char _s_dll[13]; _s_dll[0]='k'; _s_dll[1]='e'; _s_dll[2]='r'; _s_dll[3]='n'; _s_dll[4]='e'; _s_dll[5]='l';\n"
+                "  _s_dll[6]='3'; _s_dll[7]='2'; _s_dll[8]='.'; _s_dll[9]='d'; _s_dll[10]='l'; _s_dll[11]='l'; _s_dll[12]=0;\n"
+                "Or arithmetic construction: _s_dll[0]=(char)(0x60+0x0B); /* 'k' */\n"
+                "MIX techniques for variety. AVOID XOR decode loops — they trigger AV heuristic rules.\n"
+                "Do this for EVERY DLL name AND EVERY API name before passing to LoadLibraryA/GetProcAddress.\n\n"
+                "--- STEP 2: RESOLVE APIs VIA GetProcAddress WITH CORRECT SIGNATURES ---\n"
+                "Use function pointer VARIABLES (NOT typedef) declared LOCALLY inside the function body.\n"
+                "CRITICAL: Each pointer MUST match the EXACT signature (return type, calling convention, ALL param types) of the real API.\n"
+                "Do NOT use one generic signature for all APIs — they are all different!\n"
+                "Load each DLL ONCE and reuse the handle for all APIs from that DLL:\n"
+                "  HMODULE _hM = LoadLibraryA(_s_dll);\n"
+                "  /* CreateFileA: returns HANDLE, 7 params */\n"
+                "  char _s_fn0[12]; _s_fn0[0]='C'; _s_fn0[1]='r'; ... _s_fn0[11]=0;\n"
+                "  HANDLE (WINAPI *_pf0)(LPCSTR,DWORD,DWORD,LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE) = NULL;\n"
+                "  *(FARPROC*)&_pf0 = GetProcAddress(_hM, _s_fn0);\n"
+                "  /* WriteFile: returns BOOL, 5 params — DIFFERENT signature! */\n"
+                "  char _s_fn1[10]; _s_fn1[0]='W'; _s_fn1[1]='r'; ... _s_fn1[9]=0;\n"
+                "  BOOL (WINAPI *_pf1)(HANDLE,LPCVOID,DWORD,LPDWORD,LPOVERLAPPED) = NULL;\n"
+                "  *(FARPROC*)&_pf1 = GetProcAddress(_hM, _s_fn1);\n"
+                "  /* ReadFile: returns BOOL, 5 params */\n"
+                "  BOOL (WINAPI *_pf2)(HANDLE,LPVOID,DWORD,LPDWORD,LPOVERLAPPED) = NULL;\n"
+                "  /* CopyFileA: returns BOOL, 3 params */\n"
+                "  BOOL (WINAPI *_pf3)(LPCSTR,LPCSTR,BOOL) = NULL;\n"
+                "  /* DeleteFileA: returns BOOL, 1 param */\n"
+                "  BOOL (WINAPI *_pf4)(LPCSTR) = NULL;\n\n"
+                "COMMON API SIGNATURES (MUST match exactly):\n"
+                "  CreateFileA: HANDLE(LPCSTR,DWORD,DWORD,LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE) — 7 params\n"
+                "  WriteFile: BOOL(HANDLE,LPCVOID,DWORD,LPDWORD,LPOVERLAPPED) — 5 params\n"
+                "  ReadFile: BOOL(HANDLE,LPVOID,DWORD,LPDWORD,LPOVERLAPPED) — 5 params\n"
+                "  CloseHandle: BOOL(HANDLE) — 1 param\n"
+                "  VirtualAlloc: LPVOID(LPVOID,SIZE_T,DWORD,DWORD) — 4 params\n"
+                "  RegOpenKeyExA: LONG(HKEY,LPCSTR,DWORD,REGSAM,PHKEY) — 5 params\n"
+                "  RegQueryValueExA: LONG(HKEY,LPCSTR,LPDWORD,LPDWORD,LPBYTE,LPDWORD) — 6 params\n"
+                "  RegSetValueExA: LONG(HKEY,LPCSTR,DWORD,DWORD,const BYTE*,DWORD) — 6 params\n"
+                "  InternetOpenA: HINTERNET(LPCSTR,DWORD,LPCSTR,LPCSTR,DWORD) — 5 params\n"
+                "  InternetOpenUrlA: HINTERNET(HINTERNET,LPCSTR,LPCSTR,DWORD,DWORD,DWORD_PTR) — 6 params\n"
+                "  CreateProcessA: BOOL(LPCSTR,LPSTR,LPSECURITY_ATTRIBUTES,LPSECURITY_ATTRIBUTES,BOOL,DWORD,LPVOID,LPCSTR,LPSTARTUPINFOA,LPPROCESS_INFORMATION) — 10 params\n"
+                "  GetModuleFileNameA: DWORD(HMODULE,LPSTR,DWORD) — 3 params\n"
+                "  SHGetFolderPathA: HRESULT(HWND,int,HANDLE,DWORD,LPSTR) — 5 params\n"
+                "  send: int(SOCKET,const char*,int,int) — 4 params\n"
+                "  recv: int(SOCKET,char*,int,int) — 4 params\n"
+                "  connect: int(SOCKET,const struct sockaddr*,int) — 3 params\n"
+                "  closesocket: int(SOCKET) — 1 param\n"
+                "  sprintf: int(char*,const char*,...) — variadic, DO NOT resolve via GetProcAddress\n"
+                "  strlen/strcmp/strcpy/strncpy/strcat/memcpy/memset: CRT functions — DO NOT resolve via GetProcAddress\n\n"
+                "ANTI-HEURISTIC RULES:\n"
+                "- Use short generic pointer names: _pf0, _pf1, _pf2 etc. AVOID _pfCreateFile, _pfWriteFile.\n"
+                "- AVOID variable names containing: enc, dec, xor, key, cipher, crypt, payload, shell, inject.\n"
+                "- Do NOT resolve LoadLibraryA or GetProcAddress themselves — keep them as direct calls.\n"
+                "- Do NOT resolve project helper functions (non-Windows functions defined in other .c/.h files).\n"
+                "- Do NOT resolve CRT functions (strlen, strcmp, strcpy, sprintf, memcpy, memset, printf, etc.) — they are statically linked.\n"
+                "- ALL string buffers and function pointer variables MUST be LOCAL inside the function body.\n"
+                "- NEVER add typedef, extern, #include, or global declarations.\n"
+                + ("- Declare ALL variables at the TOP of the function body before any statements (C89 style).\n"
+                   if compiler_type == 'msvc' else
+                   "- Variables can be declared anywhere in a block (C99+). For-loop initializers are OK.\n") +
+                "- NEVER use nested functions (C forbids them).\n"
+            ),
+            # strat_4: Function Fragmentation
+            "strat_4": (
+                "C/C++-SPECIFIC TECHNIQUES:\n\n"
+                "--- HEADER FILE RULES (prevents C2084 'already has a body') ---\n"
+                "CRITICAL: If this file is a .h file:\n"
+                "  1) Add `#pragma once` as the VERY FIRST LINE of the file.\n"
+                "  2) Mark ALL new helpers and structs `static`.\n"
+                "  3) Keep every existing function in EXACTLY the same order — do NOT reorder.\n"
+                "  4) Do NOT add any #include lines not already in the original file.\n"
+                "  5) Insert new helpers IMMEDIATELY ABOVE the function you are decomposing.\n\n"
+                "--- NAMING CONVENTION (MANDATORY — violation = compilation failure) ---\n"
+                "Every struct, typedef, and helper MUST end with the ORIGINAL FUNCTION NAME.\n"
+                "If the function is 'combineArrs':  _Ctx_combineArrs, _step0_combineArrs, _step1_combineArrs\n"
+                "If the function is 'sendReport':   _Ctx_sendReport, _step0_sendReport, _step1_sendReport\n"
+                "If the function is 'initGlobals':   _Ctx_initGlobals, _step0_initGlobals\n"
+                "FORBIDDEN: _Ctx, _OP_CTX, _init, _proc, _step0 — these WILL cause C2011/C2084 redefinition errors.\n\n"
+                "--- CONTEXT STRUCT ---\n"
+                "  `static struct _Ctx_<funcname> { <fields> };`\n"
+                "  a) For EVERY local variable, add a matching field (PRESERVE EXACT TYPE).\n"
+                "     - `char buf[260]` → field `char buf[260]` (array stays array)\n"
+                "     - `char* ptr` → field `char* ptr` (pointer stays pointer)\n"
+                "     - `int i, count` → TWO fields: `int i; int count;`\n"
+                "  b) For EVERY function parameter, add a matching field.\n"
+                "  c) Add a 'result' field matching the return type (skip if void).\n"
+                "  d) VERIFY: for every `ctx->X`, confirm `X` exists in struct.\n\n"
+                "--- HELPER FUNCTIONS ---\n"
+                "  `static int _step0_<funcname>(struct _Ctx_<funcname>* ctx) { ... return 0; }`\n"
+                "  `static int _step1_<funcname>(struct _Ctx_<funcname>* ctx) { ... return 0; }`\n\n"
+                "--- VOID FUNCTION HANDLING ---\n"
+                "- If original returns void: NO 'result' field.\n"
+                "- void calls (free, memset, closesocket): call as STATEMENT, not assignment.\n"
+                "  CORRECT: free(ctx->buf); return 0;\n"
+                "  WRONG:   ctx->result = free(ctx->buf);  // C2186!\n\n"
+                "--- WIN32 API COLLISION PREVENTION (C2373 errors) ---\n"
+                "NEVER redeclare or create variables/function-pointers named after Win32 APIs.\n"
+                "WRONG: `BOOL (WINAPI *Process32First)(...) = NULL;`  // redefines Win32 API → C2373!\n"
+                "WRONG: `HANDLE OpenProcessToken = ...;`  // redefines Win32 API → C2373!\n"
+                "CORRECT: Just CALL the APIs directly: `Process32First(hSnap, &pe);`\n"
+                "The context struct should only hold DATA (variables, buffers, handles) — never function pointers for APIs that are already available via #include.\n\n"
+                "--- C RULES ---\n"
+                + ("- Declare ALL variables at the TOP of a block (C89 style).\n"
+                   if compiler_type == 'msvc' else
+                   "- Variables can be declared anywhere in a block (C99+). For-loop initializers are OK.\n") +
+                "- NEVER define functions inside another function body.\n"
+                "- Pointer params (char*) → store as pointer. Array locals (char buf[N]) → store as array.\n"
+                "- Use C-style casts. Use NULL not nullptr.\n"
+            ),
+            # strat_5: Semantic Substitution
+            "strat_5": (
+                "C/C++-SPECIFIC TECHNIQUES:\n\n"
+                "--- SAFE CRT SUBSTITUTIONS (use these freely) ---\n"
+                "Replace `memcpy(dst, src, n)` with manual byte loop:\n"
+                "  { DWORD _ci; for(_ci=0;_ci<n;_ci++) ((BYTE*)dst)[_ci]=((const BYTE*)src)[_ci]; }\n"
+                "Replace `strcmp(a,b)` with manual compare:\n"
+                "  { int _r=0; const char *_pa=a, *_pb=b; while(*_pa||*_pb){if(*_pa!=*_pb){_r=*_pa-*_pb;break;}_pa++;_pb++;} }\n"
+                "Replace `strcpy(d,s)` with: { const char *_p=s; char *_q=d; while((*_q++=*_p++)); }\n"
+                "Replace `strlen(s)` with: { DWORD _l=0; while(s[_l]) _l++; } then use _l.\n"
+                "Replace `memset(d,v,n)` with: { DWORD _ci; for(_ci=0;_ci<n;_ci++) ((BYTE*)d)[_ci]=(BYTE)v; }\n"
+                "Replace `strcat(d,s)` with: { char *_p=d; while(*_p) _p++; const char *_q=s; while((*_p++=*_q++)); }\n\n"
+                "--- SAFE ARITHMETIC SUBSTITUTIONS ---\n"
+                "  a + b → a - (~b) - 1  (or  a - (-(b)) which is just a + b, AVOID for clarity)\n"
+                "  a + 1 → a - (~0)  (two's complement: ~0 == -1, so a - (-1) == a + 1)\n"
+                "  a * 2 → a << 1;  a * 4 → a << 2;  a * 8 → a << 3\n"
+                "  a / 2 → a >> 1;  a / 4 → a >> 2  (unsigned only!)\n"
+                "  a % 2 → a & 1;  a % 4 → a & 3;  a % 8 → a & 7;  a % 16 → a & 15\n"
+                "  a == b → !(a ^ b);  a != b → !!(a ^ b)\n"
+                "  a == 0 → !a;  a != 0 → !!a\n\n"
+                "--- UNSAFE SUBSTITUTIONS (NEVER DO THESE) ---\n"
+                "- NEVER substitute Win32 APIs with NT-layer APIs (NtCreateFile, NtWriteFile, NtSetValueKey).\n"
+                "- NEVER invent function names that don't exist in Windows or CRT.\n"
+                "- NEVER change pointer types in assignments or comparisons (char* ↔ int, HANDLE ↔ DWORD etc.).\n"
+                "- NEVER replace signed division/modulo with bitwise shift/mask (only safe for unsigned).\n"
+                "- NEVER substitute operations that depend on evaluation order or side effects.\n"
+                "- NEVER change the type of a variable when substituting the expression that initializes it.\n\n"
+                "--- C RULES ---\n"
+                + ("- Declare ALL loop variables at the TOP of the enclosing block (C89 style):\n"
+                   "  CORRECT: { DWORD _ci; for(_ci=0;_ci<n;_ci++) ... }\n"
+                   "  WRONG:   for(DWORD _ci=0;_ci<n;_ci++) ...  // not valid C89!\n"
+                   if compiler_type == 'msvc' else
+                   "- For-loop initializers `for(DWORD _ci=0;_ci<n;_ci++)` are valid in C99+ mode.\n") +
+                "- Use BLAND variable names for temporaries: _ci, _t0, _v0, _r0 — NOT _enc, _xor, _key.\n"
+                "- ONLY use real, existing Windows/CRT APIs. Stay within the SAME API layer (Win32→Win32, CRT→CRT).\n"
+                "- NEVER add typedef, extern, #include, or global declarations.\n"
+                "- Keep ALL code INSIDE the original function body unless creating helper functions.\n"
+            ),
+            "strat_all": (
+                "C/C++-SPECIFIC TECHNIQUES — APPLY ALL THREE IN ORDER:\n\n"
+                "--- STEP 1: BUILD EVERY STRING ON THE STACK ---\n"
+                "BEFORE:  CreateFileA(\"C:\\\\Temp\\\\d.bin\", ...);\n"
+                "AFTER:\n"
+                "  char _s0[16]; _s0[0]='C'; _s0[1]=':'; _s0[2]='\\\\'; _s0[3]='T';\n"
+                "  _s0[4]='e'; _s0[5]='m'; _s0[6]='p'; _s0[7]='\\\\';\n"
+                "  _s0[8]='d'; _s0[9]='.'; _s0[10]='b'; _s0[11]='i'; _s0[12]='n'; _s0[13]=0;\n"
+                "Alternative: arithmetic construction: _s0[0]=(char)(0x40+3); /* C */\n"
+                "MIX both techniques across strings for variety.\n"
+                "Do this for EVERY string: paths, DLL names, registry keys, API names, URLs.\n"
+                "AVOID: XOR decode loops, variable names containing enc/dec/xor/key/cipher.\n\n"
+                "--- STEP 2: RESOLVE Win32 APIs VIA GetProcAddress ---\n"
+                "Use function pointer VARIABLES (NOT typedef) declared LOCALLY in the function body.\n"
+                "CRITICAL: Each pointer MUST match the EXACT signature (return type + all params) of the API.\n"
+                "Do NOT use one generic signature for all APIs — they are all different!\n"
+                "Load each DLL ONCE, reuse the handle for all APIs from that DLL:\n"
+                "  /* build 'kernel32.dll' on stack */\n"
+                "  char _s1[13]; _s1[0]='k'; _s1[1]='e'; ... _s1[12]=0;\n"
+                "  HMODULE _hM = LoadLibraryA(_s1);\n"
+                "  /* CreateFileA: returns HANDLE, 7 params */\n"
+                "  char _s2[12]; _s2[0]='C'; _s2[1]='r'; ... _s2[11]=0;\n"
+                "  HANDLE (WINAPI *_pf0)(LPCSTR,DWORD,DWORD,LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE) = NULL;\n"
+                "  *(FARPROC*)&_pf0 = GetProcAddress(_hM, _s2);\n"
+                "  /* CopyFileA: returns BOOL, 3 params — totally different! */\n"
+                "  char _s3[10]; _s3[0]='C'; _s3[1]='o'; ... _s3[9]=0;\n"
+                "  BOOL (WINAPI *_pf1)(LPCSTR,LPCSTR,BOOL) = NULL;\n"
+                "  *(FARPROC*)&_pf1 = GetProcAddress(_hM, _s3);\n\n"
+                "Apply to: CreateFileA/W, WriteFile, ReadFile, RegOpenKeyExA/W, RegQueryValueExA/W,\n"
+                "  VirtualAlloc, CreateProcessA/W, InternetOpenA, InternetOpenUrlA, HttpOpenRequestA,\n"
+                "  CopyFileA, DeleteFileA, CreateDirectoryA, GetModuleFileNameA, SHGetFolderPathA.\n"
+                "Do NOT resolve LoadLibraryA/GetProcAddress themselves — keep them as direct calls.\n"
+                "Do NOT resolve project helper functions (non-Windows functions defined in other .c/.h files).\n"
+                "Use short generic names: _pf0, _pf1, _pf2 (NOT _pfCreateFile, _pfWriteFile).\n\n"
+                "--- STEP 3: SEMANTIC SUBSTITUTION (only if safe) ---\n"
+                "  strcmp(a,b)==0 -> memcmp(a,b,strlen(a)+1)==0\n"
+                "  memcpy(d,s,n) -> for(DWORD _ci=0;_ci<n;_ci++) ((BYTE*)d)[_ci]=((BYTE*)s)[_ci];\n"
+                "  x + 1 -> x - (~0)    x * 4 -> x << 2    x == y -> !(x ^ y)\n"
+                "Skip any substitution you are unsure about.\n\n"
+                "C-SPECIFIC RULES:\n"
+                "- All string buffers and function pointer variables MUST be LOCAL inside the function body.\n"
+                "- NEVER add typedef, extern, #include, or global declarations.\n"
+                "- NEVER use nested functions (C forbids them).\n"
+                "- NEVER rename the function itself or its parameters.\n"
+                "- ONLY use real Windows APIs — NEVER invent function names.\n"
+                + ("- Declare ALL variables at the TOP of the function body (C89 style).\n"
+                   if compiler_type == 'msvc' else
+                   "- Variables can be declared anywhere in a block (C99+). For-loop initializers are OK.\n") +
+                ""
+            ),
+
+        }
+        return hints.get(strategy, "")
+
+
+def get_strategy_prompt(strategy: str, language: str = "c", compiler_type: str = 'msvc') -> str:
+    """Get the strategy prompt tailored for the specified language."""
+    base = _strategy_prompt_base.get(strategy)
+    if base is None:
+        valid_keys = sorted(_strategy_prompt_base.keys())
+        raise ValueError(
+            f"Unknown strategy '{strategy}'. Valid strategies: {valid_keys}"
+        )
+    prohibitions = _get_language_specific_prohibitions(language, compiler_type)
+    features = _get_language_specific_features(language, strategy, compiler_type)
+    result = base
+    if features:
+        result += "\nLANGUAGE-SPECIFIC TIPS:\n" + features
+    result += prohibitions
+    return result
+
+
+# Base strategy instructions (language-agnostic core)
+_strategy_prompt_base = {
+    # Strategy 1: String & Constant Obfuscation
+    # Goal: Destroy signature matching on string literals, API names, paths, URLs, keys
     "strat_1": (
-        "1. Optimize the code by removing redundant computations and duplicate logic.\n"
-        "2. Address performance bottlenecks: replace slow patterns with efficient alternatives (e.g. use lookup tables instead of repeated conditionals, combine repeated string operations).\n"
-        "3. Simplify complex logic: merge nested if-else chains, replace verbose patterns with concise equivalents, use ternary operators where appropriate.\n"
-        "4. Use alternative data structures or algorithms where beneficial (e.g. binary search instead of linear scan, hash lookup instead of sequential compare).\n"
-        "5. Leverage language-specific features and standard library functions (e.g. memcpy, memset, strstr, sprintf for C; std::find, std::sort, std::string methods for C++).\n"
-        "\nABSOLUTE PROHIBITIONS:\n"
-        "- NEVER delete, remove, rename, or change the type of ANY variable declaration. Keep every variable exactly as declared.\n"
-        "- NEVER merge two variables into one or shadow existing variable names with different types.\n"
-        "- NEVER delete entire statements or function calls. Only REPLACE them with optimized equivalents.\n"
-        "- NEVER replace function bodies with stubs, comments, or placeholders like '// Implementation goes here'.\n"
-        "- NEVER output empty function bodies or bodies with only 'return 0;' / 'return NULL;'.\n"
-        "- Your output MUST contain ALL original variable declarations and ALL original logic. Shorter output is acceptable ONLY if you merged redundant COMPUTATION (not variable declarations).\n"
-        "- Keep ALL original function/API calls. Only optimize HOW they are called, not WHETHER they are called.\n"
-        "- You MAY create new helper functions, but you MUST provide their COMPLETE definition in your output. NEVER call a function without defining it.\n"
-        "- NEVER rename or replace calls to existing project helper functions (e.g. _memcpy, _memset, _xor). Keep their exact names.\n"
-        "- ONLY use Windows/C API functions that actually exist (e.g. CreateFileW, RegSetValueExW). NEVER invent fake API names.\n"
+        "TASK: Protect ALL string literals and constant values in the function using runtime construction so they do not appear in the compiled binary.\n\n"
+        "RULES:\n"
+        "1. Every string literal (file paths, URLs, registry keys, command strings, error messages, module names, API names) "
+        "MUST be replaced with a runtime-constructed form. Do NOT leave any original string as-is.\n"
+        "2. Construction techniques — MIX at least 2 different techniques across the function (do NOT use only one):\n"
+        "   - Stack-built strings: assign each character individually to a local char array "
+        "(e.g. `char _s0[5]; _s0[0]='t'; _s0[1]='e'; _s0[2]='s'; _s0[3]='t'; _s0[4]=0;`). "
+        "This is the PREFERRED technique — it looks like normal initialization code and avoids heuristic triggers.\n"
+        "   - Arithmetic construction: compute each character from an expression "
+        "(e.g. `_s0[0]=(char)(0x60+0x14);` which gives 't', or `_s0[1]=(char)(('a'+4));` which gives 'e').\n"
+        "   - Split-concatenate: build from 2-3 sub-parts using strcat/memcpy at the use point.\n"
+        "   - Byte array with add/sub transform: store bytes shifted by a constant "
+        "(e.g. each byte = original + 7) then subtract to recover "
+        "(e.g. `for(int _i=0;_i<_len;_i++) _dst[_i]=_src[_i]-7; _dst[_len]=0;`).\n"
+        "3. Replace ALL integer magic numbers (port numbers, buffer sizes, error codes, offsets) with computed expressions:\n"
+        "   - 443 → (0x1bb), 80 → (0x50 & 0xff), 256 → (1 << 8), 0xDEADBEEF → (0xDEAD0000 | 0xBEEF)\n"
+        "4. If you use a helper function, define it as a SEPARATE static function BEFORE the main function "
+        "(C does NOT allow nested functions). But prefer INLINE character assignment within the function body.\n"
+        "5. ALL original logic and all original function calls MUST remain — only the way literals are represented changes.\n"
+        "6. Output MUST be a complete, working function. String construction MUST produce the exact original string values at runtime.\n"
+        "7. ALL string construction code MUST be INSIDE the function body.\n\n"
+        "ANTI-HEURISTIC GUIDELINES (important for avoiding heuristic detection):\n"
+        "- AVOID classic XOR decode loops (`for(i=0;i<len;i++) dst[i]=src[i]^key;`) — these trigger AV heuristic rules.\n"
+        "- PREFER per-character stack assignment — it compiles to simple `mov byte` instructions that look like normal initialization.\n"
+        "- Use VARIED techniques across different strings: some stack-built, some arithmetic, some split-concat. "
+        "Uniform patterns across all strings trigger pattern-matching heuristics.\n"
+        "- Use DIFFERENT arithmetic offsets for different strings (e.g. +7 for one, -3 for another, +0x11 for a third).\n"
+        "- Keep variable names short and generic (_s0, _b1, _t2) — not _enc, _dec, _xor, _key which are flagged names.\n\n"
+        "CRITICAL C/C++ RULES (violating these causes compile failure):\n"
+        "- C does NOT support nested functions. Any helper MUST be defined BEFORE the main function, at file scope.\n"
+        "- NEVER close the function body early with '}' and then put code after it. ALL original code stays inside the function braces.\n"
+        "- NEVER use macros with embedded variable declarations.\n"
+        "- NEVER initialize a C array from another array variable (e.g. `char a[] = b;` is INVALID C).\n"
+        "- NEVER declare a local variable with the same name as a function parameter.\n"
+        "- NEVER use 'static' keyword on local variables that call functions (e.g. `static X p = GetProcAddress(...)` is INVALID in C).\n"
+        "- NEVER create a local variable with the same name as a Windows API. Use opaque names like _p0, _p1 instead.\n"
+        "- NEVER encode #define constants (e.g. CSIDL_INTERNET_CACHE is a compile-time constant, not a string).\n"
+        "- Variable names must NOT collide with existing variables. Use _s0, _s1, _s2, etc.\n\n"
+        "CORRECT PATTERN (stack-built strings — preferred, heuristic-safe):\n"
+        "```\n"
+        "void OriginalFunc(int param1) {\n"
+        "    int existing_var = 0;\n"
+        "    // Build strings on the stack character by character\n"
+        "    char _s0[13]; _s0[0]='k'; _s0[1]='e'; _s0[2]='r'; _s0[3]='n'; _s0[4]='e'; _s0[5]='l';\n"
+        "    _s0[6]='3'; _s0[7]='2'; _s0[8]='.'; _s0[9]='d'; _s0[10]='l'; _s0[11]='l'; _s0[12]=0;\n"
+        "    // Or use arithmetic to build characters\n"
+        "    char _s1[4]; _s1[0]=(char)(0x60+4); _s1[1]=(char)(0x60+12); _s1[2]=(char)(0x60+12); _s1[3]=0;\n"
+        "    // ... use _s0, _s1 wherever the original strings were ...\n"
+        "    // ALL original code stays here inside the braces\n"
+        "}\n"
+        "```\n\n"
+        "WRONG PATTERN (NEVER do this — causes hundreds of compile errors):\n"
+        "```\n"
+        "void OriginalFunc(int param1) {\n"
+        "    int existing_var = 0;\n"
+        "}  // <-- WRONG! Premature close!\n"
+        "static void _xd(...) { ... }  // <-- WRONG! Between functions!\n"
+        "char _s0[16]; _xd(...);       // <-- WRONG! At file scope!\n"
+        "```\n"
     ),
-    # Strategy 2: Code Quality and Reliability
-    # Ensures generated code adheres to standard practices with improved error/edge
-    # case handling, prevents runtime issues, adds extra branching.
+    # Strategy 1: Control Flow Flattening via State Machine
+    # Goal: Destroy recognizable sequential/conditional code structure
     "strat_2": (
-        "1. Add proper error handling: check return values of function calls, validate pointers before use (NULL checks), handle memory allocation failures.\n"
-        "2. Add edge case handling: check for empty strings, zero-length arrays, integer overflow, buffer size limits before operations.\n"
-        "3. Follow coding best practices: initialize all variables, use proper types, add bounds checking for array/buffer accesses.\n"
-        "4. Add defensive branching: wrap risky operations in if-guards, add fallback paths for failure cases.\n"
-        "5. Add brief inline comments for complex logic blocks.\n"
-        "\nABSOLUTE PROHIBITIONS:\n"
-        "- NEVER delete, remove, or shorten ANY existing code. Only ADD error handling around it.\n"
-        "- NEVER replace function bodies with stubs, comments, or placeholders.\n"
-        "- NEVER output empty function bodies. Your output MUST be LONGER than the original (you are ADDING checks).\n"
-        "- Keep ALL original logic intact. Only WRAP it with safety checks.\n"
+        "TASK: Transform the function's control flow into a state-machine dispatch loop.\n\n"
+        "RULES:\n"
+        "1. Identify every major logical block (initialization, each branch of if/elif/else, loop bodies, cleanup/return). Assign each a numeric state ID starting from 0.\n"
+        "2. Extract each block into a separate helper function defined OUTSIDE the main function. Name them blandly: _s0_<FuncName>, _s1_<FuncName>, etc.\n"
+        "3. Replace the original code body with a dispatch loop:\n"
+        "   - Build a dispatch table mapping state ID → helper function.\n"
+        "   - Run a while-loop that calls dispatch[current_state](context) and receives the next state.\n"
+        "   - Use a shared mutable context struct to pass data between states.\n"
+        "   - C ONLY — CONTEXT STRUCT CHECKLIST (follow step-by-step to avoid C2039 errors):\n"
+        "     a) Read the ENTIRE original function from first line to last line.\n"
+        "     b) For EVERY local variable declaration, add a matching field to the context struct (PRESERVE THE EXACT TYPE).\n"
+        "     c) For EVERY function parameter, add a matching field.\n"
+        "     d) Add a 'result' field matching the function's return type (skip if void).\n"
+        "     e) VERIFY: for every `ctx->X` access in state functions, confirm `X` exists in your struct. If not, ADD IT.\n"
+        "4. Add 1-2 bogus dead states containing plausible-looking but harmless code (e.g. zeroing a buffer, incrementing a counter).\n"
+        "5. Insert opaque predicates (conditions that always evaluate the same way) as guards in 1-2 state transitions.\n"
+        "6. Keep the original function's signature (name, parameters, return type) EXACTLY the same.\n"
+        "7. Call ALL existing API functions DIRECTLY — do NOT add dynamic API resolution. Do NOT create variables or fields named after Win32 APIs.\n\n"
+        "VOID FUNCTION HANDLING (CRITICAL):\n"
+        "- If the original function returns void, the entry function must also return void — no result field needed.\n"
+        "- If a called function returns void (e.g. sendReport(), free(), memset()), call it as a STATEMENT, NOT an assignment:\n"
+        "  CORRECT: sendReport(ctx->buf); return 3;\n"
+        "  WRONG: ctx->result = sendReport(ctx->buf);  // C2186: void cannot be assigned!\n"
+        "- If a called function returns a value you DON'T use, still call it as a statement.\n\n"
+        "ANTI-HEURISTIC GUIDELINES:\n"
+        "- Use BLAND generic names: _s0, _s1, _ctx, _st, _disp — nothing crypto-looking.\n"
+        "- AVOID names containing: _enc, _dec, _xor, _key, _cipher, _crypt, _payload, _shell, _inject.\n"
+        "- Dead states should look like normal utility code, NOT decoy malware logic.\n"
+        "- Opaque predicates should use arithmetic/pointer tricks, NOT string comparisons or API calls.\n"
     ),
-    # Strategy 3: Code Reusability
-    # Splits functions into modular blocks to alter execution flow, making it harder
-    # for detectors relying on control flow patterns while achieving the same outcome.
+    # Strategy 2: Dynamic Import and API Resolution
+    # Goal: Remove all static import references and visible module/API/DLL names from the binary
     "strat_3": (
-        "1. Split the supplied function into smaller helper functions. Extract logical blocks (loops, conditionals, computation sections) into separate named functions.\n"
-        "2. The smaller helper functions MUST be defined OUTSIDE the main function, NOT inside it.\n"
-        "3. Call the helper functions from inside the original function to maintain the same behavior.\n"
-        "4. Keep the original function's signature (name, return type, parameters) exactly the same.\n"
-        "5. Each helper function should have a clear single responsibility.\n"
-        "\nABSOLUTE PROHIBITIONS:\n"
-        "- NEVER delete any logic. Every original statement MUST appear either in the main function or in a helper function.\n"
-        "- NEVER replace function bodies with stubs, comments, or placeholders.\n"
-        "- NEVER output empty functions. The combined output (main + helpers) MUST contain ALL original logic.\n"
-        "- NEVER change the original function's signature or return behavior.\n"
+        "TASK: Replace ALL direct imports, require() calls, and API function calls with runtime-resolved equivalents to defeat import table and static API-name analysis.\n\n"
+        "RULES:\n"
+        "1. Remove every explicit import statement from the function scope. Resolve modules/libraries dynamically at point of first use.\n"
+        "   - Python: replace `import X` with `_X = __import__(''.join(map(chr, [<char codes of 'X'>])))`\n"
+        "   - Python: replace `from X import Y` with `_m = __import__('X', fromlist=['Y']); _Y = getattr(_m, 'Y')`\n"
+        "   - JS: replace `require('X')` with `(require)(['X'][0])` or build the module name via string ops: `require('mo'+'dule')`\n"
+        "   - C: replace every Win32/CRT direct call with a function pointer resolved via `GetProcAddress(LoadLibraryA(...), ...)`\n"
+        "2. Build ALL module/DLL/API name strings dynamically — do NOT write them as plain string literals:\n"
+        "   - C: Build DLL and API name strings on the stack using per-character assignment (PREFERRED — heuristic-safe):\n"
+        "     `char _s0[13]; _s0[0]='k'; _s0[1]='e'; _s0[2]='r'; _s0[3]='n'; ... _s0[12]=0;`\n"
+        "     Or arithmetic construction: `_s0[0]=(char)(0x60+0x0B);` etc.\n"
+        "     AVOID XOR decode loops — they trigger heuristic engines.\n"
+        "   - Python: `''.join(chr(x) for x in [111,115])` or split+join: `'so'+'cket'`\n"
+        "   - JS: `['ht','tp'].join('')` or `'f'+'s'`\n"
+        "3. Replace all method/attribute access on external objects with dynamic resolution:\n"
+        "   - Python: `obj.method(args)` → `getattr(obj, 'meth'+'od')(args)`\n"
+        "   - JS: `obj.property` → `obj['prop'+'erty']`\n"
+        "4. Cache the resolved references in local variables (named opaquely) at the start of the function body so they are only resolved once.\n"
+        "5. ALL original functionality MUST be preserved. The dynamic resolution MUST call the exact same APIs/functions as the original.\n"
+        "6. CRITICAL (C/C++): Each function pointer MUST match the EXACT signature (return type, calling convention, ALL parameter types and count) of the real Win32 API it replaces. Do NOT use a generic signature for all APIs.\n"
     ),
-    # Strategy 4: Code Security
-    # Replaces cryptographic library calls with alternatives, modifies implementation
-    # of sensitive operations while maintaining core functionality.
+    # Strategy 3: Function Fragmentation with Indirect Call Chain
+    # Goal: Split the monolithic function into 4-6 small fragments so no single piece carries enough context to trigger detection
     "strat_4": (
-        "1. Identify security vulnerabilities and fix them (buffer overflows, unvalidated input, etc).\n"
-        "2. If the function contains cryptographic operations (encryption, hashing, key generation), replace the cryptographic library/API calls with alternative implementations that achieve the same result. For example: replace CryptCreateHash with a different hashing approach, use different cipher modes, or wrap operations differently.\n"
-        "3. If no cryptographic operations are present, focus on secure coding improvements: input validation, safe string operations, proper resource cleanup.\n"
-        "4. Follow secure coding standards: use safe functions (e.g. strncpy instead of strcpy, snprintf instead of sprintf).\n"
-        "\nABSOLUTE PROHIBITIONS:\n"
-        "- NEVER delete, remove, or shorten ANY existing code. Only REPLACE with secure equivalents.\n"
-        "- NEVER replace function bodies with stubs, comments, or placeholders.\n"
-        "- NEVER output empty function bodies. Your output MUST contain ALL original logic.\n"
-        "- NEVER change the function's observable behavior — only change HOW operations are performed.\n"
+        "TASK: Fragment the function into a chain of small, single-responsibility helper functions and replace the original body with an orchestration call chain.\n\n"
+        "*** MANDATORY NAMING RULE (violation = compilation failure) ***\n"
+        "Every new struct, typedef, and helper function you create MUST include the ORIGINAL FUNCTION NAME as a suffix.\n"
+        "Example: if the function is called 'sendReport', your names must be:\n"
+        "  struct: _Ctx_sendReport  (NOT _Ctx, NOT _OpCtx)\n"
+        "  helpers: _step0_sendReport, _step1_sendReport, _step2_sendReport  (NOT _step0, NOT _init)\n"
+        "Example: if the function is called 'combineArrs', your names must be:\n"
+        "  struct: _Ctx_combineArrs\n"
+        "  helpers: _step0_combineArrs, _step1_combineArrs\n"
+        "NEVER use a name without the function suffix. _Ctx, _init, _proc, _step0 alone WILL collide with other files.\n\n"
+        "RULES:\n"
+        "1. Extract every distinct logical unit into its own named helper function OUTSIDE the main function.\n"
+        "2. Aim for 3-5 helper functions. Each helper should be 5-15 lines and have a single clear responsibility.\n"
+        "3. AVOID names containing: enc, dec, xor, key, cipher, crypt, payload, shell, inject, hook, exploit.\n"
+        "4. Pass shared state between helpers using a context struct (C) or a dict/object (Python/JS):\n"
+        "   - The context struct MUST contain a field for EVERY local variable AND EVERY parameter of the original function.\n"
+        "   - If a helper accesses `ctx->X`, field `X` MUST exist in the struct.\n"
+        "5. Keep the original function's signature (name, parameters, return value) EXACTLY the same.\n"
+        "6. ALL original operations MUST appear somewhere across the fragments — nothing may be dropped.\n\n"
+        "HEADER FILE SAFETY (C/C++ — prevents C2084 'already has a body' errors):\n"
+        "- If the file is a .h header file, add `#pragma once` as the VERY FIRST LINE.\n"
+        "- Mark ALL new helper functions and structs as `static`.\n"
+        "- Do NOT reorder or move existing functions that you are NOT decomposing.\n"
+        "- Do NOT add any #include directives that are not already present.\n"
+        "- Output the COMPLETE file — every original function must still appear exactly once.\n\n"
+        "WIN32 API COLLISION PREVENTION (C/C++ — prevents C2373 redefinition errors):\n"
+        "- NEVER create variables, struct fields, or function pointers named after Win32 API functions.\n"
+        "  WRONG: `BOOL (WINAPI *Process32First)(...);` — redefines the Win32 API name → C2373!\n"
+        "  WRONG: `HANDLE OpenProcessToken;` — shadows the Win32 API → C2373!\n"
+        "- Just CALL Win32 APIs directly in your helper functions. They are already available via headers.\n"
+        "- The context struct holds only DATA (variables, buffers, handles, counters) — never API function pointers.\n\n"
+        "ANTI-HEURISTIC GUIDELINES:\n"
+        "- Each fragment should look like a normal utility function — not suspicious in isolation.\n"
+        "- Fragment boundaries should NOT align with 'suspicious' operations. Mix benign and sensitive code in each fragment.\n"
+        "- The orchestration in the main function should look like normal sequential calls, not an obfuscated dispatch.\n"
     ),
-    # Strategy 5: Code Obfuscation
-    # Renames functions/variables, adds unnecessary control flows, anti-debugging,
-    # redundant functions, and rarely triggered execution paths.
+    # Strategy 5: Semantic Substitution — Operation-Level Equivalence
+    # Goal: Replace every recognizable operation pattern with a functionally identical but syntactically alien form to defeat n-gram/ML-based and pattern-based AV
     "strat_5": (
-        "1. Change the given function's and LOCAL variable's names to meaningless, hard-to-understand strings which are not real words. DO NOT redefine or rename global variables (given to you) and names of functions that are called inside the given function ( might be defined elsewhere ) under any circumstances.\n"
-        "However if the given function name is any of `main`, `wmain`, `WinMain`, `wWinMain`, `DllMain`, `_tWinMain`, `_tmain` do not change it's name, only change the local variable's names inside the function.\n"
-        "2. Add unnecessary jump instructions, loops, and conditional statements inside the functions.\n"
-        "3. Add unnecessary functions and call those functions inside the original functions.\n"
-        "4. Add anti-debugging techniques to the code.\n"
-        "5. If there are loops/conditional statements in the code change them to their equivalent alternatives and make them more difficult to follow.\n"
-        "6. Incorporate code to the variants that activates under very rare and obscure cases without altering core functionality, making the rare code hard to detect during testing.\n"
-        "\nABSOLUTE PROHIBITIONS:\n"
-        "- NEVER delete, remove, or shorten ANY line of existing code. Only ADD obfuscation around it.\n"
-        "- NEVER replace function bodies with stubs, comments, or placeholders.\n"
-        "- NEVER output empty function bodies. Your output MUST be LONGER than the original (you are ADDING code).\n"
-        "- Keep ALL original logic intact. Every original statement MUST appear in your output.\n"
-        "- You MAY create new helper functions for obfuscation, but you MUST provide their COMPLETE definition in your output. NEVER call a function without defining it.\n"
-        "- NEVER rename calls to existing project helper functions (e.g. _memcpy, _memset, _xor). Keep their exact names.\n"
-        "- ONLY use Windows/C API functions that actually exist (e.g. CreateFileW, RegSetValueExW). NEVER invent fake API names like SetRegistryValueW or LoadLibraries.\n"
-    ),
-    # Strategy 6: Windows API Transformation
-    # Identifies Windows API calls and replaces them with alternative/indirect
-    # equivalents or wraps them in helper functions.
-    "strat_6": (
-        "1. Identify all Windows API function calls in the given functions.\n"
-        "2. If there are such function calls, replace each identified Windows API function call with an alternative Windows API function call or sequence of calls that achieves the same task.\n"
-        "3. If applicable, use indirect methods or wrappers around the Windows API calls to achieve the same functionality (e.g. use GetProcAddress+LoadLibrary to call APIs dynamically instead of direct calls).\n"
-        "4. Ensure that the functionality remains exactly the same after the replacement.\n"
-        "\nABSOLUTE PROHIBITIONS:\n"
-        "- NEVER delete, remove, or shorten ANY existing code. Only REPLACE API calls with equivalents.\n"
-        "- NEVER replace function bodies with stubs, comments, or placeholders.\n"
-        "- NEVER output empty function bodies. Your output MUST contain ALL original logic.\n"
-        "- NEVER change non-API code. Only transform Windows API calls.\n"
-        "- ONLY replace Windows API calls with REAL alternative Windows API calls that actually exist. NEVER invent fake API names like SetRegistryValueW or LoadLibraries.\n"
-        "- Keep all calls to project-defined helper functions (e.g. _memcpy, _memset, _xor) exactly as-is. These are NOT Windows APIs.\n"
+        "TASK: Substitute every recognizable built-in operation, loop pattern, string operation, and function call with a semantically equivalent but syntactically unrecognizable alternative.\n\n"
+        "RULES:\n"
+        "1. String operations — replace with low-level equivalents:\n"
+        "   - Python: `'a'+'b'` → `''.join(['a','b'])`; `s.lower()` → `s.translate(str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))`\n"
+        "   - JS: `a+b` → `[a,b].join('')`; `str.includes(sub)` → `str.indexOf(sub) !== -1`; `str.toLowerCase()` → `str.replace(/[A-Z]/g, c=>String.fromCharCode(c.charCodeAt(0)+32))`\n"
+        "   - C: replace `strcmp(a,b)` with manual byte-comparison loop; replace `strcpy(d,s)` with `memcpy(d,s,strlen(s)+1)`\n"
+        "2. Arithmetic — replace with bitwise/algebraic equivalents:\n"
+        "   - `a + b` → `a - (~b) - 1` (two's complement trick)\n"
+        "   - `a * 4` → `a << 2`; `a / 2` → `a >> 1`; `a % 8` → `a & 7`\n"
+        "   - `a == b` → `not (a ^ b)` (Python) / `!(a ^ b)` (C/JS)\n"
+        "   - `if a == b` → `if [a,b].count(a) == 2:` (Python)\n"
+        "3. Collection / loop operations — replace with functional-style equivalents:\n"
+        "   - Python `for x in lst:` → `list(map(lambda x: ..., lst))` or `[... for x in lst]`\n"
+        "   - Python `dict[key]` → `dict.get(key)` (safe) or `(lambda d,k: d[k])(dict, key)` (obfuscated access)\n"
+        "   - JS `arr.forEach(fn)` → `for(let _i=0,_l=arr.length;_i<_l;_i++) fn(arr[_i])`\n"
+        "   - JS `arr.length` → `arr['len'+'gth']` (computed property access, same value including sparse arrays)\n"
+        "4. API/method calls — replace known APIs with alternative SAME-LAYER APIs achieving the same result:\n"
+        "   - Python `os.path.join(a,b)` → `str((__import__('pathlib').Path(a))/b)` (pathlib is always safe)\n"
+        "   - Python `open(f,'r').read()` → `__import__('io').FileIO(f).readall().decode()`\n"
+        "   - JS `fs.readFileSync(f)` → `require('fs').readFileSync(f)` called through a constructed-name ref\n"
+        "   - C: replace `memcpy(d,s,n)` with a manual byte loop; replace `strcmp(a,b)` with char-by-char compare\n"
+        "   - C: replace `sprintf(buf,fmt,...)` with manual snprintf or sequential strcat/itoa calls\n"
+        "5. SAFETY: Every substitution MUST produce IDENTICAL runtime behavior for ALL inputs including edge cases (empty strings, zero values, NULL, boundary cases). If you are not 100%% certain a substitution is safe, DO NOT apply it — leave that operation unchanged.\n"
+        "6. AIM to substitute as many operations as possible (ideally 70%%+), but NEVER sacrifice correctness for coverage. A correct 40%% substitution is far better than a broken 70%% one.\n"
+        "7. NEVER substitute Win32 API calls with NT-layer APIs (NtCreateFile, NtWriteFile, NtSetValueKey) — they have completely different signatures, calling conventions, and parameter types. Use alternative USER-MODE Win32 APIs or CRT functions instead.\n\n"
+        "TYPE SAFETY (C/C++ — violating these causes compile errors):\n"
+        "- NEVER cast between unrelated pointer types without explicit cast (e.g. char* and HANDLE are NOT interchangeable).\n"
+        "- NEVER change the return type of any expression used in an assignment or comparison.\n"
+        "- When replacing an API call, the replacement MUST return the SAME type and accept the SAME argument types.\n"
+        "- NEVER use undeclared variables. Every variable MUST be declared before use.\n"
+        "- If targeting MSVC (C89 mode): declare loop variables at the TOP of the enclosing block, not inline in for-loops.\n\n"
+        "ANTI-HEURISTIC GUIDELINES:\n"
+        "- Use BLAND variable names for temporaries: _t0, _v0, _r0, _ci — nothing crypto-looking.\n"
+        "- AVOID names containing: enc, dec, xor, key, cipher, crypt, payload, shell, inject.\n"
+        "- MIX substitution techniques — don't apply the same pattern uniformly to all operations.\n"
+        "- Substituted code should look like normal 'manual' implementation, NOT like obfuscation.\n"
     ),
     "error_checking": (
         "1. Check for potential syntactic and semantic errors in the given functions.\n"
         "2. If you find any errors, correct them.\n"
         "3. Ensure that the corrected functions maintain the same functionality as the original functions."
     ),
-    # Combined strategy: applies a mix of optimization, quality, and obfuscation techniques.
+    # Combined: Maximum Evasion (strat_1 + strat_3 + strat_5 combined)
     "strat_all": (
-        "1. Optimize the code by removing redundant computations and simplifying logic.\n"
-        "2. Add error handling and edge case checks around risky operations.\n"
-        "3. Rename LOCAL variables to short names (do NOT rename globals or called functions).\n"
-        "4. Add dead-code branches that never execute to change binary profile.\n"
-        "5. Replace magic numbers with equivalent expressions.\n"
-        "\nABSOLUTE PROHIBITIONS:\n"
-        "- NEVER delete, remove, or shorten ANY line of code. Every original statement MUST appear in your output.\n"
-        "- NEVER replace function bodies with stubs, comments, or placeholders.\n"
-        "- NEVER output empty function bodies. Your output MUST be AT LEAST as long as the original.\n"
+        "TASK: Apply combined evasion techniques in PRIORITY order to defeat static and heuristic analysis.\n\n"
+        "--- PRIORITY 1: BUILD STRINGS ON THE STACK (most important) ---\n"
+        "Replace EVERY string literal with per-character stack assignment:\n"
+        "  char _s0[12]; _s0[0]='k'; _s0[1]='e'; _s0[2]='r'; ... _s0[11]=0;\n"
+        "Or arithmetic construction: _s0[0]=(char)(0x60+0x0B); _s0[1]=(char)(0x60+0x05);\n"
+        "NEVER use XOR decode loops — they trigger heuristic engines.\n"
+        "Use BLAND variable names: _s0, _s1, _b0, _v0, _t0. AVOID names with enc/dec/xor/key/cipher/crypt.\n\n"
+        "--- PRIORITY 2: DYNAMIC API RESOLUTION VIA GetProcAddress ---\n"
+        "Replace DIRECT calls to Win32 APIs (NOT project functions) with runtime-resolved function pointers.\n"
+        "CRITICAL: Each function pointer MUST match the EXACT signature of the API it replaces.\n"
+        "Do NOT use one generic signature for all APIs — each API has different params and return type.\n"
+        "Declare function pointer VARIABLES (not typedef) INSIDE the function body:\n"
+        "  HMODULE _hM = LoadLibraryA(_s_dllname);\n"
+        "  /* CreateFileA: 7 params */\n"
+        "  HANDLE (WINAPI *_pf0)(LPCSTR,DWORD,DWORD,LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE) = NULL;\n"
+        "  *(FARPROC*)&_pf0 = GetProcAddress(_hM, _s_apiname);\n"
+        "  /* CreateProcessA: 10 params — different signature! */\n"
+        "  BOOL (WINAPI *_pf1)(LPCSTR,LPSTR,LPSECURITY_ATTRIBUTES,LPSECURITY_ATTRIBUTES,BOOL,DWORD,LPVOID,LPCSTR,LPSTARTUPINFOA,LPPROCESS_INFORMATION) = NULL;\n"
+        "  *(FARPROC*)&_pf1 = GetProcAddress(_hM, _s_apiname2);\n"
+        "Target Win32 APIs: CreateFileA/W, WriteFile, ReadFile, RegOpenKeyExA/W, RegQueryValueExA/W,\n"
+        "VirtualAlloc, CreateProcessA/W, InternetOpenA, InternetOpenUrlA, HttpOpenRequestA, CopyFileA,\n"
+        "DeleteFileA, CreateDirectoryA, GetModuleFileNameA, SHGetFolderPathA.\n"
+        "Build DLL names AND API names on the stack (Priority 1) before passing to LoadLibraryA/GetProcAddress.\n"
+        "ANTI-HEURISTIC: Re-use the same HMODULE variable for the same DLL. Do NOT call LoadLibraryA\n"
+        "multiple times for the same DLL — load it ONCE and reuse the handle.\n"
+        "Use short generic pointer names: _pf0, _pf1, _pf2 etc. AVOID names like _pfCreateFile.\n"
+        "NEVER resolve project helper functions (functions defined in the same project) via GetProcAddress.\n"
+        "ONLY resolve actual Windows DLL exports.\n\n"
+        "--- PRIORITY 3: SEMANTIC SUBSTITUTION (apply carefully) ---\n"
+        "Replace arithmetic/string/loop operations with semantically identical alternatives:\n"
+        "  strcmp(a,b)==0 -> (memcmp(a,b,strlen(a)+1)==0)\n"
+        "  x + 1 -> x - (~0)\n"
+        "  x * 4 -> x << 2\n"
+        "  x == y -> !(x ^ y)\n"
+        "Apply ONLY substitutions you are 100%% certain preserve exact behavior.\n\n"
+        "RULES:\n"
+        "- ALL original logic MUST remain functionally intact — identical outputs.\n"
+        "- Keep the original function signature EXACTLY.\n"
+        "- NEVER rename the function itself or any existing project helper functions.\n"
+        "- If code gets too complex, apply Priority 1+2 CORRECTLY rather than all 3 with bugs.\n"
     ),
 }
 
+# Legacy compatibility: strategy_prompt_dict with C/C++ defaults
+strategy_prompt_dict = {
+    key: get_strategy_prompt(key, "c") for key in _strategy_prompt_base
+}
+
+
+# ─── Legacy output schema dictionaries ────────────────────────────────────────
+# Used ONLY by the legacy get_prompt() / PromptGenerator path (src/run_pipeline.py).
+# Production MutationAgent uses raw code output and does NOT use these.
+#
+# UNIFIED SCHEMA (all strategies use the same 3 keys):
+#   {"modified_code": str, "function_map": str, "comments": str}
+# ──────────────────────────────────────────────────────────────────────────────
 
 additional_strategy_wise_json_prompt_dict = {
-    'obfuscation_splitting_prompt_json_only_replacer':
-    (
-        f"7. When you change the name of any function to something unreadable make sure to provide the name of the variant function that would replace the original function in the below format explained through an example. I need this information to know the name of the function to replace the original function. This step is CRUCIAL AND MUST always be completed.\n"
-        f"For example, If the original function is `int func(char* s, int t)` and your generated variant with the given instruction is `int xgxhxs(char* uyuy, int ffh)` and let's assume two other functions that you generated to call inside of this are `int r()` and `int p()`, then you MUST provide me the required information inside the JSON response with the exact key name \"replacer\":\n"
-        f'"replacer": "xgxhxs"\n'
-        f"The above format is the only ACCEPTABLE format you should use with the exact key name 'replacer'. Do not use any other format with any other key and any extra information. Just the replacer function name should be placed as the value in the JSON response\n"
-        f"Generate this information ONLY for the function(s) you are asked to modify. For instance if you are told to modify 1 functions then give me 1 such information, if told to modify 2, give me 2 and so on.\n"
-        f"Make Sure to keep the return type and some of parameter information (number and types of parameters) of the replacer generated function [ `int xgxhxs(char* uyuy, int ffh)` ] the same as the original function [ `int func(char* s, int t)` ].\n"
-        f"8. Do not use any other format for the replacer key. Use the exact format and key as shown above.\n"
-        f"9. Never define other functions inside the main generated variant function. Always define them outside the main generated variant function and call them inside the original function. For the example above, the functions r() and p() should always be defined outside xgxhxs(char* uyuy, int ffh).\n"
-        f"10. xgxhxs, p and r are just example of function names you might generate. Feel free to use other names.\n"
-        f"11. DO NOT generate anything outside the JSON format. Your final output should be a single JSON object with the appropriate keys('modified code', 'replacer', 'comments') and values in the format that I provided you. "
+    # For strategies that RENAME the function (strat 1, 2, 4, 5, 6 — obfuscation)
+    'obfuscation_prompt_json': (
+        "7. Provide the mapping of original function(s) to generated function(s). This is CRUCIAL.\n"
+        "Example: original `int func(char* s, int t)` → variant `int xgxhxs(char* uyuy, int ffh)` with helpers `int r()` and `int p()`:\n"
+        '"function_map": "func(char* s, int t) : xgxhxs(char* uyuy, int ffh)|r()|p()"\n'
+        "If only one variant (no helpers): \"function_map\": \"func(char* s, int t) : xgxhxs(char* uyuy, int ffh)\"\n"
+        "Keep return type and parameter types of the entry-point variant identical to the original.\n"
+        "8. Never define helper functions inside the main variant. Define them outside and call them.\n"
+        "9. DO NOT generate anything outside the JSON. Output a single JSON object with keys: 'modified_code', 'function_map', 'comments'.\n"
     ),
 
-    'function_splitting_prompt_json_only_replacer': (
-        f"7. If you generated new functions, make sure to provide the name of the variant function that would replace the original function in the below format explained through an example. I need this information to know the name of the function to replace the original function. This step is CRUCIAL AND MUST always be completed.\n"
-        f'For Example, If the original function is `void f(int a)` and your generated sub-functions are `void g(int a)` and `int h(int b)` which are called inside f(int a), then you MUST provide me the required information within the JSON response with the exact key name "replacer" in this format:\n'
-        f'"replacer": "f"\n'
-        f"The above format is the only ACCEPTABLE format you should use with the exact key name 'replacer'. Do not use any other format with any other key and any extra information. Just the replacer function name should be placed as the value in the JSON response\n"
-        f"Generate this information ONLY for the function(s) you are asked to modify. For instance if you are told to modify 1 functions then give me 1 such information, if told to modify 2, give me 2 and so on.\n"
-        f"Make Sure to keep the return type, name and all of parameter information (name, number and types of parameters) i.e function signature of the replacer generated function the same as the original function.\n"
-        f"8. Do not use any other format for the replacer key. Use the exact format and key as shown above.\n"
-        f"9. Never define sub-functions inside the main generated variant function. Always define them outside the main generated variant function and call them inside the original function. For the example above, the functions g() and h() should always be defined outside f(int a).\n"
-        f"10. DO NOT generate anything outside the JSON format. Your final output should be a single JSON object with the appropriate keys('modified code', 'replacer', 'comments') and values in the format that I provided you. "
-    ),
-
-    'obfuscation_splitting_prompt_json': (
-        f"7. When you change the name of any function to something unreadable make sure to provide the mapping of the original function to the generated function. This step is CRUCIAL AND MUST always be completed. "
-        f"For example, If the original function is `int func(char* s, int t)` and your generated variant with the given instruction is `int xgxhxs(char* uyuy, int ffh)` and let's assume two other functions that you generated to call inside `int xgxhxs(char* uyuy, int ffh)` are `int r()` and `int p()` , then you MUST provide me the mapping inside the JSON response with the key name 'mapping':\n"
-        f'"mapping": "func(char* s, int t) : xgxhxs(char* uyuy, int ffh)|r()|p()"\n'
-        f"If you generated only one variant function then the mapping should be like this:\n"
-        f'"mapping": "func(char* s, int t) : xgxhxs(char* uyuy, int ffh)"\n'
-        f"Make sure to follow this mapping format above STRICTLY for all the functions you generate inside your JSON response and generate this ONLY for the function(s) you are asked to modify. For instance if you are told to modify 1 functions then generate 1 mapping, if told to modify 2, generate 2 and so on.\n"
-        f"Make Sure to keep the return type and all of parameter information (number and types of parameters) of the generated function which is to be called inplace of the original function the same. "
-        f"Place the generated function to be called in place of the original function first followed by the rest of the other functions in the mapping.\n"
-        f"8. Never define other functions inside the main generated variant function. Always define them outside the main generated variant function and call them inside the original function. For the example above, the functions r() and p() should always be defined outside xgxhxs(char* uyuy, int ffh).\n"
-    ),
-
-    'obfuscation_splitting_prompt_json_strat_all': (
-        "7. When you change the name of multiple functions to something unreadable make sure to provide the mapping of the original functions to the generated functions. This step is CRUCIAL AND MUST always be completed. For example, If the original functions are `int func(char* s, int t), int g(int var)` and your generated variant with the given instruction is `int a(char* uyuy, int ffh) and int b(int raar)`, then you MUST provide me the mapping inside the JSON response with the key name 'mapping' in a list in the following format:\n"
-        '"mapping": ["func(char* s, int t) : int a(char* uyuy, int ffh)", "int g(int var) : int b(int raar)"]\n'
-        "Make sure to follow this mapping format above STRICTLY (multiple functions separated by | ) for all the functions you generate inside your JSON response and generate this ONLY for the function(s) you are asked to modify. For instance if you are told to modify 1 functions then generate 1 mapping, if told to modify 2, generate 2 and so on.\n"
-    ),
-
+    # For strategies that SPLIT without renaming (strat 3 — function splitting)
     'function_splitting_prompt_json': (
-        "7. If you generated new functions, make sure to provide the mapping of the original function name to your generated function name/names with all parameters. This step is CRUCIAL AND MUST always be completed. Follow the format provided strictly.\n"
-        'Example: If the original function is `void f(int a)` and your generated sub-functions are `void g(int a)` and `int h(int b)` which are called inside f(int a), then you MUST provide the information within the JSON response with the key name "mapping" in this format:\n'
-        '"mapping": "f(int a) : f(int a)|g(int a)|h(int b)"\n'
-        "Make sure to follow this mapping format above STRICTLY (orginal function : multiple functions separated by | ) for all the functions you generate inside your JSON response and generate this ONLY for the function(s) you are asked to modify. For instance if you are told to modify 1 function then generate 1 mapping, if told to modify 2, generate 2 and so on.\n"
-        "Make Sure to keep the return type, name and all of parameter information (name, number and types of parameters) i.e function signature of the generated function which is to be called inplace of the original function the same."
-        "Place the generated function to be called in place of the original function first followed by the rest of the subfunctions in the mapping.\n"
-        "8. Never define sub-functions inside the main generated variant function. Always define them outside the main generated variant function and call them inside the original function. For the example above, the functions g() and h() should always be defined outside f(int a).\n"
+        "7. Provide the mapping of original function(s) to generated sub-functions. This is CRUCIAL.\n"
+        "Example: original `void f(int a)` split into `void g(int a)` and `int h(int b)` called inside f:\n"
+        '"function_map": "f(int a) : f(int a)|g(int a)|h(int b)"\n'
+        "Place the entry-point function first, followed by helpers separated by |.\n"
+        "Keep the entry-point function's signature (name, return type, all params) identical to the original.\n"
+        "8. Never define sub-functions inside the main function. Define them outside and call them.\n"
+        "9. DO NOT generate anything outside the JSON. Output a single JSON object with keys: 'modified_code', 'function_map', 'comments'.\n"
     ),
-
-    "function_splitting_json_prompt_no_mapping": (
-        f"7. Make Sure to keep the return type, name and all of parameter information (name, number and types of parameters) i.e function signature of the supplied function exactly the same during code generation.\n"
-        f"8. Never define sub-functions inside the main generated variant function. Always define them outside the main generated variant function and call them inside the original function. \n"
-        f'For Example, If the original function is `void f(int a)` and your generated sub-functions are `void g(int a)` and `int h(int b)` which are called inside f(int a), you should define g(int a) and h(int b) outside f(int a).\n'
-        f"9. DO NOT generate anything outside the JSON format. Your final output should be a single JSON object with the appropriate keys('modified code', 'comments') and values in the format that I provided you. "
-    )
 }
 
 additional_strategy_wise_backticks_prompt_dict = {
@@ -221,7 +844,7 @@ additional_strategy_wise_backticks_prompt_dict = {
 
 class PromptGenerator:
     def __init__(self, num_functions, function_names, strategy_num, strategy,
-                 behavior, assembly_gen_mode=None, gen_asm_code=None, error_list=None,
+                 behavior, error_list=None,
                  error_type=None, execution_output=None, language_name="c++"):
         
         self.num_functions = num_functions
@@ -229,10 +852,8 @@ class PromptGenerator:
         self.strategy_num = strategy_num
         self.strategy = strategy
         self.behavior = behavior
-        self.assembly_code_type = assembly_gen_mode
         self.language_name = language_name
         self.total_prompt = None
-        self.gen_asm_code = gen_asm_code
         self.error_list = error_list
         self.error_type = error_type
         self.execution_output = execution_output
@@ -347,8 +968,6 @@ class PromptGenerator:
         elif self.strategy == 'strat_4':
             return self.strategy_4_security_prompt()
         elif self.strategy == 'strat_5':
-            return self.strategy_5_obfuscation_prompt()
-        elif self.strategy == 'strat_6':
             return self.strategy_6_windows_api_prompt()
         
     def get_behaviors(self):
@@ -489,373 +1108,6 @@ class PromptGenerator:
     )
         
         
-    # def generic_instructions_assembly_testing(self):
-    #     return (
-    #         "Please follow the instructions below:\n"
-    #         "- The syntax should be NASM compatible.\n"
-    #         "- Only use 32-bit registers. Do not mix 32 and 64 bit integers.\n"
-    #         "- Use linux based system calls to print the output. The generated assembly code should be linux compatible.\n"
-    #         "- You should only print the final numerical result of the calculation. No need to print any additional strings. If the final result is x, print only x as the output.\n"
-    #         "- You shold carefully handle codes related to printing the final result in assembly.\n"
-    #         "- Output the code in a single ```assembly``` block.\n"
-    #     )
-    
-    def generic_instructions_assembly_testing(self):
-        return (
-            "Please follow the instructions below:\n"
-            "- The syntax should be NASM and linux compatible.\n"
-            "- Only use 32-bit registers. Do not mix 32 and 64-bit integers.\n"
-            "- Use the C library function `printf` to print the output instead of using system calls.\n"
-            "- Declare `extern printf` and `extern fflush` at the beginning of the code.\n"
-            "- Ensure the format string includes a newline (`0xA`) to print the final result correctly.\n"
-            "- Before calling `printf`, push the necessary variables that store the final result onto the stack for printing.\n"
-            "- After calling `printf`, push `0` and call `fflush(NULL)` to flush the output.\n"
-            "- Clean up the stack after calling `printf` and `fflush`.\n"
-            "- Only the final numerical result should be printed, without any additional strings or message outputs.\n"
-            "- Use `_start` as the entry point since linking will be done with `ld`.\n"
-            "- Use the Linux system call (`int 0x80`) to exit the program with status code 0 after printing the result.\n"
-            "- Output the code in a single ```assembly``` block. Always generate the complete code, do not generate partial code.\n"
-        )
-
-    
-    def get_general_assembly_generation_prompt(self):
-        return (
-            "Ensure that for every modification made to registers, a corresponding section of code reverts those registers to their original values using reverse operations (e.g., if a register is incremented, it should later be decremented back).\n"
-            "Before modifying any registers, save their original values on the stack using PUSH instructions. After the modifications are done, restore the original values using POP instructions.\n"
-            "Make sure to use a separate loop or appropriate instructions to perform the reverse actions.\n\n"
-            "Please follow the instructions below:\n"
-            "- The code should be compatible with NASM and can be compiled as a flat binary without any external data declarations.\n"
-            "- Make use of different registers and instructions (e.g., ADD, SUB, CMP, etc.).\n"
-            "- Contain a mix of arithmetic operations, loops, and condition checks. Create nested conditions or loops.\n"
-            "- Do not mix up 32-bit and 64-bit registers. Use only 32-bit registers.\n"
-            "- Do not use any Linux-based instructions, only use Windows-based instructions.\n"
-            "- Do not include any entry points, global labels, or section declarations (e.g., `.text`, `_start`, `.data` etc.).\n"
-            "- Do not use any exit codes or system call to exit the program.\n"
-            "- Do not use NASM-incompatible instructions or pseudo-ops (e.g., `ptr`). Use only instructions that NASM recognizes.\n"
-            "- Do not use any external memory access (e.g., do not use labels like `.data`, `db`, or memory accesses like `[addr]`).\n"
-            "- Generate the assembly code within a single ```assembly``` block.\n"
-        )
-        
-    def generate_simple_loop_summation(self):
-        return (
-            "Generate an x86 32 bit assembly code that calculates the sum of numbers from 1 to 10 using a loop.\n"
-            + self.generic_instructions_assembly_testing()
-        )
-        
-    def generate_medium_loop_summation(self):
-        return (
-            "Generate an x86 32 bit assembly code that calculates the sum of odd numbers from 1 to 10 using loops and conditional statements.\n"
-            "Carefully handle codes related to multiplication and division in assembly.\n"
-            + self.generic_instructions_assembly_testing()
-        )
-    
-    def generate_complex_loop_summation(self):
-        return (
-            "Generate an x86 32 bit assembly code that counts the total number of duplicate elements in the array [2,3,4,3,2,1] and print the final result\n"
-            "You should use nested loops and also conditional statements to find the duplicate element for each element in the array, keep track of total number of duplicates in a variable and finally print the result.\n"
-            + self.generic_instructions_assembly_testing()
-        )
-    
-    def generate_binary_search_on_array(self):
-        return (
-            "Generate an x86 32 bit assembly code that performs binary search on the sorted array [-10,2,3,4,6,7,8,90,1000].\n"
-            "The array is already sorted and you should implement the binary search algorithm to find element 7 in the array and print 1 if you find it, else print 0.\n"
-            + self.generic_instructions_assembly_testing()
-        )
-
-        
-        
-        
-    def get_general_prompt_assembly_generation_procedure(self):
-        return (
-            "Ensure that for every modification made to registers within the procedure, a corresponding section of code reverts those registers to their original values using reverse operations (e.g., if a register is incremented, it should later be decremented back).\n"
-            "Make sure to use a separate loop or appropriate instructions to perform the reverse actions.\n\n"
-            "Please follow the instructions below:\n"
-            "- The code should be compatible with NASM and can be compiled as a flat binary without any external data declarations.\n"
-            "- Make use of different registers and instructions (e.g., ADD, SUB, CMP, etc.).\n"
-            "- Properly preserve the registers used by the caller function using `PUSH` and `POP` in the correct order.\n"
-            "- Contain a mix of arithmetic operations, loops, and condition checks. Create nested conditions or loops.\n"
-            "- Revert all register changes before the procedure ends.\n"
-            "- Do not mix up 32-bit and 64-bit registers. Use only 32-bit registers.\n"
-            "- Do not use exit codes, use the `ret` instruction to return to the caller.\n"
-            "- Do not use any Linux-based instructions, only use Windows-based instructions.\n"
-            "- Do not include any entry points, global labels, or section declarations (e.g., `.text`, `_start`, `.data` etc.).\n"
-            "- Generate the assembly code within a single ```assembly``` block.\n"
-            "- Do not use NASM-incompatible instructions or pseudo-ops (e.g., `ptr`). Use only instructions that NASM recognizes.\n"
-            "- Do not use any external memory access (e.g., do not use labels like `.data`, `db`, or memory accesses like `[addr]`).\n"
-            "Please ensure the procedure does not break functionality or leave any registers in an altered state when it finishes."
-        )
-    
-    """
-    # The following prompts are for the assembly procedure generation behaviors
-    def get_prompt_loops_conditionals_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that includes loops and conditional statements to perform some specific tasks. The choice of task is up to you. It can be a known algorithm or something of your own design.\n" 
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-        
-
-
-    def get_prompt_register_swapping_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that swaps the values of registers multiple times using different arithmetic or logical operations. "
-            "Ensure that by the end of the procedure, all registers return to their original values through reverse operations.\n"
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-        
-    
-    def get_prompt_recursive_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that implements a recursive function. "
-            "The procedure should call itself with decremented values until a base condition is met, and then unwind the recursion. "
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-        
-    def get_prompt_string_manipulation_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that manipulates a string. "
-            "The procedure should perform operations such as reversing the string, converting it to uppercase, extracting substrings, or anything else you can think of related to strings.\n"
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-        
-    def get_prompt_floating_point_operations_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that performs floating-point operations. "
-            "The procedure should include arithmetic operations, comparisons, and conversions between floating-point and integer values or anything else you can think of related to floating point operations.\n"
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-    
-    def get_prompt_memory_operations_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that performs memory operations. "
-            "The procedure should include reading from and writing to memory, copying memory blocks, or anything else you can think of related to memory operations.\n"
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-        
-    def get_assembly_procedure(self):
-        if self.assembly_code_type == 'loops_conditionals':
-            return self.get_prompt_loops_conditionals_procedure()
-        elif self.assembly_code_type == 'register_swapping':
-            return self.get_prompt_register_swapping_procedure()
-        elif self.assembly_code_type == 'recursive_procedure':
-            return self.get_prompt_recursive_procedure()
-        elif self.assembly_code_type == 'string_manipulation':
-            return self.get_prompt_string_manipulation_procedure()
-        elif self.assembly_code_type == 'floating_point_operations':
-            return self.get_prompt_floating_point_operations_procedure()
-        elif self.assembly_code_type == 'memory_operations':
-            return self.get_prompt_memory_operations_procedure()    
-    
-    
-    # The following prompts are for the assembly code generation behaviors
-    """
-    def get_prompt_loops_conditionals(self):
-        return (
-            "Generate some x86 assembly code that includes loops and conditional statements to perform some specific tasks. The choice of task is up to you. It can be a known algorithm or something of your own design.\n" 
-            + self.get_general_assembly_generation_prompt()
-        )
-        
-    def get_prompt_register_swapping(self):
-        return (
-            "Generate some x86 assembly code that swaps the values of registers multiple times using different arithmetic or logical operations. "
-            "Ensure that by the end of the code, all registers return to their original values through reverse operations.\n"
-            + self.get_general_assembly_generation_prompt()
-        )
-        
-    def get_prompt_string_manipulation(self):
-        return (
-            "Generate some x86 assembly code that manipulates a string. "
-            "The code should perform operations such as reversing the string, converting it to uppercase, or extracting substrings or anything else you can think of related to strings.\n"
-            + self.get_general_assembly_generation_prompt()
-        )
-        
-    def get_prompt_floating_point_operations(self):
-        return (
-            "Generate some x86 assembly code that performs floating-point operations. "
-            "The code should include arithmetic operations, comparisons, and conversions between floating-point and integer values or anything else you can think of related to floating point operations.\n"
-            + self.get_general_assembly_generation_prompt()
-        )
-    
-    def get_prompt_memory_operations(self):
-        return (
-            "Generate some x86 assembly code that performs memory operations. "
-            "The code should include reading from and writing to memory, copying memory blocks, or anything else you can think of related to memory operations.\n"
-            + self.get_general_assembly_generation_prompt()
-        )
-        
-    def get_assembly_code(self):
-        if self.assembly_code_type == 'loops_conditionals':
-            return self.get_prompt_loops_conditionals()
-        elif self.assembly_code_type == 'register_swapping':
-            return self.get_prompt_register_swapping()
-        elif self.assembly_code_type == 'string_manipulation':
-            return self.get_prompt_string_manipulation()
-        elif self.assembly_code_type == 'floating_point_operations':
-            return self.get_prompt_floating_point_operations()
-        elif self.assembly_code_type == 'memory_operations':
-            return self.get_prompt_memory_operations()
-        
-    def get_asm_testing_code(self):
-        if self.assembly_code_type == 'basic_test_code':
-            return self.generate_simple_loop_summation()
-        elif self.assembly_code_type == 'medium_test_code':
-            return self.generate_medium_loop_summation()
-        elif self.assembly_code_type == 'complex_test_code':
-            return self.generate_complex_loop_summation()
-        elif self.assembly_code_type == 'binary_search_test_code':
-            return self.generate_binary_search_on_array()
-        
-    def get_intro_prompt_asm_editing(self):
-        return (
-            "Here is an x86-32 bit NASM syntax, Linux-compatible assembly code:\n\n"
-            f"{self.gen_asm_code}\n\n"
-            "As an intelligent coding assistant, your task is to modify the given assembly code following these steps:\n"
-            "1. Carefully review the provided assembly code to understand its syntax, structure, and semantics.\n"
-        )
-        
-    def get_post_prompts_asm_editing(self):
-        return (
-            "5. Ensure that the functionality of the code remains fully preserved after making modifications.\n"
-            "6. Do not remove any important parts/sections of the code that are necessary for its execution while making the modifications.\n"
-            "7. Provide the modified code in a block enclosed in ```assembly``` tags and output the code in only one block. Generate the entire code, do not generate partial code.\n"
-            "8. Do not regenerate the prompts that I have given you.\n"
-        )
-        
-        
-    def get_prompt_equivalent_instructions(self):
-         return (
-            "2. Identify any instructions that can be replaced with equivalent instructions of the same byte length.\n"
-            "3. Replace these identified instructions with equivalent alternatives that achieve the same functionality.\n"
-            "4. Maintain the overall structure, control flow and logic of the code when replacing instructions.\n"
-            "Here is an example of the task with some simple assembly code:\n\n"
-            "Original code:\n"
-            "```assembly\n"
-            "mov eax, 1\n"
-            "add eax, 2\n"
-            "sub eax, eax\n"
-            "```\n"
-            "Modified code:\n"
-            "```assembly\n"
-            "mov eax, 1\n"
-            "sub eax, -2\n"
-            "xor eax, eax\n"
-            "```\n\n"
-            "In this example, the `add` instruction was replaced with `sub`, and the `sub` instruction was replaced with `xor`. Apply similar transformations where possible, ensuring the integrity of the code is maintained.\n"
-            "Remember, this is just an example. The provided code might have more diverse instructions.\n"
-        )
-        
-    
-    def get_prompt_register_reassignment(self):
-        return (
-            "2. Identify a set of instructions where you can replace one register with another alternative register without hampering the code that comes after it.\n"
-            "3. Replace these identified registers with alternatives that achieve the same functionality.\n"
-            "Be careful to ensure that the register reassignment is consistent and does not interfere with the code that comes after the part you are working with.\n"
-            "4. Maintain the overall structure, control flow and logic of the code when reassigning registers.\n"
-            "Here is an example of the task with some simple assembly code:\n\n"
-            "Original code:\n"
-            "```assembly\n"
-            "mov ebx, [ebp+4]\n"
-            "sub ebx, -10\n"
-            "sub ecx, 3\n"
-            "and eax, ebx\n"
-            "mov ecx, [ebp-8]\n"
-            "xchg eax, ecx\n"
-            "pushf\n"
-            
-            "```\n"
-            "Modified code:\n"
-            "```assembly\n"
-            "mov edx, [ebp+4]\n"
-            "sub edx, -10\n"
-            "sub ecx, 3\n"
-            "and eax, edx\n"    
-            "mov ecx, [ebp-8]\n"
-            "xchg eax, ecx\n"
-            "```\n\n"
-            "In this example, the `ebx` register was replaced with `edx` in such a way that other instructions were not hampered. Apply similar transformations where possible, ensuring the integrity of the code is maintained.\n"
-            "Remember, this is just an example. The provided code might have more diverse instructions.\n"
-        )        
-    
-    def get_prompt_instruction_reordering(self):
-        return (
-            "2. Identify a set of instructions that can be reordered without altering the overall functionality of the code.\n"
-            "3. Rearrange these instructions while ensuring that other instructions remain unaffected.\n"
-            "4. Maintain the overall structure, control flow and logic of the code when reordering such instructions.\n"
-            "Here is an example of the task with some simple assembly code:\n\n"
-            "Original code:\n"
-            "```assembly\n"
-            "mov ebx, [ebp+4]\n"
-            "sub ebx, -10\n"
-            "sub ecx, 3\n"
-            "and eax, ebx\n"
-            "mov ecx, [ebp-8]\n"
-            "xchg eax, ecx\n"
-            "```\n"
-            "Modified code:\n"
-            "```assembly\n"
-            "sub ecx, 3\n"
-            "mov ebx, [ebp+4]\n"
-            "sub ebx, -10\n"
-            "and eax, ebx\n"
-            "mov ecx, [ebp-8]\n"
-            "xchg eax, ecx\n"
-            "```\n\n"
-            "In this example, the third instruction was moved ahead of the first two without disrupting the program's logic. Apply similar transformations where possible, ensuring the integrity of the code is maintained.\n"
-            "Remember, this is just an example. The provided code might have more diverse instructions.\n"
-        )
-    
-    def get_prompt_push_pop_reordering(self):
-        return (
-            "2. Identify a set of PUSH and POP instructions that can be reordered without altering the overall functionality of the code.\n"
-            "3. Rearrange these instructions while ensuring that other instructions remain unaffected.\n"
-            "4. Maintain the overall structure, control flow and logic of the code when reordering such instructions.\n"
-            "Here is an example of the task with some simple assembly code:\n\n"
-            "Original code:\n"
-            "```assembly\n"
-            "push eax\n"
-            "push ebx\n"
-            "mov eax, [ebp+4]\n"
-            "sub ecx, 3\n"
-            "mov ebx, [ebp+4]\n"
-            "sub ebx, -10\n"
-            "pop ebx\n"
-            "pop eax\n"
-            "```\n"
-            "Modified code:\n"
-            "```assembly\n"
-            "push ebx\n"
-            "push eax\n"
-            "mov eax, [ebp+4]\n"
-            "sub ecx, 3\n"
-            "mov ebx, [ebp+4]\n"
-            "sub ebx, -10\n"
-            "pop eax\n"
-            "pop ebx\n"
-            "```\n\n"
-            "In this example, the PUSH and POP instructions were reordered without disrupting the program's logic. Apply similar transformations where possible, ensuring the integrity of the code is maintained.\n"
-            "Remember, this is just an example. The provided code might have more diverse instructions.\n"
-        )
-    
-    
-    
-    def get_asm_editing_prompt(self):
-        """
-        Generates prompt for editing the assembly code. The prompts have examples that the LLM can benefit from.
-        """
-        if self.assembly_code_type == 'equivalent_instructions':
-            total_prompt = self.get_intro_prompt_asm_editing() + self.get_prompt_equivalent_instructions() + self.get_post_prompts_asm_editing()
-            return total_prompt
-        elif self.assembly_code_type == 'register_reassignment':
-            total_prompt = self.get_intro_prompt_asm_editing() + self.get_prompt_register_reassignment() + self.get_post_prompts_asm_editing()
-            return total_prompt
-        elif self.assembly_code_type == 'instruction_reordering':
-            total_prompt = self.get_intro_prompt_asm_editing() + self.get_prompt_instruction_reordering() + self.get_post_prompts_asm_editing()
-            return total_prompt
-        elif self.assembly_code_type == 'push_pop_reordering':
-            total_prompt = self.get_intro_prompt_asm_editing() + self.get_prompt_push_pop_reordering() + self.get_post_prompts_asm_editing()
-            return total_prompt
-        
-
         
     def generate_prompt(self):
         
@@ -868,940 +1120,10 @@ class PromptGenerator:
         if self.behavior is None:
             intro_prompt = self.get_intro_prompt_variant_gen_orig_strategy()
             self.total_prompt = intro_prompt + f"\n{strategy_prompt}\n\n" + functionality_preservation_prompt + backticks_format_useful_instructions
-        elif self.behavior == 'assembly_procedure_generation':
-            self.total_prompt = self.get_assembly_procedure()
-        elif self.behavior == 'assembly_code_generation':
-            self.total_prompt = self.get_assembly_code()
-        elif self.behavior == 'assembly_testing_code_generation':
-            self.total_prompt = self.get_asm_testing_code()
-        elif self.behavior == 'assembly_code_error_correction':
-            self.total_prompt = self.asm_code_error_correction(self.gen_asm_code, self.error_list)
-        elif self.behavior == 'assembly_testing_error_correction':
-            self.total_prompt = self.asm_testing_error_correction()
-        elif self.behavior == 'assembly_testing_code_editing':
-            self.total_prompt = self.get_asm_editing_prompt()
         else:
             intro_prompt = self.get_intro_prompt_indicator_targetted_strategy()
             self.total_prompt = intro_prompt + f"\n{strategy_prompt}\n\n" + self.get_behaviors() + functionality_preservation_prompt + backticks_format_useful_instructions
             
-        return self.total_prompt
-    
-    def asm_testing_error_correction(self):
-        prompt_string = f"Here is an x86 assembly code for 32 bit machines: \n{self.gen_asm_code}\n"
-       
-        if self.error_list:
-           
-            if self.error_type == 'nasm_errors':
-                prompt_string += f"Here are the error messages with line numbers when trying to assemble this code to binary on a Linux machine with NASM:\n{self.error_list}\n\n"
-            elif self.error_type == 'linker_errors':
-                prompt_string += f"Here are the error messages when linking this code to binary on a Linux machine with ld:\n{self.error_list}\n\n"
-            elif self.error_type == 'runtime_errors':
-                
-                if self.execution_output != '':
-                    print("SHOULD BE HERE")
-                    prompt_string += f"Here are the error messages when trying to run this code on a Linux machine:\n{self.error_list}\n\n"
-                else:
-                    prompt_string += f"The program did not print anything on the screen so there might be errors related to printing. Also, here are the error messages when trying to run this code on a Linux machine:\n{self.error_list}\n\n"
-               
-            prompt_string += "Here is your task:\n"
-            
-            task_list = (
-                "Step 1: Based on the provided error messages, identify and correct the errors in the assembly code so it is compatible with NASM and can be successfully assembled and has no runtime errors.\n"
-                "Step 2: In addition to fixing the errors indicated by the error messages, perform a thorough review of the entire code for potential inconsistencies or logical issues in assembly, including:\n"
-            )
-           
-            prompt_string += task_list
-            
-            
-            
-            
-        elif self.error_list is None and self.execution_output == '':
-            prompt_string += "The code compiled correctly and executed correctly but nothing was printed to the console. So there are errors related to printing and flushing the output. Here is your task:\n"
-            task_list = (
-                "Step 1: Identify and correct the errors in the assembly code for properly printing and flushing the output with  `printf` and call `fflush(NULL)` so that the result can be successfully printed to the screen.\n"
-                "Step 2: In addition to fixing the printing and flushing errors, perform a thorough review of the entire code for potential inconsistencies or logical issues in assembly, including:\n"
-            )
-        
-        else:
-            prompt_string += "The code compiled correctly with NASM so there are no syntactical errors. " 
-            
-            if self.execution_output != '':
-                # Something was printed to the console
-                prompt_string += f"Something was printed to the console so there are no errors related to printing and flushing the output."
-            
-            prompt_string += "But there might still be logical errors. Here is your task:\n"
-            prompt_string += "Step 1: Perform a thorough review of the entire code for potential inconsistencies or logical issues in assembly, including:\n"
-           
-        index_no = 3 if self.error_list or self.execution_output == '' else 2
-       
-        rest_of_task = (
-            "- Improper register use.\n"
-            "- Incorrect syntax or invalid NASM-specific instructions (e.g., ptr, incorrect stack access).\n"
-            "- Undefined or incorrectly used variables or memory locations.\n"
-            "- Inconsistent or incorrect addressing modes (e.g., [addr] vs. relative addressing).\n"
-            "- Logical or flow errors (e.g., issues in loops or conditionals that would cause programming to fall in an infinite loop).\n"
-            "- Using PUSH and POP instructions in the incorrect order or using them in the wrong way.\n"
-            f"Step {index_no}: If you find additional issues or inconsistencies not mentioned in the error messages or the list, fix them.\n"
-            f"Step {index_no + 1}: If the assembly code is already correct, simply output the original code in a single ```assembly``` block without making any changes.\n"
-            f"Step {index_no + 2}: Else, provide the entire corrected assembly code in a single ```assembly``` block.\n"
-            f"Please keep these points in mind while generating corrected code:\n"
-            f"- You are to generate only 1 code block with the entire corrected code in the above format. Do not generate any extra code blocks.\n"
-            f"- Always generate the entire piece of code. Never generate partial code.\n"
-        )
-       
-        prompt_string += rest_of_task
-       
-        return prompt_string
-    
-    def asm_code_error_correction(self, asm_code, error_list):
-        
-        prompt_string = f"Here is an x86 assembly code for 32 bit machines: \n{asm_code}\n"
-        
-        if error_list:
-            prompt_string += f"Here are the error messages when trying to convert this code to flat binary with NASM:\n{error_list}\n\n"
-            prompt_string += "Here is your task:\n"
-            
-            task_list = (
-                "Step 1: Based on the provided error messages, identify and correct the errors in the assembly code so it is compatible with NASM and can be successfully assembled into a flat binary.\n"
-                "Step 2: In addition to fixing the errors indicated by the error messages, perform a thorough review of the entire code for potential inconsistencies or common issues in assembly, including:\n"
-            )
-            
-            prompt_string += task_list
-        else:
-            prompt_string += "Here is your task:\n"
-            prompt_string += "Step 1: Perform a thorough review of the entire code for potential inconsistencies or common issues in assembly, including:\n"
-        
-        index_no = 3 if error_list else 2
-        
-        rest_of_task = (
-            "- Improper register use or lack of register preservation.\n"
-            "- Incorrect syntax or invalid NASM-specific instructions (e.g., ptr, incorrect stack access).\n"
-            "- Undefined or incorrectly used variables or memory locations.\n"
-            "- Inconsistent or incorrect addressing modes (e.g., [addr] vs. relative addressing).\n"
-            "- Logical or flow errors (e.g., issues in loops or conditionals).\n"
-            "- Not using PUSH and POP instructions to preserve and restore register values or using them in incorrect order.\n"
-            f"Step {index_no}: If you find additional issues or inconsistencies not mentioned in the error messages or the list, fix them.\n"
-            f"Step {index_no + 1}: During correcting, do not declare any extra variable or add any extra sections (like .data, .text etc), global labels or entry points. Use hardcoded values if need be. The code should be self-contained.\n"
-            f"Step {index_no + 2}: If the assembly code has additional sections(.text, .data etc) and data declarations, remove them and use self-contained values with only the registers and no additional data or variable.\n"
-            f"Step {index_no + 3}: If the assembly code is already correct, simply output the original code in a single ```assembly``` block without making any changes.\n"
-            f"Please keep these points in mind while generating corrected code:\n"
-            f"- You are to generate only 1 code block with the entire corrected code. Do not generate any extra code blocks.\n"
-            f"- Always generate the entire piece of code. Never generate partial code.\n"
-        )
-        
-        prompt_string += rest_of_task
-        
-        return prompt_string
-            
-
-class AssemblyPromptGenerator:
-    def __init__(self, num_functions, function_names, strategy_num, strategy,
-                 behavior, assembly_gen_mode=None, gen_asm_code=None, error_list=None,
-                 error_type=None, execution_output=None, language_name="assembly"):
-        
-        self.num_functions = num_functions
-        self.function_names = function_names
-        self.strategy_num = strategy_num
-        self.strategy = strategy
-        self.behavior = behavior
-        self.assembly_code_type = assembly_gen_mode
-        self.language_name = language_name
-        self.total_prompt = None
-        self.gen_asm_code = gen_asm_code
-        self.error_list = error_list
-        self.error_type = error_type
-        self.execution_output = execution_output
-
-
-
-    
-    def generic_instructions_assembly_testing(self):
-        return (
-            "Please follow the instructions below:\n"
-            "- The syntax should be NASM and linux compatible.\n"
-            "- Only use 32-bit registers. Do not mix 32 and 64-bit integers.\n"
-            "- Use the C library function `printf` to print the output instead of using system calls.\n"
-            "- Declare `extern printf` and `extern fflush` at the beginning of the code.\n"
-            "- Ensure the format string includes a newline (`0xA`) to print the final result correctly.\n"
-            "- Before calling `printf`, push the necessary variables that store the final result onto the stack for printing.\n"
-            "- After calling `printf`, push `0` and call `fflush(NULL)` to flush the output.\n"
-            "- Clean up the stack after calling `printf` and `fflush`.\n"
-            "- Only the final numerical result should be printed, without any additional strings or message outputs.\n"
-            "- Use `_start` as the entry point since linking will be done with `ld`.\n"
-            "- Use the Linux system call (`int 0x80`) to exit the program with status code 0 after printing the result.\n"
-            "- Output the code in a single ```assembly``` block. Always generate the complete code, do not generate partial code.\n"
-        )
-
-
-    def get_general_assembly_generation_prompt_repeated_inst_example(self):
-        return (
-
-            "Assembly Code Requirements:\n"
-            "1. Compatibility: The code must be compatible with NASM and compile as a flat binary without external data declarations.\n"
-            "2. Register Usage: Use only 32-bit registers (e.g., EAX, EBX); do not use 64-bit registers\n"
-            "3. Instructions Restrictions:\n"
-            "- Do not use NASM-incompatible instructions or pseudo-ops (e.g., `ptr`). Use only instructions that NASM recognizes.\n"
-            "- Avoid external memory access; do not use labels like .data, db, or memory accesses like [addr].\n"
-            "- Do not include entry points, global labels, or section declarations (e.g., .text, _start, .data).\n"
-            "- Do not use system calls or exit codes; this is for flat binary generation.\n"
-
-            "Steps to generate the assembly code:\n"
-            "1. Declare ```BITS 32``` at the start of the code.\n"
-            "2. Register Preservation:\n"
-            "- Before modifying any registers, save their original values on the stack using ```PUSH``` instructions.\n"
-            "- After the main code, restore the original values using ```POP``` instructions in the reverse order\n"
-            "3. Main Code Guidelines:\n"
-            "- Include a mix of arithmetic operations, loops, and conditional checks.\n"
-            "- Use hardcoded values instead of external data declarations. Do not generate code that relies on array or memory.\n"
-            "- Create nested conditions and loops to demonstrate complex control flow. Your program should have several nested loops and branching statements.\n"
-            "- Generate the assembly code within a single ```assembly``` block.\n"
-
-            "Code Structure to Follow:\n"
-            "```assembly\n"
-            "    BITS 32\n"
-            "    push eax\n"
-            "    push ebx\n"
-            "    ; (Push other registers if needed)\n\n"
-            "    ; Main code starts here\n"
-            "    ; (Your code will be here)\n\n"
-            "    pop ebx\n"
-            "    pop eax\n"
-            "    ; (Pop any additional registers you pushed)\n"
-            "```\n"
-
-            "\nRemember, the code should not include any arrays, memory accesses, or external data declarations. Just use registers and immediate values for all computations.\n"
-
-            "An example is given below: \n"
-            
-            "```assembly\n"
-            "    BITS 32\n"
-            "    push eax\n"
-            "    push ebx\n"
-            "    push ecx\n"
-            "\n"
-            "    mov ecx, 10  ; Load counter value ( hardcoded )\n"
-            "\n"
-            "loop_start:\n"
-            "    cmp ecx, 0          ; Compare counter with 0\n"
-            
-            "    xor eax, eax        ; Clear eax\n"
-            "    xor eax, eax        ; Clear eax\n"
-            "    xor eax, eax        ; Clear eax\n"
-            "    xor eax, eax        ; Clear eax\n"
-            "    xor eax, eax        ; Clear eax\n"
-
-            "    je loop_end         ; If counter is 0, jump to loop_end\n"
-            "\n"
-            "    ; Perform some operations\n"
-            "    mov eax, ecx        ; Move counter value to eax\n"
-            
-            "    add eax, 2          ; Add 2 to eax\n"
-            "    add eax, 2          ; Add 2 to eax\n"
-            "    add eax, 2          ; Add 2 to eax\n"
-
-            "\n"
-            "    dec ecx             ; Decrement counter\n"
-            "    dec ecx             ; Decrement counter\n"
-            "    dec ecx             ; Decrement counter\n"
-            "    dec ecx             ; Decrement counter\n"
-
-            "    jmp loop_start      ; Jump back to loop_start\n"
-            "\n"
-            "loop_end:\n"
-            "    ; End of loop\n"
-            "\n"
-            "    pop ecx\n"
-            "    pop ebx\n"
-            "    pop eax\n"
-            "```\n"
-
-            "Observe the code above. First ```BITS 32``` was added. Before modifying any registers, the original register values are saved on the stack using ```PUSH``` instructions. After the main code, the original values are restored using ```POP``` instructions in correct order.\n"
-            "The code above also demonstrates the use of arithmetic operations, loops, and conditional checks.\n"
-            "Notice how code has several repeated instructions? For fun, your generated assembly code should have such type of repeated instructions of various types of course!!\n"
-            "It also uses hard-coded values instead of external data declarations and has no _start, .data, .bss, .text sections.\n"
-            "Please do not copy this code. This is just an example.\n"
-        )
-
-    def get_general_assembly_generation_prompt_register_swapping(self):
-        return (
-
-            "Assembly Code Requirements:\n"
-            "1. Compatibility: The code must be compatible with NASM and compile as a flat binary without external data declarations.\n"
-            "2. Register Usage: Use only 32-bit registers (e.g., EAX, EBX); do not use 64-bit registers\n"
-            "3. Instructions Restrictions:\n"
-            "- Do not use NASM-incompatible instructions or pseudo-ops (e.g., `ptr`). Use only instructions that NASM recognizes.\n"
-            "- Avoid external memory access; do not use labels like .data, db, or memory accesses like [addr].\n"
-            "- Do not include entry points, global labels, or section declarations (e.g., .text, _start, .data).\n"
-            "- Do not use system calls or exit codes; this is for flat binary generation.\n"
-
-            "Steps to generate the assembly code:\n"
-            "1. Declare ```BITS 32``` at the start of the code.\n"
-            "2. Register Preservation:\n"
-            "- Before modifying any registers, save their original values on the stack using ```PUSH``` instructions.\n"
-            "- After the main code, restore the original values using ```POP``` instructions in the reverse order\n"
-            "3. Main Code Guidelines:\n"
-            "- Include a mix of arithmetic operations, loops, and conditional checks.\n"
-            "- Use hardcoded values instead of external data declarations. Do not generate code that relies on array or memory.\n"
-            "- Create nested conditions and loops to demonstrate complex control flow. Your program should have several nested loops and branching statements.\n"
-            "- Generate the assembly code within a single ```assembly``` block.\n"
-
-            "Code Structure to Follow:\n"
-            "```assembly\n"
-            "    BITS 32\n"
-            "    push eax\n"
-            "    push ebx\n"
-            "    ; (Push other registers if needed)\n\n"
-            "    ; Main code starts here\n"
-            "    ; (Your code will be here)\n\n"
-            "    pop ebx\n"
-            "    pop eax\n"
-            "    ; (Pop any additional registers you pushed)\n"
-            "```\n"
-
-            "\nRemember, the code should not include any arrays, memory accesses, or external data declarations. Just use registers and immediate values for all computations.\n"
-
-            "An example is given below: \n"
-
-            "```assembly\n"
-            "    BITS 32\n"
-            "    push eax\n"
-            "    push ebx\n"
-            "    push ecx\n"
-            "    push edx\n"
-
-            "    ; Initialize registers with different values\n"
-            "    mov eax, 5          ; EAX = 5\n"
-            "    mov ebx, 10         ; EBX = 10\n"
-            "    mov ecx, 3          ; Set loop counter to 3\n"
-
-            "loop_start:\n"
-            "    cmp ecx, 0          ; Compare counter with 0\n"
-            "    je loop_end         ; If counter is 0, jump to loop_end\n"
-
-            "    ; Register swapping and arithmetic operations within the loop\n"
-            "    ; Swap EAX and EBX using XCHG\n"
-            "    xchg eax, ebx       ; Swap EAX and EBX\n"
-
-            "    ; Swap EAX and EBX using intermediate register (EDX)\n"
-            "    mov edx, eax        ; Store EAX in EDX\n"
-            "    mov eax, ebx        ; Move EBX to EAX\n"
-            "    mov ebx, edx        ; Move EDX (original EAX) to EBX\n"
-
-            "    ; Logical operation\n"
-            "    xor eax, ebx        ; EAX = EAX XOR EBX\n"
-
-            "    ; Swap EBX and ECX using XCHG\n"
-            "    xchg ebx, ecx       ; Swap EBX and ECX\n"
-
-            "    ; Conditional operation\n"
-            "    test eax, eax       ; Test if EAX is zero\n"
-            "    jz skip_swap        ; If zero, skip the next swap\n"
-            "    ; Swap EAX and EBX if not zero using XCHG\n"
-            "    xchg eax, ebx       ; Swap EAX and EBX if not zero\n"
-
-            "skip_swap:\n"
-            "    ; Decrement loop counter\n"
-            "    dec ecx             ; Decrement counter\n"
-            "    jmp loop_start      ; Jump back to loop_start\n"
-
-            "loop_end:\n"
-            "    ; End of loop\n"
-
-            "    ; Restore registers\n"
-            "    pop edx\n"
-            "    pop ecx\n"
-            "    pop ebx\n"
-            "    pop eax\n"
-
-            "Observe the code above. First ```BITS 32``` was added. Before modifying any registers, the original register values are saved on the stack using ```PUSH``` instructions. After the main code, the original values are restored using ```POP``` instructions in correct order.\n"
-            "The code above also demonstrates the use of arithmetic operations, loops, and conditional checks.\n"
-            "It also showcases register swapping using XCHG and intermediate registers with mov operation. You are to write some code similar to this, but not exactly this.\n"
-            "It also uses hard-coded values instead of external data declarations and has no _start, .data, .bss, .text sections.\n"
-            "Please do not copy this code. This is just an example.\n"
-        )
-    
-    def get_general_assembly_generation_prompt(self):
-        return (
-
-            "Assembly Code Requirements:\n"
-            "1. Compatibility: The code must be compatible with NASM and compile as a flat binary without external data declarations.\n"
-            "2. Register Usage: Use only 32-bit registers (e.g., EAX, EBX); do not use 64-bit registers\n"
-            "3. Instructions Restrictions:\n"
-            "- Do not use NASM-incompatible instructions or pseudo-ops (e.g., `ptr`). Use only instructions that NASM recognizes.\n"
-            "- Avoid external memory access; do not use labels like .data, db, or memory accesses like [addr].\n"
-            "- Do not include entry points, global labels, or section declarations (e.g., .text, _start, .data).\n"
-            "- Do not use system calls or exit codes; this is for flat binary generation.\n"
-
-            "Steps to generate the assembly code:\n"
-            "1. Declare ```BITS 32``` at the start of the code.\n"
-            "2. Register Preservation:\n"
-            "- Before modifying any registers, save their original values on the stack using ```PUSH``` instructions.\n"
-            "- After the main code, restore the original values using ```POP``` instructions in the reverse order\n"
-            "3. Main Code Guidelines:\n"
-            "- Include a mix of arithmetic operations, loops, and conditional checks.\n"
-            "- Use hardcoded values instead of external data declarations. Do not generate code that relies on array or memory.\n"
-            "- Create nested conditions and loops to demonstrate complex control flow. Your program should have several nested loops and branching statements.\n"
-            "- Generate the assembly code within a single ```assembly``` block.\n"
-
-            "Code Structure to Follow:\n"
-            "```assembly\n"
-            "    BITS 32\n"
-            "    push eax\n"
-            "    push ebx\n"
-            "    ; (Push other registers if needed)\n\n"
-            "    ; Main code starts here\n"
-            "    ; (Your code will be here)\n\n"
-            "    pop ebx\n"
-            "    pop eax\n"
-            "    ; (Pop any additional registers you pushed)\n"
-            "```\n"
-
-            "\nRemember, the code should not include any arrays, memory accesses, or external data declarations. Just use registers and immediate values for all computations.\n"
-
-            "An example is given below: \n"
-            
-            "```assembly\n"
-            "    BITS 32\n"
-            "    push eax\n"
-            "    push ebx\n"
-            "    push ecx\n"
-            "\n"
-            "    mov ecx, 10  ; Load counter value ( hardcoded )\n"
-            "\n"
-            "loop_start:\n"
-            "    cmp ecx, 0          ; Compare counter with 0\n"
-            "    je loop_end         ; If counter is 0, jump to loop_end\n"
-            "\n"
-            "    ; Perform some operations\n"
-            "    mov eax, ecx        ; Move counter value to eax\n"
-            "    add eax, 2          ; Add 2 to eax\n"
-            "\n"
-            "    dec ecx             ; Decrement counter\n"
-            "    jmp loop_start      ; Jump back to loop_start\n"
-            "\n"
-            "loop_end:\n"
-            "    ; End of loop\n"
-            "\n"
-            "    pop ecx\n"
-            "    pop ebx\n"
-            "    pop eax\n"
-            "```\n"
-
-            "Observe the code above. First ```BITS 32``` was added. Before modifying any registers, the original register values are saved on the stack using ```PUSH``` instructions. After the main code, the original values are restored using ```POP``` instructions in correct order.\n"
-            "The code above also demonstrates the use of arithmetic operations, loops, and conditional checks.\n"
-            "It also uses hard-coded values instead of external data declarations and has no _start, .data, .bss, .text sections.\n"
-            "Please do not copy this code. This is just an example.\n"
-        )
-        
-    def generate_simple_loop_summation(self):
-        return (
-            "Generate an x86 32 bit assembly code that calculates the sum of numbers from 1 to 10 using a loop.\n"
-            + self.generic_instructions_assembly_testing()
-        )
-        
-    def generate_medium_loop_summation(self):
-        return (
-            "Generate an x86 32 bit assembly code that calculates the sum of odd numbers from 1 to 10 using loops and conditional statements.\n"
-            "Carefully handle codes related to multiplication and division in assembly.\n"
-            + self.generic_instructions_assembly_testing()
-        )
-    
-    def generate_complex_loop_summation(self):
-        return (
-            "Generate an x86 32 bit assembly code that counts the total number of duplicate elements in the array [2,3,4,3,2,1] and print the final result\n"
-            "You should use nested loops and also conditional statements to find the duplicate element for each element in the array, keep track of total number of duplicates in a variable and finally print the result.\n"
-            + self.generic_instructions_assembly_testing()
-        )
-    
-    def generate_binary_search_on_array(self):
-        return (
-            "Generate an x86 32 bit assembly code that performs binary search on the sorted array [-10,2,3,4,6,7,8,90,1000].\n"
-            "The array is already sorted and you should implement the binary search algorithm to find element 7 in the array and print 1 if you find it, else print 0.\n"
-            + self.generic_instructions_assembly_testing()
-        )
-
-    
-        
-    def get_general_prompt_assembly_generation_procedure(self):
-        return (
-            "Ensure that for every modification made to registers within the procedure, a corresponding section of code reverts those registers to their original values using reverse operations (e.g., if a register is incremented, it should later be decremented back).\n"
-            "Make sure to use a separate loop or appropriate instructions to perform the reverse actions.\n\n"
-            "Please follow the instructions below:\n"
-            "- The code should be compatible with NASM and can be compiled as a flat binary without any external data declarations.\n"
-            "- Make use of different registers and instructions (e.g., ADD, SUB, CMP, etc.).\n"
-            "- Properly preserve the registers used by the caller function using `PUSH` and `POP` in the correct order.\n"
-            "- Contain a mix of arithmetic operations, loops, and condition checks. Create nested conditions or loops.\n"
-            "- Revert all register changes before the procedure ends.\n"
-            "- Do not mix up 32-bit and 64-bit registers. Use only 32-bit registers.\n"
-            "- Do not use exit codes, use the `ret` instruction to return to the caller.\n"
-            "- Do not use any Linux-based instructions, only use Windows-based instructions.\n"
-            "- Do not include any entry points, global labels, or section declarations (e.g., `.text`, `_start`, `.data` etc.).\n"
-            "- Generate the assembly code within a single ```assembly``` block.\n"
-            "- Do not use NASM-incompatible instructions or pseudo-ops (e.g., `ptr`). Use only instructions that NASM recognizes.\n"
-            "- Do not use any external memory access (e.g., do not use labels like `.data`, `db`, or memory accesses like `[addr]`).\n"
-            "Please ensure the procedure does not break functionality or leave any registers in an altered state when it finishes."
-        )
-    
-    """
-    The following prompts are for the assembly procedure generation behaviors
-    """
-    def get_prompt_loops_conditionals_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that includes loops and conditional statements to perform some specific tasks. The choice of task is up to you. It can be a known algorithm or something of your own design.\n" 
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-        
-
-
-    def get_prompt_register_swapping_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that swaps the values of registers multiple times using different arithmetic or logical operations. "
-            "Ensure that by the end of the procedure, all registers return to their original values through reverse operations.\n"
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-        
-    
-    def get_prompt_recursive_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that implements a recursive function. "
-            "The procedure should call itself with decremented values until a base condition is met, and then unwind the recursion. "
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-        
-    def get_prompt_string_manipulation_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that manipulates a string. "
-            "The procedure should perform operations such as reversing the string, converting it to uppercase, extracting substrings, or anything else you can think of related to strings.\n"
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-        
-    def get_prompt_floating_point_operations_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that performs floating-point operations. "
-            "The procedure should include arithmetic operations, comparisons, and conversions between floating-point and integer values or anything else you can think of related to floating point operations.\n"
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-    
-    def get_prompt_memory_operations_procedure(self):
-        return (
-            "Generate an x86 assembly procedure that performs memory operations. "
-            "The procedure should include reading from and writing to memory, copying memory blocks, or anything else you can think of related to memory operations.\n"
-            + self.get_general_prompt_assembly_generation_procedure()
-        )
-        
-    def get_assembly_procedure(self):
-        if self.assembly_code_type == 'loops_conditionals':
-            return self.get_prompt_loops_conditionals_procedure()
-        elif self.assembly_code_type == 'register_swapping':
-            return self.get_prompt_register_swapping_procedure()
-        elif self.assembly_code_type == 'recursive_procedure':
-            return self.get_prompt_recursive_procedure()
-        elif self.assembly_code_type == 'string_manipulation':
-            return self.get_prompt_string_manipulation_procedure()
-        elif self.assembly_code_type == 'floating_point_operations':
-            return self.get_prompt_floating_point_operations_procedure()
-        elif self.assembly_code_type == 'memory_operations':
-            return self.get_prompt_memory_operations_procedure()    
-    
-    
-    """
-    The following prompts are for the assembly code generation behaviors 
-    """
-    def get_prompt_loops_conditionals(self):
-        return (
-            "Generate some x86 assembly code that includes nested loops and conditional statements to perform some specific tasks. It can be a known algorithm or something of your own design.\n" 
-            + self.get_general_assembly_generation_prompt() + 
-            "Your task is to follow the requirements, steps and code structure given above to generate a new sophisticated assembly program ( don't generate a simple program ) that includes nested loops and conditional statements to perform specific task."
-        )
-    
-    def get_prompt_malconv_loops_conditionals(self):
-        return (
-            "Generate some x86 assembly code that includes nested loops and conditional statements to perform some specific tasks. For fun, whenever you use an operation, say xor, or add, make sure to use it in several consecutive instructions like xor in 5 consecutive lines or add in 10 consecutive lines etc.\n" 
-            + self.get_general_assembly_generation_prompt_repeated_inst_example() + 
-            "Your task is to follow the requirements, steps and code structure given above to generate a new fun assembly program ( make it complex for fun!! ) that includes nested loops and conditional statements. Don't forget the important requirement of including used operations in consecutive fashion ( like add in 10 consecutive lines or some other operations etc) to perform a specific task!!"
-        )
-
-    def get_prompt_register_swapping(self):
-        return (
-            "Generate some x86 assembly code that swaps the values of registers many many times using different arithmetic and logical operations.\n"
-            + self.get_general_assembly_generation_prompt_register_swapping() +  
-            "Your task is to follow the requirements, steps and code structure given above to generate a new sophisticated assembly program ( don't generate a simple program ) that swaps the values of registers many times using different arithmetic and logical operations. The code should be complex and involve multiple register swaps with loops and conditional statements."
-        )
-        
-    def get_prompt_string_manipulation(self):
-        return (
-            "Generate some x86 assembly code that manipulates a string. "
-            "The code should perform operations such as reversing the string, converting it to uppercase, or extracting substrings or anything else you can think of related to strings.\n"
-            + self.get_general_assembly_generation_prompt()
-        )
-        
-    def get_prompt_floating_point_operations(self):
-        return (
-            "Generate some x86 assembly code that performs floating-point operations. "
-            "The code should include arithmetic operations, comparisons, and conversions between floating-point and integer values or anything else you can think of related to floating point operations.\n"
-            + self.get_general_assembly_generation_prompt()
-        )
-    
-    def get_prompt_memory_operations(self):
-        return (
-            "Generate some x86 assembly code that performs memory operations. "
-            "The code should include reading from and writing to memory, copying memory blocks, or anything else you can think of related to memory operations.\n"
-            + self.get_general_assembly_generation_prompt()
-        )
-        
-    def get_assembly_code(self):
-        if self.assembly_code_type == 'loops_conditionals':
-            return self.get_prompt_loops_conditionals()
-        elif self.assembly_code_type == 'malconv_loops_conditionals':
-            return self.get_prompt_malconv_loops_conditionals()
-        elif self.assembly_code_type == 'register_swapping':
-            return self.get_prompt_register_swapping()
-        elif self.assembly_code_type == 'string_manipulation':
-            return self.get_prompt_string_manipulation()
-        elif self.assembly_code_type == 'floating_point_operations':
-            return self.get_prompt_floating_point_operations()
-        elif self.assembly_code_type == 'memory_operations':
-            return self.get_prompt_memory_operations()
-        
-    def get_asm_testing_code(self):
-        if self.assembly_code_type == 'basic_test_code':
-            return self.generate_simple_loop_summation()
-        elif self.assembly_code_type == 'medium_test_code':
-            return self.generate_medium_loop_summation()
-        elif self.assembly_code_type == 'complex_test_code':
-            return self.generate_complex_loop_summation()
-        elif self.assembly_code_type == 'binary_search_test_code':
-            return self.generate_binary_search_on_array()
-        
-    def get_intro_prompt_asm_editing(self):
-        return (
-            "Here is an x86-32 bit NASM syntax, Linux-compatible assembly code:\n\n"
-            f"{self.gen_asm_code}\n\n"
-            "As an intelligent coding assistant, your task is to modify the given assembly code following these steps:\n"
-            "1. Carefully review the provided assembly code to understand its syntax, structure, and semantics.\n"
-        )
-        
-    def get_post_prompts_asm_editing(self):
-        return (
-            "5. Ensure that the functionality of the code remains fully preserved after making modifications.\n"
-            "6. Do not remove any important parts/sections of the code that are necessary for its execution while making the modifications.\n"
-            "7. Provide the modified code in a block enclosed in ```assembly``` tags and output the code in only one block. Generate the entire code, do not generate partial code.\n"
-            "8. Do not regenerate the prompts that I have given you.\n"
-        )
-        
-        
-    def get_prompt_equivalent_instructions(self):
-         return (
-            "2. Identify any instructions that can be replaced with equivalent instructions of the same byte length.\n"
-            "3. Replace these identified instructions with equivalent alternatives that achieve the same functionality.\n"
-            "4. Maintain the overall structure, control flow and logic of the code when replacing instructions.\n"
-            "Here is an example of the task with some simple assembly code:\n\n"
-            "Original code:\n"
-            "```assembly\n"
-            "mov eax, 1\n"
-            "add eax, 2\n"
-            "sub eax, eax\n"
-            "```\n"
-            "Modified code:\n"
-            "```assembly\n"
-            "mov eax, 1\n"
-            "sub eax, -2\n"
-            "xor eax, eax\n"
-            "```\n\n"
-            "In this example, the `add` instruction was replaced with `sub`, and the `sub` instruction was replaced with `xor`. Apply similar transformations where possible, ensuring the integrity of the code is maintained.\n"
-            "Remember, this is just an example. The provided code might have more diverse instructions.\n"
-        )
-        
-    def get_prompt_register_reassignment(self):
-        return (
-            "2. Identify a set of instructions where you can replace one register with another alternative register without hampering the code that comes after it.\n"
-            "3. Replace these identified registers with alternatives that achieve the same functionality.\n"
-            "Be careful to ensure that the register reassignment is consistent and does not interfere with the code that comes after the part you are working with.\n"
-            "4. Maintain the overall structure, control flow and logic of the code when reassigning registers.\n"
-            "Here is an example of the task with some simple assembly code:\n\n"
-            "Original code:\n"
-            "```assembly\n"
-            "mov ebx, [ebp+4]\n"
-            "sub ebx, -10\n"
-            "sub ecx, 3\n"
-            "and eax, ebx\n"
-            "mov ecx, [ebp-8]\n"
-            "xchg eax, ecx\n"
-            "pushf\n"
-            
-            "```\n"
-            "Modified code:\n"
-            "```assembly\n"
-            "mov edx, [ebp+4]\n"
-            "sub edx, -10\n"
-            "sub ecx, 3\n"
-            "and eax, edx\n"    
-            "mov ecx, [ebp-8]\n"
-            "xchg eax, ecx\n"
-            "```\n\n"
-            "In this example, the `ebx` register was replaced with `edx` in such a way that other instructions were not hampered. Apply similar transformations where possible, ensuring the integrity of the code is maintained.\n"
-            "Remember, this is just an example. The provided code might have more diverse instructions.\n"
-        )        
-    
-    def get_prompt_instruction_reordering(self):
-        return (
-            "2. Identify a set of instructions that can be reordered without altering the overall functionality of the code.\n"
-            "3. Rearrange these instructions while ensuring that other instructions remain unaffected.\n"
-            "4. Maintain the overall structure, control flow and logic of the code when reordering such instructions.\n"
-            "Here is an example of the task with some simple assembly code:\n\n"
-            "Original code:\n"
-            "```assembly\n"
-            "mov ebx, [ebp+4]\n"
-            "sub ebx, -10\n"
-            "sub ecx, 3\n"
-            "and eax, ebx\n"
-            "mov ecx, [ebp-8]\n"
-            "xchg eax, ecx\n"
-            "```\n"
-            "Modified code:\n"
-            "```assembly\n"
-            "sub ecx, 3\n"
-            "mov ebx, [ebp+4]\n"
-            "sub ebx, -10\n"
-            "and eax, ebx\n"
-            "mov ecx, [ebp-8]\n"
-            "xchg eax, ecx\n"
-            "```\n\n"
-            "In this example, the third instruction was moved ahead of the first two without disrupting the program's logic. Apply similar transformations where possible, ensuring the integrity of the code is maintained.\n"
-            "Remember, this is just an example. The provided code might have more diverse instructions.\n"
-        )
-    
-    def get_prompt_push_pop_reordering(self):
-        return (
-            "2. Identify a set of PUSH and POP instructions that can be reordered without altering the overall functionality of the code.\n"
-            "3. Rearrange these instructions while ensuring that other instructions remain unaffected.\n"
-            "4. Maintain the overall structure, control flow and logic of the code when reordering such instructions.\n"
-            "Here is an example of the task with some simple assembly code:\n\n"
-            "Original code:\n"
-            "```assembly\n"
-            "push eax\n"
-            "push ebx\n"
-            "mov eax, [ebp+4]\n"
-            "sub ecx, 3\n"
-            "mov ebx, [ebp+4]\n"
-            "sub ebx, -10\n"
-            "pop ebx\n"
-            "pop eax\n"
-            "```\n"
-            "Modified code:\n"
-            "```assembly\n"
-            "push ebx\n"
-            "push eax\n"
-            "mov eax, [ebp+4]\n"
-            "sub ecx, 3\n"
-            "mov ebx, [ebp+4]\n"
-            "sub ebx, -10\n"
-            "pop eax\n"
-            "pop ebx\n"
-            "```\n\n"
-            "In this example, the PUSH and POP instructions were reordered without disrupting the program's logic. Apply similar transformations where possible, ensuring the integrity of the code is maintained.\n"
-            "Remember, this is just an example. The provided code might have more diverse instructions.\n"
-        )
-    
-    
-    
-    def get_asm_editing_prompt(self):
-        """
-        Generates prompt for editing the assembly code. The prompts have examples that the LLM can benefit from.
-        """
-        if self.assembly_code_type == 'equivalent_instructions':
-            total_prompt = self.get_intro_prompt_asm_editing() + self.get_prompt_equivalent_instructions() + self.get_post_prompts_asm_editing()
-            return total_prompt
-        elif self.assembly_code_type == 'register_reassignment':
-            total_prompt = self.get_intro_prompt_asm_editing() + self.get_prompt_register_reassignment() + self.get_post_prompts_asm_editing()
-            return total_prompt
-        elif self.assembly_code_type == 'instruction_reordering':
-            total_prompt = self.get_intro_prompt_asm_editing() + self.get_prompt_instruction_reordering() + self.get_post_prompts_asm_editing()
-            return total_prompt
-        elif self.assembly_code_type == 'push_pop_reordering':
-            total_prompt = self.get_intro_prompt_asm_editing() + self.get_prompt_push_pop_reordering() + self.get_post_prompts_asm_editing()
-            return total_prompt
-        
-    
-    def asm_testing_error_correction(self):
-        prompt_string = f"Here is an x86 assembly code for 32 bit machines: \n{self.gen_asm_code}\n"
-       
-        if self.error_list:
-           
-            if self.error_type == 'nasm_errors':
-                prompt_string += f"Here are the error messages with line numbers when trying to assemble this code to binary on a Linux machine with NASM:\n{self.error_list}\n\n"
-            elif self.error_type == 'linker_errors':
-                prompt_string += f"Here are the error messages when linking this code to binary on a Linux machine with ld:\n{self.error_list}\n\n"
-            elif self.error_type == 'runtime_errors':
-                
-                if self.execution_output != '':
-                    print("SHOULD BE HERE")
-                    prompt_string += f"Here are the error messages when trying to run this code on a Linux machine:\n{self.error_list}\n\n"
-                else:
-                    prompt_string += f"The program did not print anything on the screen so there might be errors related to printing. Also, here are the error messages when trying to run this code on a Linux machine:\n{self.error_list}\n\n"
-               
-            prompt_string += "Here is your task:\n"
-            
-            task_list = (
-                "Step 1: Based on the provided error messages, identify and correct the errors in the assembly code so it is compatible with NASM and can be successfully assembled and has no runtime errors.\n"
-                "Step 2: In addition to fixing the errors indicated by the error messages, perform a thorough review of the entire code for potential inconsistencies or logical issues in assembly, including:\n"
-            )
-           
-            prompt_string += task_list
-            
-            
-            
-            
-        elif self.error_list is None and self.execution_output == '':
-            prompt_string += "The code compiled correctly and executed correctly but nothing was printed to the console. So there are errors related to printing and flushing the output. Here is your task:\n"
-            task_list = (
-                "Step 1: Identify and correct the errors in the assembly code for properly printing and flushing the output with  `printf` and call `fflush(NULL)` so that the result can be successfully printed to the screen.\n"
-                "Step 2: In addition to fixing the printing and flushing errors, perform a thorough review of the entire code for potential inconsistencies or logical issues in assembly, including:\n"
-            )
-        
-        else:
-            prompt_string += "The code compiled correctly with NASM so there are no syntactical errors. " 
-            
-            if self.execution_output != '':
-                # Something was printed to the console
-                prompt_string += f"Something was printed to the console so there are no errors related to printing and flushing the output."
-            
-            prompt_string += "But there might still be logical errors. Here is your task:\n"
-            prompt_string += "Step 1: Perform a thorough review of the entire code for potential inconsistencies or logical issues in assembly, including:\n"
-           
-        index_no = 3 if self.error_list or self.execution_output == '' else 2
-       
-        rest_of_task = (
-            "- Improper register use.\n"
-            "- Incorrect syntax or invalid NASM-specific instructions (e.g., ptr, incorrect stack access).\n"
-            "- Undefined or incorrectly used variables or memory locations.\n"
-            "- Inconsistent or incorrect addressing modes (e.g., [addr] vs. relative addressing).\n"
-            "- Logical or flow errors (e.g., issues in loops or conditionals that would cause programming to fall in an infinite loop).\n"
-            "- Using PUSH and POP instructions in the incorrect order or using them in the wrong way.\n"
-            f"Step {index_no}: If you find additional issues or inconsistencies not mentioned in the error messages or the list, fix them.\n"
-            f"Step {index_no + 1}: If the assembly code is already correct, simply output the original code in a single ```assembly``` block without making any changes.\n"
-            f"Step {index_no + 2}: Else, provide the entire corrected assembly code in a single ```assembly``` block.\n"
-            f"Please keep these points in mind while generating corrected code:\n"
-            f"- You are to generate only 1 code block with the entire corrected code in the above format. Do not generate any extra code blocks.\n"
-            f"- Always generate the entire piece of code. Never generate partial code.\n"
-        )
-       
-        prompt_string += rest_of_task
-       
-        return prompt_string
-    
-
-    def asm_code_reg_preserve_error_correction(self):
-        prompt_string = f"Here is an x86 assembly code for 32 bit machines: \n{self.gen_asm_code}\n"
-        prompt_string += "Your task:\n"
-        task_list =  (
-            "1. Review the assembly code and identify the registers that are modified and need to be preserved.\n"
-            "2. Check the PUSH and POP instructions to ensure all used and modified registers are correctly preserved.\n"
-            "3. If any modified registers are not preserved correctly, add the necessary PUSH and POP instructions in the correct order to preserve the register values, and output the corrected code in a single ```assembly``` block.\n"
-            "4. If esp or ebp are used in the code, ensure that they are correctly preserved and restored.\n" 
-            "5. If all modified registers are preserved correctly, output the original code in a single ```assembly``` block without changes.\n"
-            "6. During error correction, do not remove or add any instructions other than the necessary PUSH and POP instructions. This is extremely important to preserve functionality. For instance if you see several similar instructions that is not causing any error, keep them as it is.\n"
-            "7. During error correction, ensure that the corrected code maintains the original functionality and logic.\n"
-            "8. Always provide the entire code; do not generate partial code.\n"
-        )
-
-        prompt_string += task_list
-
-        return prompt_string
-
-    def asm_code_nasm_compile_error_correction(self):
-        prompt_string = f"Here is an x86 assembly code for 32-bit machines:\n{self.gen_asm_code}\n\n"
-        prompt_string += f"Here are the error messages when trying to compile this code to a flat binary with NASM:\n{self.error_list}\n\n"
-        prompt_string += "Your task:\n"
-        task_list = (
-            "1. Based on the error messages, identify the errors in the assembly code.\n"
-            "2. Correct the errors so that the code is compatible with NASM and can be successfully assembled into a flat binary.\n"
-            "3. During error correction, ensure that the corrected code maintains the original functionality and logic.\n"
-            "4. During error correction, do not declare any extra variables or add any extra sections (e.g., `.data`, `.text`), global labels, or entry points. Use hardcoded values if needed; the code should be self-contained.\n"
-            "5. During error correction do not remove or add any instructions other than the necessary corrections to fix the errors. This is extremely important to preserve functionality. For instance if you see several similar instructions that is not causing any error, keep them as it is.\n" 
-            "6. Use only registers and hardcoded values for all computations; avoid external memory access (e.g., labels like `.data`, `db`, or memory accesses like `[addr]`).\n"
-            "7. After making the necessary changes, output the corrected code in a single ```assembly``` block.\n"
-            "8. Always provide the entire code; do not generate partial code.\n"
-        )
-
-        prompt_string += task_list
-
-        return prompt_string
-
-
-    def asm_code_error_correction(self):
-        prompt_string = f"Here is an x86 assembly code for 32-bit machines:\n\n```assembly\n{self.gen_asm_code}\n```\n\n"
-
-        prompt_string += "Your task:\n\n"
-
-        # Step 1: Review and correct the code
-        prompt_string += "1. Review and correct the code to fix any potential issues, for example:\n"
-        potential_issues = (
-            "- Improper register use or lack of register preservation.\n"
-            "- Logical or flow errors (e.g., issues in loops or conditionals).\n"
-            "- Infinite loops or undefined conditional jumps.\n"
-            "- Runtime crash instructions.\n"
-            "- Undefined or incorrectly used variables or memory locations.\n"
-            "- Inconsistent or incorrect addressing modes (e.g., `[addr]` vs. relative addressing).\n"
-            "- Stack mismanagement (e.g., `PUSH`/`POP` imbalance).\n"
-        )
-        prompt_string += potential_issues + "\n"
-
-        # Step 2: Guidelines for correction
-        prompt_string += "2. Guidelines for Correction:\n"
-        correction_guidelines = (
-            "- Do not change the overall functionality of the code; maintain the original logic.\n"
-            "- Do not declare any extra variables or add any extra sections (e.g., `.data`, `.text`), global labels, or entry points.\n"
-            "- Use hardcoded values if needed; the code should be self-contained.\n"
-            "- If the code contains additional sections or data declarations, remove them and use only registers and hardcoded values.\n"
-            "- Do not remove or add any instructions other than the necessary corrections to fix the errors. This is extremely important to preserve functionality. For instance if you see several similar instructions that is not causing any error, keep them as it is.\n"
-            "- You do not need to optimize the code; focus on correcting errors and maintaining functionality.\n"
-            # "- Ensure that the corrected code does not crash, contains no infinite loops, and has properly defined conditional jumps.\n"
-            # "- Maintain proper register preservation if they are not preserved properly by pushing and popping them.\n"
-        )
-        prompt_string += correction_guidelines + "\n"
-
-        # Step 3: Output requirements
-        prompt_string += "3. Output Requirements:\n"
-        output_requirements = (
-            "- Output the entire corrected code in a single ```assembly``` block.\n"
-            "- Do not include any explanations, reasoning, or extra text; only output the code.\n"
-            "- Always generate the entire code; never generate partial code.\n"
-        )
-        prompt_string += output_requirements + "\n"
-
-        # Final note
-        prompt_string += "Note: Perform any necessary reasoning internally. Your final output should be only the corrected assembly code as specified.\n"
-
-        return prompt_string
-
-
-    def generate_prompt(self):
-        
-        # functionality_preservation_prompt = self.get_functionality_preservation_prompt()
-        # backticks_format_useful_instructions = self.get_backticks_format_useful_instructions()
-        # strategy_prompt = self.get_strategy_prompt()
-        # print(self.behavior)
-    
-        if self.behavior == 'assembly_procedure_generation':
-            self.total_prompt = self.get_assembly_procedure()
-        elif self.behavior == 'assembly_code_generation':
-            self.total_prompt = self.get_assembly_code()
-        elif self.behavior == 'assembly_testing_code_generation':
-            self.total_prompt = self.get_asm_testing_code()
-        
-        elif self.behavior == 'register_preservation_error_correction':
-            self.total_prompt = self.asm_code_reg_preserve_error_correction()
-        elif self.behavior == 'nasm_compile_error_correction':
-            self.total_prompt = self.asm_code_nasm_compile_error_correction()
-        elif self.behavior == 'generic_error_correction':
-            self.total_prompt = self.asm_code_error_correction()
-
-        elif self.behavior == 'assembly_testing_error_correction':
-            self.total_prompt = self.asm_testing_error_correction()
-        elif self.behavior == 'assembly_testing_code_editing':
-            self.total_prompt = self.get_asm_editing_prompt()
-       
         return self.total_prompt
 
 
@@ -1812,8 +1134,6 @@ def get_prompt(
     strategy_num,
     is_json_prompt=False,
     behavior=None,
-    assembly_gen_mode=None,
-    asm_code=None,
     error_list=None,
     error_type=None,
     execution_output=None,
@@ -1821,19 +1141,10 @@ def get_prompt(
 ):
     prompt = ''
 
-    if language_name == 'assembly':
-        prompt_generator = AssemblyPromptGenerator(num_functions, function_names, strategy_num, 
-                                                   variant_generation_strategy, behavior, 
-                                                   assembly_gen_mode, asm_code, 
-                                                   error_list, error_type, execution_output)
-
-    else:
-    
-        prompt_generator = PromptGenerator(num_functions, function_names, strategy_num, 
-                                        variant_generation_strategy, behavior, 
-                                        assembly_gen_mode, asm_code, 
-                                        error_list, error_type, execution_output, 
-                                        language_name)
+    prompt_generator = PromptGenerator(num_functions, function_names, strategy_num,
+                                       variant_generation_strategy, behavior,
+                                       error_list, error_type, execution_output,
+                                       language_name)
         
     
     prompt = prompt_generator.generate_prompt()
@@ -1941,13 +1252,13 @@ def get_prompt(
         prompt += f"8. DO NOT change the function name, return type, parameters and their types, or the name and number of parameters of the original functions while generating variants.\n\n"
 
         if is_json_prompt:
-            prompt += f"9. DO NOT generate anything outside the JSON format. Your final output should be a single JSON object with the appropriate keys('modified code', 'replacer', 'comments') and values in the format that I provided you. "
+            prompt += f"9. DO NOT generate anything outside the JSON format. Your final output should be a single JSON object with keys 'modified_code', 'function_map', 'comments'.\n"
 
     elif strategy_num == 5:
         #print("strategy_num", strategy_num)
 
         if is_json_prompt:
-            prompt += additional_strategy_wise_json_prompt_dict['obfuscation_splitting_prompt_json']
+            prompt += additional_strategy_wise_json_prompt_dict['obfuscation_prompt_json']
         else:
             prompt += additional_strategy_wise_backticks_prompt_dict['obfuscation_splitting_prompt_no_mapping']
 
@@ -1971,10 +1282,13 @@ def generate_simple_prompt(
         f"and {num_functions} global function definition(s) from a {language_name} source code file. "
         f"As a coding assistant, GENERATE VARIANTS of these functions namely: ***{', '.join([func_name for func_name in function_names])}*** following these instructions: \n"
         f"{strategy_prompt}\n"
-        f"REMEMBER, the generated code MUST MAINTAIN the same FUNCTIONALITY as the original code. Make sure to ALWAYS generate the code, I don't need the code explanation."
+        f"REMEMBER, the generated code MUST MAINTAIN the same FUNCTIONALITY as the original code. Make sure to ALWAYS generate the code, I don't need the code explanation.\n"
+        f"SAFETY VALVE: If a particular transformation would break semantics or produce unsafe code, "
+        f"skip that specific transformation and leave that part of the code unchanged. "
+        f"It is better to produce partially-transformed but CORRECT code than fully-transformed but BROKEN code."
     )
 
     return prompt
 
 
-# print(get_prompt(1, ["func1"], strategy_prompt_dict["strat_1_optimization"], 1))
+# print(get_prompt(1, ["func1"], strategy_prompt_dict["strat_2_optimization"], 1))

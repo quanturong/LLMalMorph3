@@ -265,7 +265,64 @@ class CapeApiClient:
         except Exception as e:
             logger.error(f"Submit error: {e}")
             return None
-    
+
+    def submit_bytes(self, file_bytes: bytes, filename: str = "sample.exe",
+                     machine: str = '', platform: str = 'windows',
+                     timeout_analysis: int = 120,
+                     options: Dict[str, str] = None) -> Optional[int]:
+        """
+        Submit in-memory bytes for analysis (no plaintext touches disk).
+        Returns task_id on success, None on failure.
+        """
+        import io
+        try:
+            files = {'file': (filename, io.BytesIO(file_bytes))}
+            data = {
+                'timeout': timeout_analysis,
+                'platform': platform,
+            }
+            if machine:
+                data['machine'] = machine
+            if options:
+                top_level_option_keys = {
+                    'route', 'package', 'custom', 'clock', 'memory',
+                    'enforce_timeout', 'priority', 'tags'
+                }
+                options_for_string = {}
+                for k, v in options.items():
+                    if k in top_level_option_keys:
+                        data[k] = v
+                    else:
+                        options_for_string[k] = v
+                if options_for_string:
+                    data['options'] = ','.join(f'{k}={v}' for k, v in options_for_string.items())
+
+            r = self.session.post(
+                self._url('/apiv2/tasks/create/file/'),
+                files=files,
+                data=data,
+                timeout=self.timeout
+            )
+
+            if r.status_code == 200:
+                result = r.json()
+                if 'data' in result and 'task_ids' in result['data']:
+                    task_ids = result['data']['task_ids']
+                    if task_ids:
+                        return task_ids[0]
+                elif 'task_id' in result:
+                    return result['task_id']
+                elif 'data' in result and 'task_id' in result['data']:
+                    return result['data']['task_id']
+                logger.error(f"Unexpected submit response: {result}")
+                return None
+            else:
+                logger.error(f"Submit failed ({r.status_code}): {r.text[:500]}")
+                return None
+        except Exception as e:
+            logger.error(f"Submit bytes error: {e}")
+            return None
+
     def get_task_status(self, task_id: int) -> str:
         """
         Get task status. 

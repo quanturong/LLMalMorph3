@@ -2,16 +2,27 @@
 Automatic error fixing using LLM.
 Fixes compilation errors and code issues automatically.
 """
+import json
 import logging
+import os
 import re
 from typing import Dict, List, Optional, Tuple
 from llm_api import get_llm_provider, LLMAPIError
 try:
-    from .error_analyzer import ErrorAnalyzer, ErrorType
+    from .error_analyzer import (
+        ErrorAnalyzer, ErrorType,
+        detect_compiler_from_errors,
+        COMPILER_MSVC, COMPILER_GCC, COMPILER_CLANG, COMPILER_AUTO,
+    )
 except ImportError:
     # Fallback if error_analyzer is not available
     ErrorAnalyzer = None
     ErrorType = None
+    detect_compiler_from_errors = None
+    COMPILER_MSVC = 'msvc'
+    COMPILER_GCC = 'gcc'
+    COMPILER_CLANG = 'clang'
+    COMPILER_AUTO = 'auto'
 
 try:
     from .fix_history_rag import FixHistoryRAG
@@ -21,7 +32,56 @@ except (ImportError, SystemError):
     except ImportError:
         FixHistoryRAG = None
 
+try:
+    from .semantic_validator import get_semantic_validator, SemanticValidator
+except (ImportError, SystemError):
+    try:
+        from semantic_validator import get_semantic_validator, SemanticValidator
+    except ImportError:
+        get_semantic_validator = None  # type: ignore
+        SemanticValidator = None  # type: ignore
+
 logger = logging.getLogger(__name__)
+
+# ── AST availability check ─────────────────────────────────────────
+# When tree-sitter is not available, validation runs in DEGRADED MODE:
+# all thresholds become stricter to compensate for losing structural analysis.
+_AST_AVAILABLE: bool = False
+try:
+    _sv = get_semantic_validator() if get_semantic_validator else None
+    _AST_AVAILABLE = bool(_sv and _sv.available)
+    del _sv
+except Exception:
+    pass
+
+if not _AST_AVAILABLE:
+    logger.warning(
+        "⚠️  auto_fixer: tree-sitter NOT available — running in DEGRADED MODE. "
+        "Validation will use stricter heuristic thresholds to compensate. "
+        "Install tree-sitter + tree-sitter-c/cpp for full semantic validation."
+    )
+
+
+# ── Win32 domain knowledge (loaded from external JSON config) ──────
+_WIN32_KNOWLEDGE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    'configs', 'win32_knowledge.json'
+)
+_win32_knowledge_cache: Optional[dict] = None
+
+
+def _load_win32_knowledge() -> dict:
+    """Lazy-load Win32 domain tables from configs/win32_knowledge.json."""
+    global _win32_knowledge_cache
+    if _win32_knowledge_cache is not None:
+        return _win32_knowledge_cache
+    try:
+        with open(_WIN32_KNOWLEDGE_PATH, 'r', encoding='utf-8') as f:
+            _win32_knowledge_cache = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.warning(f"Could not load win32_knowledge.json: {e}. Using empty tables.")
+        _win32_knowledge_cache = {}
+    return _win32_knowledge_cache
 
 
 # ── Error line parser ──────────────────────────────────────────────
@@ -101,27 +161,33 @@ def _extract_global_declarations(source_lines: List[str], max_lines: int = 150) 
     return '\n'.join(decl_lines)
 
 
-def _extract_function_signatures(section_text: str) -> List[str]:
-    """Extract function signatures (return_type func_name(...)) from a code section.
+def _extract_function_signatures(section_text: str, language: str = "c") -> List[str]:
+    """Extract function names from a code section using AST, with regex fallback.
 
-    Used to verify that a fix preserves function signatures defined in the region.
+    Uses tree-sitter AST when available; falls back to regex heuristic otherwise.
     """
-    # Match common C/C++ function definitions — simplified but effective
+    # ── AST path (preferred) ──
+    sv = get_semantic_validator() if get_semantic_validator else None
+    if sv and sv.available:
+        names = sv.extract_function_names(section_text, language)
+        if names:
+            return names
+
+    # ── Regex fallback ──
     pattern = re.compile(
-        r'^[ \t]*'                              # leading whitespace
-        r'(?:static\s+|inline\s+|extern\s+|virtual\s+|__declspec\([^)]*\)\s+)*'  # qualifiers
-        r'(?:(?:unsigned|signed|const|volatile|struct|enum|union|class)\s+)*'     # type qualifiers
-        r'(\w[\w:*&\s<>,]*?)\s+'                # return type (group 1)
-        r'(\w+)\s*'                             # function name (group 2)
-        r'\([^)]*\)'                            # parameter list
-        r'(?:\s*(?:const|override|noexcept|final))*'  # trailing qualifiers
-        r'\s*[{;]',                             # body or declaration
+        r'^[ \t]*'
+        r'(?:static\s+|inline\s+|extern\s+|virtual\s+|__declspec\([^)]*\)\s+)*'
+        r'(?:(?:unsigned|signed|const|volatile|struct|enum|union|class)\s+)*'
+        r'(\w[\w:*&\s<>,]*?)\s+'
+        r'(\w+)\s*'
+        r'\([^)]*\)'
+        r'(?:\s*(?:const|override|noexcept|final))*'
+        r'\s*[{;]',
         re.MULTILINE
     )
     sigs = []
     for m in pattern.finditer(section_text):
         func_name = m.group(2)
-        # Exclude control-flow keywords that look like functions
         if func_name not in ('if', 'for', 'while', 'switch', 'return', 'sizeof',
                              'catch', 'throw', 'delete', 'new', 'else'):
             sigs.append(func_name)
@@ -167,12 +233,26 @@ def _check_brace_balance(text: str) -> int:
     return balance
 
 
-def _extract_defined_symbols(section_text: str) -> set:
-    """Extract symbols (function names, global vars, macros) defined in a section.
+def _extract_defined_symbols(section_text: str, language: str = "c") -> set:
+    """Extract symbols (function names, global vars, macros, typedefs) defined in a section.
 
+    Uses AST when available; regex fallback otherwise.
     These are symbols that OTHER regions may depend on, so they must be preserved.
     """
-    symbols: set = set()
+    # ── AST path (preferred) ──
+    sv = get_semantic_validator() if get_semantic_validator else None
+    if sv and sv.available:
+        snap = sv.extract_snapshot(section_text, language)
+        if snap is not None:
+            symbols: set = set()
+            symbols.update(snap.functions.keys())
+            symbols.update(snap.types.keys())
+            symbols.update(snap.globals.keys())
+            symbols.update(snap.macros)
+            return symbols
+
+    # ── Regex fallback ──
+    symbols = set()
 
     # Function definitions
     for name in _extract_function_signatures(section_text):
@@ -202,8 +282,29 @@ def _extract_defined_symbols(section_text: str) -> set:
 
 def _find_symbols_used_elsewhere(source_lines: List[str], reg_start: int, reg_end: int,
                                   defined_symbols: set) -> List[str]:
-    """Find which symbols defined in [reg_start, reg_end] are referenced outside that region."""
-    used_elsewhere: List[str] = []
+    """Find which symbols defined in [reg_start, reg_end] are referenced outside that region.
+
+    AST-first: uses tree-sitter to find real identifier tokens (ignoring
+    comments and string literals).  Falls back to regex word-boundary if
+    AST is unavailable.
+    """
+    sv = get_semantic_validator() if get_semantic_validator else None
+    if sv and sv.available:
+        full_code = '\n'.join(source_lines)
+        used_elsewhere: List[str] = []
+        for sym in defined_symbols:
+            if len(sym) < 2:
+                continue
+            ref_lines = sv.find_symbol_references(full_code, sym)
+            # Check if any reference is outside the region
+            if any(ln < reg_start or ln > reg_end for ln in ref_lines):
+                used_elsewhere.append(sym)
+        return used_elsewhere
+
+    # ── Regex fallback (degraded mode) ──
+    if not _AST_AVAILABLE:
+        logger.debug("[degraded] _find_symbols_used_elsewhere: using regex word-boundary fallback")
+    used_elsewhere = []
     for sym in defined_symbols:
         if len(sym) < 2:
             continue
@@ -309,107 +410,26 @@ class AutoFixer:
         return fixed_code
 
     # ── Windows SDK collision sanitizer ────────────────────────────────
-    # Identifiers that MUST NOT be #define'd or typedef'd in user code
-    # because they conflict with Windows SDK / CRT headers.
-    _FORBIDDEN_DEFINES = {
-        'string', 'bool', 'true', 'false', 'byte', 'BYTE', 'CHAR', 'DWORD',
-        'HANDLE', 'UINT', 'LONG', 'LPSTR', 'LPCSTR', 'LPVOID', 'WORD',
-        'TRUE', 'FALSE', 'BOOL', 'INT', 'VOID', 'SHORT', 'ULONG', 'USHORT',
-        'UCHAR', 'PCHAR', 'PWSTR', 'PCWSTR', 'LPWSTR', 'LPCWSTR',
-        'SIZE_T', 'SSIZE_T', 'HRESULT', 'LRESULT', 'WPARAM', 'LPARAM',
-        'HINSTANCE', 'HWND', 'HMODULE', 'HKEY', 'HDC', 'HBITMAP',
-        'HBRUSH', 'HPEN', 'HFONT', 'HICON', 'HMENU', 'HCURSOR',
-        'COLORREF', 'SOCKET', 'INVALID_HANDLE_VALUE', 'INVALID_SOCKET',
-        'NULL', 'MAX_PATH', 'WINAPI', 'CALLBACK', 'APIENTRY',
-        'WCHAR', 'TCHAR', 'LPTSTR', 'LPCTSTR', 'FARPROC',
-        # C99/C11 standard types the LLM should not redefine
-        'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
-        'int8_t', 'int16_t', 'int32_t', 'int64_t',
-        'uintptr_t', 'intptr_t', 'size_t', 'ssize_t',
-        # Win32 struct/union types that must NOT be redefined (C2371)
-        'MEMORY_BASIC_INFORMATION', 'PMEMORY_BASIC_INFORMATION',
-        'SECURITY_ATTRIBUTES', 'LPSECURITY_ATTRIBUTES',
-        'PROCESS_INFORMATION', 'STARTUPINFO', 'STARTUPINFOA', 'STARTUPINFOW',
-        'PROCESSENTRY32', 'MODULEENTRY32', 'THREADENTRY32',
-        'WIN32_FIND_DATA', 'WIN32_FIND_DATAA', 'WIN32_FIND_DATAW',
-        'OVERLAPPED', 'CRITICAL_SECTION', 'WSADATA',
-        'SOCKADDR_IN', 'FILETIME', 'SYSTEMTIME',
-        'LARGE_INTEGER', 'ULARGE_INTEGER',
-        'COORD', 'SMALL_RECT', 'CONSOLE_SCREEN_BUFFER_INFO',
-        'PVOID', 'LPBYTE', 'LPDWORD',
-        # WinCrypt types & constants (from <wincrypt.h> / <dpapi.h>)
-        'DATA_BLOB', 'PDATA_BLOB', 'CRYPT_INTEGER_BLOB',
-        'HCRYPTPROV', 'HCRYPTHASH', 'HCRYPTKEY',
-        'PROV_RSA_FULL', 'PROV_RSA_AES', 'PROV_RSA_SCHANNEL',
-        'CRYPT_VERIFYCONTEXT', 'CRYPT_MACHINE_KEYSET', 'CRYPT_NEWKEYSET',
-        'ALG_CLASS_HASH', 'ALG_TYPE_ANY', 'ALG_SID_SHA', 'ALG_SID_SHA_256',
-        'ALG_SID_MD5', 'CALG_SHA', 'CALG_SHA_256', 'CALG_MD5',
-        'HP_HASHVAL', 'HP_HASHSIZE', 'KP_MODE', 'KP_IV',
-        'PLAINTEXTKEYBLOB', 'CUR_BLOB_VERSION',
-        'CERT_CONTEXT', 'PCERT_CONTEXT',
-        # COM/OLE types
-        'VARIANT', 'SAFEARRAY', 'BSTR', 'LPSAFEARRAY',
-        'IWebBrowser2', 'IDispatch', 'IUnknown',
-        # Vault types
-        'VAULT_ITEM', 'VAULT_ELEMENT_TYPE',
-    }
+    # Loaded from configs/win32_knowledge.json — identifiers that MUST NOT
+    # be #define'd or typedef'd in user code.
+    _forbidden_defines_cache: Optional[set] = None
+    _lowercase_to_correct_cache: Optional[Dict[str, str]] = None
 
-    # ── Map of lowercased Win32 types → correct casing ─────────────────
-    # LLMs (especially strat_5) rename Windows types to lowercase.
-    # Instead of declaring them as local 'int' variables, we restore
-    # the correct casing so the code compiles against Windows SDK.
-    _WIN32_LOWERCASE_TO_CORRECT: Dict[str, str] = {
-        # Primitive Windows typedefs
-        'dword': 'DWORD', 'word': 'WORD', 'byte': 'BYTE',
-        'bool': 'BOOL', 'void': 'VOID', 'uint': 'UINT',
-        'long': 'LONG', 'ulong': 'ULONG', 'ushort': 'USHORT',
-        'short': 'SHORT', 'char': 'CHAR', 'uchar': 'UCHAR',
-        'int': 'INT', 'lpvoid': 'LPVOID', 'pvoid': 'PVOID',
-        'lpstr': 'LPSTR', 'lpcstr': 'LPCSTR', 'lpwstr': 'LPWSTR',
-        'lpcwstr': 'LPCWSTR', 'lptstr': 'LPTSTR', 'lpctstr': 'LPCTSTR',
-        'lpbyte': 'LPBYTE', 'lpdword': 'LPDWORD',
-        'size_t': 'SIZE_T', 'ssize_t': 'SSIZE_T',
-        'hresult': 'HRESULT', 'lresult': 'LRESULT',
-        'wparam': 'WPARAM', 'lparam': 'LPARAM',
-        'colorref': 'COLORREF', 'farproc': 'FARPROC',
-        'wchar': 'WCHAR', 'tchar': 'TCHAR',
-        # Handle types
-        'handle': 'HANDLE', 'hmodule': 'HMODULE', 'hinstance': 'HINSTANCE',
-        'hwnd': 'HWND', 'hdc': 'HDC', 'hkey': 'HKEY',
-        'hbitmap': 'HBITMAP', 'hbrush': 'HBRUSH', 'hpen': 'HPEN',
-        'hfont': 'HFONT', 'hicon': 'HICON', 'hmenu': 'HMENU',
-        'hcursor': 'HCURSOR', 'hinternet': 'HINTERNET',
-        'hcryptprov': 'HCRYPTPROV', 'hcrypthash': 'HCRYPTHASH',
-        'hcryptkey': 'HCRYPTKEY', 'socket': 'SOCKET',
-        # Struct/union types
-        'memory_basic_information': 'MEMORY_BASIC_INFORMATION',
-        'pmemory_basic_information': 'PMEMORY_BASIC_INFORMATION',
-        'security_attributes': 'SECURITY_ATTRIBUTES',
-        'lpsecurity_attributes': 'LPSECURITY_ATTRIBUTES',
-        'process_information': 'PROCESS_INFORMATION',
-        'startupinfo': 'STARTUPINFO', 'startupinfoa': 'STARTUPINFOA',
-        'startupinfow': 'STARTUPINFOW',
-        'processentry32': 'PROCESSENTRY32', 'moduleentry32': 'MODULEENTRY32',
-        'threadentry32': 'THREADENTRY32',
-        'win32_find_data': 'WIN32_FIND_DATA',
-        'win32_find_dataa': 'WIN32_FIND_DATAA',
-        'win32_find_dataw': 'WIN32_FIND_DATAW',
-        'overlapped': 'OVERLAPPED', 'critical_section': 'CRITICAL_SECTION',
-        'wsadata': 'WSADATA', 'sockaddr_in': 'SOCKADDR_IN',
-        'filetime': 'FILETIME', 'systemtime': 'SYSTEMTIME',
-        'large_integer': 'LARGE_INTEGER', 'ularge_integer': 'ULARGE_INTEGER',
-        'coord': 'COORD', 'small_rect': 'SMALL_RECT',
-        'console_screen_buffer_info': 'CONSOLE_SCREEN_BUFFER_INFO',
-        # Constants
-        'true': 'TRUE', 'false': 'FALSE', 'null': 'NULL',
-        'max_path': 'MAX_PATH', 'invalid_handle_value': 'INVALID_HANDLE_VALUE',
-        'invalid_socket': 'INVALID_SOCKET',
-        'winapi': 'WINAPI', 'callback': 'CALLBACK', 'apientry': 'APIENTRY',
-        # Commonly lowercased Win32 directory constants
-        'csidl_program_files': 'CSIDL_PROGRAM_FILES',
-        'csidl_program_filesx86': 'CSIDL_PROGRAM_FILESx86',
-        'shgfp_type_current': 'SHGFP_TYPE_CURRENT',
-    }
+    @classmethod
+    def _get_forbidden_defines(cls) -> set:
+        """Lazy-load forbidden defines from external config."""
+        if cls._forbidden_defines_cache is None:
+            data = _load_win32_knowledge()
+            cls._forbidden_defines_cache = set(data.get('forbidden_defines', []))
+        return cls._forbidden_defines_cache
+
+    @classmethod
+    def _get_lowercase_to_correct(cls) -> Dict[str, str]:
+        """Lazy-load lowercase→correct casing map from external config."""
+        if cls._lowercase_to_correct_cache is None:
+            data = _load_win32_knowledge()
+            cls._lowercase_to_correct_cache = data.get('lowercase_to_correct', {})
+        return cls._lowercase_to_correct_cache
 
     @classmethod
     def _sanitize_dangerous_patterns(cls, code: str) -> str:
@@ -428,14 +448,14 @@ class AutoFixer:
 
             # #define FORBIDDEN ...
             m = re.match(r'^#\s*define\s+(\w+)', stripped)
-            if m and m.group(1) in cls._FORBIDDEN_DEFINES:
+            if m and m.group(1) in cls._get_forbidden_defines():
                 logger.warning(f"   \U0001f6e1 Sanitizer: removed '#define {m.group(1)}' (Windows SDK conflict)")
                 removed += 1
                 continue
 
             # typedef ... FORBIDDEN ;
             m = re.match(r'^typedef\s+.*\b(\w+)\s*;', stripped)
-            if m and m.group(1) in cls._FORBIDDEN_DEFINES:
+            if m and m.group(1) in cls._get_forbidden_defines():
                 logger.warning(f"   \U0001f6e1 Sanitizer: removed 'typedef ... {m.group(1)}' (Windows SDK conflict)")
                 removed += 1
                 continue
@@ -592,64 +612,16 @@ class AutoFixer:
         return result
 
     # ── Generic pattern-based fixes (no LLM) ──────────────────────────
-    # Return type lookup for common Win32 / CRT functions
-    _WIN32_FUNC_RETURN_TYPES: Dict[str, str] = {
-        # Process / Thread
-        'GetCurrentProcessId': 'DWORD', 'GetCurrentThreadId': 'DWORD',
-        'GetParentProcessId': 'DWORD', 'CreateProcess': 'BOOL',
-        'CreateProcessA': 'BOOL', 'CreateProcessW': 'BOOL',
-        'OpenProcess': 'HANDLE', 'CreateThread': 'HANDLE',
-        'TerminateProcess': 'BOOL', 'GetExitCodeProcess': 'BOOL',
-        'WaitForSingleObject': 'DWORD', 'GetProcessVersion': 'DWORD',
-        'GetLastError': 'DWORD', 'SetLastError': 'void',
-        # Memory
-        'malloc': 'void*', 'calloc': 'void*', 'realloc': 'void*',
-        'HeapAlloc': 'LPVOID', 'VirtualAlloc': 'LPVOID',
-        'GetProcessHeap': 'HANDLE', 'LocalAlloc': 'HLOCAL',
-        'GlobalAlloc': 'HGLOBAL',
-        # File / IO
-        'CreateFile': 'HANDLE', 'CreateFileA': 'HANDLE', 'CreateFileW': 'HANDLE',
-        'ReadFile': 'BOOL', 'WriteFile': 'BOOL', 'CloseHandle': 'BOOL',
-        'GetFileSize': 'DWORD', 'SetFilePointer': 'DWORD',
-        'FindFirstFile': 'HANDLE', 'FindFirstFileA': 'HANDLE', 'FindFirstFileW': 'HANDLE',
-        # Registry
-        'RegOpenKeyEx': 'LONG', 'RegOpenKeyExA': 'LONG', 'RegOpenKeyExW': 'LONG',
-        'RegCreateKeyEx': 'LONG', 'RegSetValueEx': 'LONG',
-        'RegQueryValueEx': 'LONG', 'RegCloseKey': 'LONG',
-        # Module / Library
-        'LoadLibrary': 'HMODULE', 'LoadLibraryA': 'HMODULE', 'LoadLibraryW': 'HMODULE',
-        'GetModuleHandle': 'HMODULE', 'GetModuleHandleA': 'HMODULE', 'GetModuleHandleW': 'HMODULE',
-        'GetProcAddress': 'FARPROC', 'FreeLibrary': 'BOOL',
-        # String
-        'strlen': 'size_t', 'wcslen': 'size_t', 'lstrlen': 'int', 'lstrlenW': 'int',
-        'strcmp': 'int', 'wcscmp': 'int', 'lstrcmp': 'int',
-        'strstr': 'char*', 'wcsstr': 'wchar_t*', 'StrStr': 'char*',
-        'wsprintf': 'int', 'wsprintfW': 'int', 'sprintf': 'int',
-        # Sync
-        'CreateMutex': 'HANDLE', 'CreateMutexA': 'HANDLE', 'CreateMutexW': 'HANDLE',
-        'CreateEvent': 'HANDLE', 'CreateSemaphore': 'HANDLE',
-        # Network
-        'socket': 'SOCKET', 'connect': 'int', 'send': 'int', 'recv': 'int',
-        'InternetOpen': 'HINTERNET', 'InternetOpenA': 'HINTERNET', 'InternetOpenW': 'HINTERNET',
-        'InternetOpenUrl': 'HINTERNET', 'InternetConnect': 'HINTERNET',
-        'HttpOpenRequest': 'HINTERNET', 'HttpSendRequest': 'BOOL',
-        # Window
-        'CreateWindow': 'HWND', 'CreateWindowEx': 'HWND', 'CreateWindowExA': 'HWND',
-        'CreateWindowExW': 'HWND', 'FindWindow': 'HWND',
-        'GetDC': 'HDC', 'ReleaseDC': 'int',
-        # Crypto
-        'CryptAcquireContext': 'BOOL', 'CryptAcquireContextA': 'BOOL',
-        'CryptAcquireContextW': 'BOOL', 'CryptCreateHash': 'BOOL',
-        'CryptHashData': 'BOOL', 'CryptGetHashParam': 'BOOL',
-        # Shell
-        'SHGetFolderPath': 'HRESULT', 'SHGetFolderPathA': 'HRESULT', 'SHGetFolderPathW': 'HRESULT',
-        'ShellExecute': 'HINSTANCE', 'ShellExecuteA': 'HINSTANCE', 'ShellExecuteW': 'HINSTANCE',
-        # Misc
-        'GetCommandLine': 'LPSTR', 'GetCommandLineA': 'LPSTR', 'GetCommandLineW': 'LPWSTR',
-        'GetTickCount': 'DWORD', 'GetTickCount64': 'ULONGLONG',
-        'Sleep': 'void', 'ExitProcess': 'void',
-        'GetModuleFileName': 'DWORD', 'GetModuleFileNameA': 'DWORD', 'GetModuleFileNameW': 'DWORD',
-    }
+    # Return type lookup loaded from configs/win32_knowledge.json
+    _func_return_types_cache: Optional[Dict[str, str]] = None
+
+    @classmethod
+    def _get_func_return_types(cls) -> Dict[str, str]:
+        """Lazy-load Win32/CRT function return type map from external config."""
+        if cls._func_return_types_cache is None:
+            data = _load_win32_knowledge()
+            cls._func_return_types_cache = data.get('func_return_types', {})
+        return cls._func_return_types_cache
 
     @classmethod
     def _infer_variable_type(cls, ident: str, lines: List[str], usage_lines: List[int],
@@ -686,7 +658,7 @@ class AutoFixer:
                 m = re.search(re.escape(ident) + r'\s*=\s*(\w+)\s*\(', line)
             if m:
                 func = m.group(1)
-                ret = cls._WIN32_FUNC_RETURN_TYPES.get(func)
+                ret = cls._get_func_return_types().get(func)
                 if ret and ret != 'void':
                     return ret
 
@@ -714,65 +686,58 @@ class AutoFixer:
             if re.search(r'\b' + re.escape(ident) + r'\s*[!=]=\s*(?:TRUE|FALSE)\b', line):
                 return 'BOOL'
 
-        # ── Naming-convention fallback ──
-        if ident.startswith('h') and len(ident) > 1 and ident[1].isupper():
-            return 'HANDLE'
-        if ident.startswith('p') and len(ident) > 1 and ident[1].isupper():
-            return 'BYTE*'
-        if ident.startswith('lp') and len(ident) > 2 and ident[2].isupper():
-            return 'BYTE*'
-        if ident.startswith('b') and len(ident) > 1 and ident[1].isupper():
-            return 'BOOL'
-        if ident.startswith('dw') and len(ident) > 2 and ident[2].isupper():
-            return 'DWORD'
-        if ident.startswith('n') and len(ident) > 1 and ident[1].isupper():
-            return 'int'
-        if ident.startswith(('sz', 'str')):
-            return 'char*'
-        if ident.startswith('w') and len(ident) > 1 and ident[1].isupper():
-            return 'WORD'
-        if ident.isupper():
-            return 'DWORD'
+        # ── AST-based type inference (preferred over naming heuristics) ──
+        sv = get_semantic_validator() if get_semantic_validator else None
+        if sv and sv.available and usage_lines:
+            full_code = '\n'.join(lines)
+            for line_num in usage_lines:
+                ast_type = sv.infer_type_at_usage(full_code, ident, line_num)
+                if ast_type:
+                    return ast_type
 
-        return 'int'
+        # No reliable inference — return None rather than guessing from
+        # naming conventions (hX→HANDLE, dwX→DWORD, etc.) which can make
+        # the code compile but silently break runtime semantics.
+        return None
 
     @classmethod
     def _find_function_body_start(cls, lines: List[str], usage_line: int) -> Optional[int]:
         """Return the 0-based line index just after the opening '{' of the
         function that contains *usage_line* (1-based).
 
-        Keeps traversing upward past nested scopes (while/for/if blocks) to
-        find the outermost function-level opening brace, so declarations are
-        placed at function scope, not block scope.
+        AST-first: uses tree-sitter to walk function_definition nodes.
+        Falls back to brace-counting heuristic if AST is unavailable.
         """
+        # ── AST path (preferred) ──
+        sv = get_semantic_validator() if get_semantic_validator else None
+        if sv and sv.available:
+            full_code = '\n'.join(lines)
+            ast_line = sv.find_function_body_start(full_code, usage_line)
+            if ast_line is not None:
+                return ast_line - 1  # convert 1-based → 0-based
+
+        # ── Brace-counting fallback (degraded mode) ──
+        if not _AST_AVAILABLE:
+            logger.debug("[degraded] _find_function_body_start: using brace-counting fallback")
         brace_depth = 0
         func_brace_line: Optional[int] = None
         for i in range(min(usage_line - 1, len(lines) - 1), -1, -1):
             line = lines[i]
             brace_depth += line.count('}') - line.count('{')
             if brace_depth < 0:
-                # We've found an unmatched '{' → this opens a scope
-                # Check if it looks like a function definition (has ')' context)
                 context = ' '.join(lines[max(0, i - 5):i + 1])
                 if ')' in context:
-                    # Check whether this is a function definition or just a control block
-                    # Function defs have: type name(...) { but NOT if/while/for/switch(...)
-                    # Look at the line with ')' — if it starts with if/while/for/switch/do, skip
                     stripped_ctx = context.lstrip()
                     control_kw = re.match(
                         r'.*\b(if|else\s*if|while|for|switch|do)\s*\(', stripped_ctx
                     )
                     if control_kw:
-                        # This is a control-flow block brace, not function.
-                        # Record it as a candidate but keep searching.
                         if func_brace_line is None:
                             func_brace_line = i + 1
-                        brace_depth = 0  # reset to continue upward
+                        brace_depth = 0
                         continue
-                    # Looks like a function definition
                     return i + 1
                 else:
-                    # Standalone block '{' — record but keep searching
                     if func_brace_line is None:
                         func_brace_line = i + 1
                     brace_depth = 0
@@ -785,7 +750,8 @@ class AutoFixer:
         source_code: str,
         errors: List[str],
         language: str = "c",
-    ) -> Tuple[str, int]:
+        file_path: str = "",
+    ) -> Tuple[str, int, set]:
         """Apply pattern-based compilation-error fixes that work for any project.
 
         Currently handles:
@@ -797,10 +763,12 @@ class AutoFixer:
 
         Returns
         -------
-        (fixed_code, num_fixes)
+        (fixed_code, num_fixes, lnk_missing_libs)
+            lnk_missing_libs is a set of library names (e.g. 'kernel32.lib')
+            detected from LNK2019/LNK2001 errors.
         """
         if language.lower() not in ('c', 'cpp', 'c++'):
-            return source_code, 0
+            return source_code, 0, set()
 
         fixes = 0
         lines = source_code.split('\n')
@@ -885,10 +853,17 @@ class AutoFixer:
 
         for err in errors:
             if 'C1075' in err and ("'{'" in err or "no matching token" in err):
-                # Count braces to detect imbalance
+                # Count braces using string/comment-aware counter
                 full_text = '\n'.join(lines)
+                brace_balance = _check_brace_balance(full_text)
                 open_count = full_text.count('{')
                 close_count = full_text.count('}')
+                # Use the string/comment-aware balance to decide direction,
+                # but keep raw counts for backward compat in the insertion logic.
+                if brace_balance > 0:
+                    open_count = close_count + brace_balance
+                elif brace_balance < 0:
+                    close_count = open_count + abs(brace_balance)
                 if open_count > close_count:
                     diff = open_count - close_count
                     # Try to find a function definition line where the depth is wrong
@@ -1005,7 +980,7 @@ class AutoFixer:
             # Instead of declaring them as 'int dword;', we replace in-code to restore casing.
             win32_case_restored: set = set()
             for ident in list(plain_undeclared.keys()):
-                correct = cls._WIN32_LOWERCASE_TO_CORRECT.get(ident)
+                correct = cls._get_lowercase_to_correct().get(ident)
                 if correct and ident != correct:
                     # Verify the lowercase form is not a legitimate user variable
                     # (it's only a Win32 type rename if it's used in a type context:
@@ -1054,82 +1029,8 @@ class AutoFixer:
                 plain_undeclared.pop(ident, None)
 
             # Known API types / macros that need an #include rather than a declaration
-            _API_TYPES_NEEDING_INCLUDE: Dict[str, str] = {
-                # Basic Windows types — must be resolved via include, NOT as variables
-                'DWORD': '<windows.h>', 'BOOL': '<windows.h>', 'HANDLE': '<windows.h>',
-                'BYTE': '<windows.h>', 'WORD': '<windows.h>', 'UINT': '<windows.h>',
-                'LONG': '<windows.h>', 'ULONG': '<windows.h>', 'USHORT': '<windows.h>',
-                'LPVOID': '<windows.h>', 'SIZE_T': '<windows.h>', 'LPSTR': '<windows.h>',
-                'LPCSTR': '<windows.h>', 'LPWSTR': '<windows.h>', 'LPCWSTR': '<windows.h>',
-                'LPDWORD': '<windows.h>', 'LPBYTE': '<windows.h>',
-                'HMODULE': '<windows.h>', 'HINSTANCE': '<windows.h>', 'HKEY': '<windows.h>',
-                'HDC': '<windows.h>', 'HWND': '<windows.h>', 'HMENU': '<windows.h>',
-                'HICON': '<windows.h>', 'HCURSOR': '<windows.h>', 'HBITMAP': '<windows.h>',
-                'HBRUSH': '<windows.h>', 'HPEN': '<windows.h>', 'HFONT': '<windows.h>',
-                'COLORREF': '<windows.h>', 'LRESULT': '<windows.h>', 'WPARAM': '<windows.h>',
-                'LPARAM': '<windows.h>', 'FARPROC': '<windows.h>',
-                'WCHAR': '<windows.h>', 'TCHAR': '<windows.h>',
-                'SOCKET': '<winsock2.h>', 'HINTERNET': '<wininet.h>',
-                # Struct types
-                'PROCESSENTRY32': '<tlhelp32.h>', 'MODULEENTRY32': '<tlhelp32.h>',
-                'THREADENTRY32': '<tlhelp32.h>', 'HEAPENTRY32': '<tlhelp32.h>',
-                'STARTUPINFO': '<windows.h>', 'STARTUPINFOA': '<windows.h>',
-                'STARTUPINFOW': '<windows.h>',
-                'PROCESS_INFORMATION': '<windows.h>',
-                'SECURITY_ATTRIBUTES': '<windows.h>',
-                'MEMORY_BASIC_INFORMATION': '<windows.h>',
-                'CRITICAL_SECTION': '<windows.h>',
-                'OVERLAPPED': '<windows.h>',
-                'WIN32_FIND_DATA': '<windows.h>', 'WIN32_FIND_DATAA': '<windows.h>',
-                'WIN32_FIND_DATAW': '<windows.h>',
-                'WSADATA': '<winsock2.h>',
-                'SOCKADDR_IN': '<winsock2.h>', 'sockaddr_in': '<winsock2.h>',
-                'HCRYPTPROV': '<wincrypt.h>', 'HCRYPTHASH': '<wincrypt.h>',
-                'HCRYPTKEY': '<wincrypt.h>',
-                # WinCrypt types & constants
-                'DATA_BLOB': '<wincrypt.h>', 'PDATA_BLOB': '<wincrypt.h>',
-                'CRYPT_INTEGER_BLOB': '<wincrypt.h>',
-                'PROV_RSA_FULL': '<wincrypt.h>', 'PROV_RSA_AES': '<wincrypt.h>',
-                'CRYPT_VERIFYCONTEXT': '<wincrypt.h>', 'CRYPT_MACHINE_KEYSET': '<wincrypt.h>',
-                'CRYPT_NEWKEYSET': '<wincrypt.h>',
-                'CALG_SHA': '<wincrypt.h>', 'CALG_SHA_256': '<wincrypt.h>',
-                'CALG_MD5': '<wincrypt.h>', 'CALG_SHA1': '<wincrypt.h>',
-                'HP_HASHVAL': '<wincrypt.h>', 'HP_HASHSIZE': '<wincrypt.h>',
-                'PLAINTEXTKEYBLOB': '<wincrypt.h>', 'CUR_BLOB_VERSION': '<wincrypt.h>',
-                'CERT_CONTEXT': '<wincrypt.h>', 'PCERT_CONTEXT': '<wincrypt.h>',
-                'ALG_CLASS_HASH': '<wincrypt.h>', 'ALG_TYPE_ANY': '<wincrypt.h>',
-                # IP helper types
-                'IP_ADAPTER_INFO': '<iphlpapi.h>', 'PIP_ADAPTER_INFO': '<iphlpapi.h>',
-                'IP_ADDR_STRING': '<iphlpapi.h>',
-                'MIB_IFROW': '<iphlpapi.h>', 'MIB_IFTABLE': '<iphlpapi.h>',
-                # Shell types
-                'SHGFP_TYPE_CURRENT': '<shlobj.h>',
-                'SHITEMID': '<shlobj.h>', 'ITEMIDLIST': '<shlobj.h>',
-                # TlHelp32 extra
-                'HEAPENTRY32': '<tlhelp32.h>', 'HEAPLIST32': '<tlhelp32.h>',
-                # Shlwapi
-                'DLLVERSIONINFO': '<shlwapi.h>',
-                # DbgHelp
-                'IMAGEHLP_LINE64': '<dbghelp.h>', 'SYMBOL_INFO': '<dbghelp.h>',
-                # COM types
-                'VARIANT': '<oaidl.h>', 'SAFEARRAY': '<oaidl.h>',
-                'BSTR': '<wtypes.h>',
-                # WinDns
-                'DNS_RECORD': '<windns.h>', 'PDNS_RECORD': '<windns.h>',
-                'DNS_RECORDA': '<windns.h>',
-                # Video For Windows
-                'CAPDRIVERCAPS': '<vfw.h>', 'CAPSTATUS': '<vfw.h>',
-                # C99/C11 standard library types
-                'uint8_t': '<stdint.h>', 'uint16_t': '<stdint.h>',
-                'uint32_t': '<stdint.h>', 'uint64_t': '<stdint.h>',
-                'int8_t': '<stdint.h>', 'int16_t': '<stdint.h>',
-                'int32_t': '<stdint.h>', 'int64_t': '<stdint.h>',
-                'uintptr_t': '<stdint.h>', 'intptr_t': '<stdint.h>',
-                'bool': '<stdbool.h>', 'true': '<stdbool.h>', 'false': '<stdbool.h>',
-                # POSIX / common types
-                'ssize_t': '<sys/types.h>', 'pid_t': '<sys/types.h>',
-                'NULL': '<stdlib.h>',
-            }
+            # Loaded from configs/win32_knowledge.json
+            _API_TYPES_NEEDING_INCLUDE = _load_win32_knowledge().get('types_needing_include', {})
 
             includes_to_add: set = set()
 
@@ -1189,6 +1090,9 @@ class AutoFixer:
 
                 # Infer type from usage
                 inferred = cls._infer_variable_type(ident, lines, usage_lns, errors=errors)
+                if inferred is None:
+                    logger.info(f"      ⏭ Skipping '{ident}' — could not confidently infer type")
+                    continue
 
                 # Find enclosing function body start
                 target_line = min(usage_lns) if usage_lns else 1
@@ -1229,13 +1133,31 @@ class AutoFixer:
                 logger.info(f"      \U0001f527 Pattern fix: added {len(includes_to_add)} include(s): "
                            f"{', '.join(sorted(includes_to_add))}")
 
-        # ── 6. Fix C1083 "cannot open include file" — remove bad includes ──
-        # Also handles C1083 for .tlb files used by #import
+        # ── 6. Fix C1083 "cannot open include file" ──
+        # Strategy: NEVER delete or comment out #include lines automatically.
+        # - SDK headers missing → environment problem, log and skip.
+        # - Non-SDK headers missing → keep include, log as unresolved.
+        #   The cascading C2065/C3861 errors from undefined symbols will be
+        #   handled by the LLM with semantic-preserving forward declarations.
+        # - .tlb type libraries → comment out #import (only exception: these
+        #   are COM-specific and have no simple forward-declaration equivalent).
+        _SDK_HEADERS = {'stdio.h', 'stdlib.h', 'string.h', 'windows.h',
+                        'winsock2.h', 'ws2tcpip.h', 'wininet.h',
+                        'tlhelp32.h', 'shlobj.h', 'wincrypt.h', 'dpapi.h',
+                        'psapi.h', 'iphlpapi.h', 'math.h', 'time.h',
+                        'stdint.h', 'stddef.h', 'assert.h', 'errno.h',
+                        'ctype.h', 'limits.h', 'signal.h', 'setjmp.h',
+                        'windns.h', 'shlwapi.h', 'ole2.h', 'oleauto.h',
+                        'oaidl.h', 'wtypes.h', 'vfw.h', 'wincred.h',
+                        'atlbase.h', 'activscp.h', 'exdisp.h',
+                        'shellapi.h', 'commctrl.h', 'commdlg.h',
+                        'dbghelp.h', 'winternl.h', 'ntstatus.h'}
         for err in errors:
             m = re.search(r'C1083.*cannot open (?:include|type library) file.*[\'"]([^\'"]+)[\'"]', err)
             if m:
                 bad_inc = m.group(1)
                 # Handle .tlb (type library) files — comment out #import lines
+                # (COM type libraries have no forward-declaration equivalent)
                 if bad_inc.lower().endswith('.tlb'):
                     for i in range(len(lines) - 1, -1, -1):
                         line_stripped = lines[i].strip()
@@ -1244,26 +1166,27 @@ class AutoFixer:
                             fixes += 1
                             logger.info(f"      \U0001f527 Pattern fix (C1083): commented out #import '{bad_inc}'")
                     continue
-                # Remove lines that #include this file
-                for i in range(len(lines) - 1, -1, -1):
-                    line_stripped = lines[i].strip()
-                    if line_stripped.startswith('#include') and bad_inc in line_stripped:
-                        # Only remove if it's not a standard system header
-                        standard_headers = {'stdio.h', 'stdlib.h', 'string.h', 'windows.h',
-                                          'winsock2.h', 'ws2tcpip.h', 'wininet.h',
-                                          'tlhelp32.h', 'shlobj.h', 'wincrypt.h', 'dpapi.h',
-                                          'psapi.h', 'iphlpapi.h', 'math.h', 'time.h',
-                                          'stdint.h', 'stddef.h', 'assert.h', 'errno.h',
-                                          'ctype.h', 'limits.h', 'signal.h', 'setjmp.h',
-                                          'windns.h', 'shlwapi.h', 'ole2.h', 'oleauto.h',
-                                          'oaidl.h', 'wtypes.h', 'vfw.h', 'wincred.h',
-                                          'atlbase.h', 'activscp.h', 'exdisp.h',
-                                          'shellapi.h', 'commctrl.h', 'commdlg.h',
-                                          'dbghelp.h', 'winternl.h', 'ntstatus.h'}
-                        if bad_inc.lower() not in standard_headers:
-                            lines.pop(i)
-                            fixes += 1
-                            logger.info(f"      \U0001f527 Pattern fix (C1083): removed bad #include '{bad_inc}'")
+
+                if bad_inc.lower() in _SDK_HEADERS:
+                    # SDK header missing → environment problem, not code bug.
+                    logger.warning(
+                        f"      ⚠️  C1083: standard SDK header '{bad_inc}' not found — "
+                        f"likely an SDK/environment issue, NOT a code problem. "
+                        f"Keeping #include untouched."
+                    )
+                    continue
+
+                # Non-SDK header (third-party / project-specific that wasn't found).
+                # Do NOT comment out or delete — the include is intentional and
+                # the header may define macros, inline functions, struct layouts,
+                # or constants that affect behavior.  Keep it, and let the LLM
+                # resolve the cascading undefined-symbol errors by adding forward
+                # declarations above the include.
+                logger.info(
+                    f"      ℹ️  C1083: non-SDK header '{bad_inc}' not found — "
+                    f"keeping #include untouched. Cascading undefined-symbol errors "
+                    f"will be resolved by LLM with forward declarations."
+                )
 
         # ── 6b. Fix C4430 "missing type specifier" for bare main() ──
         # Old C code with `main()` instead of `int main()` triggers C4430 in MSVC C++ mode
@@ -1279,502 +1202,16 @@ class AutoFixer:
                         logger.info(f"      \U0001f527 Pattern fix (C4430): added 'int' return type to main()")
                         break
 
-        # ── 7. Fix C3861 "identifier not found" — add forward declaration or include ──
-        # Map of Win32 API functions → required header
-        _API_FUNC_NEEDING_INCLUDE: Dict[str, str] = {
-            # WinCrypt / DPAPI
-            'CryptAcquireContext': '<wincrypt.h>', 'CryptAcquireContextA': '<wincrypt.h>',
-            'CryptAcquireContextW': '<wincrypt.h>',
-            'CryptReleaseContext': '<wincrypt.h>',
-            'CryptCreateHash': '<wincrypt.h>', 'CryptHashData': '<wincrypt.h>',
-            'CryptGetHashParam': '<wincrypt.h>', 'CryptDestroyHash': '<wincrypt.h>',
-            'CryptDeriveKey': '<wincrypt.h>', 'CryptDestroyKey': '<wincrypt.h>',
-            'CryptEncrypt': '<wincrypt.h>', 'CryptDecrypt': '<wincrypt.h>',
-            'CryptGenRandom': '<wincrypt.h>', 'CryptGenKey': '<wincrypt.h>',
-            'CryptImportKey': '<wincrypt.h>', 'CryptExportKey': '<wincrypt.h>',
-            'CryptSetKeyParam': '<wincrypt.h>', 'CryptGetKeyParam': '<wincrypt.h>',
-            'CryptUnprotectData': '<wincrypt.h>', 'CryptProtectData': '<wincrypt.h>',
-            'CryptStringToBinaryA': '<wincrypt.h>', 'CryptStringToBinaryW': '<wincrypt.h>',
-            'CryptBinaryToStringA': '<wincrypt.h>', 'CryptBinaryToStringW': '<wincrypt.h>',
-            'CertOpenStore': '<wincrypt.h>', 'CertCloseStore': '<wincrypt.h>',
-            'CertEnumCertificatesInStore': '<wincrypt.h>',
-            # DNS
-            'DnsQuery': '<windns.h>', 'DnsQuery_A': '<windns.h>',
-            'DnsQuery_W': '<windns.h>', 'DnsFree': '<windns.h>',
-            'DnsRecordListFree': '<windns.h>',
-            # IP Helper
-            'GetAdaptersInfo': '<iphlpapi.h>', 'GetAdaptersAddresses': '<iphlpapi.h>',
-            'GetIpAddrTable': '<iphlpapi.h>', 'GetBestInterface': '<iphlpapi.h>',
-            # COM / OLE
-            'OleInitialize': '<ole2.h>', 'OleUninitialize': '<ole2.h>',
-            'SafeArrayCreateVector': '<oleauto.h>', 'SafeArrayAccessData': '<oleauto.h>',
-            'SafeArrayUnaccessData': '<oleauto.h>', 'SafeArrayCreate': '<oleauto.h>',
-            'VariantInit': '<oleauto.h>', 'VariantClear': '<oleauto.h>',
-            'SysAllocString': '<oleauto.h>', 'SysFreeString': '<oleauto.h>',
-            # Shell
-            'SHGetFolderPathA': '<shlobj.h>', 'SHGetFolderPathW': '<shlobj.h>',
-            'SHGetSpecialFolderPathA': '<shlobj.h>', 'SHGetSpecialFolderPathW': '<shlobj.h>',
-            # Shlwapi
-            'wnsprintfA': '<shlwapi.h>', 'wnsprintfW': '<shlwapi.h>',
-            'PathFileExistsA': '<shlwapi.h>', 'PathFileExistsW': '<shlwapi.h>',
-            'PathCombineA': '<shlwapi.h>', 'PathCombineW': '<shlwapi.h>',
-            'PathAppendA': '<shlwapi.h>', 'PathAppendW': '<shlwapi.h>',
-            # WinInet
-            'InternetOpenA': '<wininet.h>', 'InternetOpenW': '<wininet.h>',
-            'InternetConnectA': '<wininet.h>', 'InternetConnectW': '<wininet.h>',
-            'HttpOpenRequestA': '<wininet.h>', 'HttpOpenRequestW': '<wininet.h>',
-            'HttpSendRequestA': '<wininet.h>', 'HttpSendRequestW': '<wininet.h>',
-            'InternetReadFile': '<wininet.h>', 'InternetCloseHandle': '<wininet.h>',
-            # TlHelp32
-            'CreateToolhelp32Snapshot': '<tlhelp32.h>',
-            'Process32First': '<tlhelp32.h>', 'Process32Next': '<tlhelp32.h>',
-            'Module32First': '<tlhelp32.h>', 'Module32Next': '<tlhelp32.h>',
-            # WinCred
-            'CredEnumerateA': '<wincred.h>', 'CredEnumerateW': '<wincred.h>',
-            'CredFree': '<wincred.h>', 'CredReadA': '<wincred.h>',
-            # VFW
-            'capCreateCaptureWindowA': '<vfw.h>', 'capCreateCaptureWindowW': '<vfw.h>',
-            'capCreateCaptureWindow': '<vfw.h>',
-            'capGetDriverDescriptionA': '<vfw.h>', 'capGetDriverDescriptionW': '<vfw.h>',
-        }
-        for err in errors:
-            m = re.search(r'C3861.*\'([^\']+)\'.*identifier not found', err)
-            if m:
-                func_name = m.group(1)
-                # Skip if already declared/defined in the file
-                if re.search(r'\b' + re.escape(func_name) + r'\s*\(', source_code):
-                    # It exists somewhere — might be a prototype issue, skip
-                    continue
-                # Check if it's a known Win32 API that needs a specific include
-                if func_name in _API_FUNC_NEEDING_INCLUDE:
-                    inc = _API_FUNC_NEEDING_INCLUDE[func_name]
-                    inc_check = inc.replace('<', '').replace('>', '')
-                    if inc_check not in '\n'.join(lines):
-                        includes_to_add.add(f'#include {inc}')
-                        logger.info(f"      \U0001f527 Pattern fix (C3861): '{func_name}' needs {inc}")
-                    continue
-                # Check by prefix — many WinCrypt functions start with Crypt
-                if func_name.startswith('Crypt') and 'wincrypt.h' not in '\n'.join(lines):
-                    includes_to_add.add('#include <wincrypt.h>')
-                    logger.info(f"      \U0001f527 Pattern fix (C3861): '{func_name}' needs <wincrypt.h>")
-                    continue
-                # Check if it's in _WIN32_FUNC_RETURN_TYPES (known API, likely just missing include)
-                if func_name in cls._WIN32_FUNC_RETURN_TYPES:
-                    continue  # Will be resolved once proper headers are in place
-                # Add extern forward declaration at file scope (after includes)
-                last_inc_idx = -1
-                for i, l in enumerate(lines):
-                    if l.strip().startswith('#include'):
-                        last_inc_idx = i
-                insert_at = last_inc_idx + 1 if last_inc_idx >= 0 else 0
-                forward_decl = f"\n/* Auto-fix: forward declaration */\nextern int {func_name}();\n"
-                lines.insert(insert_at, forward_decl)
-                fixes += 1
-                logger.info(f"      \U0001f527 Pattern fix (C3861): added forward declaration for '{func_name}'")
+        # ── Sections 7-11 removed: structural/semantic fixes now handled by LLM ──
+        # Previous pattern-based handlers for C2039, C2084, C2143, C2365, C2371,
+        # C2373, C2491, C2561, C2664, C2733, C3861 have been removed.
+        # The LLM fixer (fix_compilation_errors) handles these via multi-turn
+        # conversation with error context, few-shot examples, and RAG retrieval.
 
-        # ── 8. Fix C2371 type redefinition — remove user-defined struct/typedef ──
-        # When the LLM or a previous fix attempt added a typedef/struct that
-        # redefines a type already in <windows.h> / <winnt.h>, remove it.
-        _SDK_TYPES_FOR_C2371 = {
-            'MEMORY_BASIC_INFORMATION', 'PMEMORY_BASIC_INFORMATION',
-            'SECURITY_ATTRIBUTES', 'LPSECURITY_ATTRIBUTES',
-            'PROCESS_INFORMATION', 'STARTUPINFO', 'STARTUPINFOA', 'STARTUPINFOW',
-            'PROCESSENTRY32', 'MODULEENTRY32', 'THREADENTRY32',
-            'WIN32_FIND_DATA', 'WIN32_FIND_DATAA', 'WIN32_FIND_DATAW',
-            'OVERLAPPED', 'CRITICAL_SECTION', 'WSADATA', 'SOCKADDR_IN',
-            'FILETIME', 'SYSTEMTIME', 'LARGE_INTEGER', 'ULARGE_INTEGER',
-            'COORD', 'SMALL_RECT', 'CONSOLE_SCREEN_BUFFER_INFO',
-            'OSVERSIONINFO', 'OSVERSIONINFOA', 'OSVERSIONINFOW',
-            'OSVERSIONINFOEX', 'OSVERSIONINFOEXA', 'OSVERSIONINFOEXW',
-            'PVOID', 'LPBYTE', 'LPDWORD',
-        }
-        c2371_types: set = set()
-        for err in errors:
-            m = re.search(r'C2371.*\'([^\']+)\'.*redefinition', err)
-            if m:
-                c2371_types.add(m.group(1))
-
-        if c2371_types:
-            # Remove typedef struct blocks for these types
-            current_text = '\n'.join(lines)
-            for redef_type in c2371_types:
-                if redef_type not in _SDK_TYPES_FOR_C2371:
-                    continue
-                # Remove "typedef struct ... } REDEF_TYPE, *PREDEF_TYPE ;"
-                struct_pattern = re.compile(
-                    r'typedef\s+struct\s+\w*\s*\{[^}]*\}\s*'
-                    r'[A-Z_][A-Z0-9_]*(?:\s*,\s*\*?[A-Z_][A-Z0-9_]*)*\s*;',
-                    re.DOTALL
-                )
-                def _remover(match):
-                    if redef_type in match.group(0):
-                        logger.info(f"      \U0001f527 Pattern fix (C2371): removed typedef struct redefining '{redef_type}'")
-                        return ''
-                    return match.group(0)
-                current_text = struct_pattern.sub(_remover, current_text)
-
-                # Also remove simple "typedef <type> REDEF_TYPE;" lines
-                simple_td = re.compile(
-                    r'^.*typedef\s+\w[\w\s\*]*\b' + re.escape(redef_type) + r'\s*;.*$',
-                    re.MULTILINE
-                )
-                for m_td in simple_td.finditer(current_text):
-                    logger.info(f"      \U0001f527 Pattern fix (C2371): removed typedef redefining '{redef_type}'")
-                current_text = simple_td.sub('', current_text)
-                fixes += 1
-
-            lines = current_text.split('\n')
-
-        # ── 9. Fix C2036 "unknown size" for Win32 pointer types ──
-        # This often happens when PVOID/LPVOID was accidentally redefined
-        # and then used. Just ensure <windows.h> is included.
-        for err in errors:
-            if 'C2036' in err:
-                m = re.search(r'C2036.*\'([^\']+)\'.*unknown size', err)
-                if m:
-                    type_name = m.group(1)
-                    if type_name in ('PVOID', 'LPVOID', 'LPBYTE', 'LPDWORD', 'LPSTR', 'LPCSTR'):
-                        if 'windows.h' not in '\n'.join(lines):
-                            includes_to_add.add('#include <windows.h>')
-
-        # ── 10. Fix C2094 "label 'X' was undefined" — goto with missing label ──
-        # Mutation strategies (especially obfuscation) may rename labels or add
-        # goto statements without defining the target label.  Fix by adding the
-        # missing label right before the closing brace of the enclosing function.
-        c2094_labels: set = set()
-        for err in errors:
-            m = re.search(r'C2094.*label\s*\'([^\']+)\'', err)
-            if not m:
-                m = re.search(r'C2094.*\'([^\']+)\'.*undefined', err)
-            if m:
-                c2094_labels.add(m.group(1))
-
-        if c2094_labels:
-            current_text = '\n'.join(lines)
-            for label_name in c2094_labels:
-                # Check the label really isn't defined anywhere
-                label_def_pat = re.compile(r'^\s*' + re.escape(label_name) + r'\s*:', re.MULTILINE)
-                if label_def_pat.search(current_text):
-                    continue  # already defined, skip
-
-                # Find the goto statement to determine which function it's in
-                goto_pat = re.compile(r'\bgoto\s+' + re.escape(label_name) + r'\s*;')
-                goto_match = goto_pat.search(current_text)
-                if not goto_match:
-                    continue
-
-                # Find the enclosing function's closing brace.
-                # Walk forward from goto to find the next '}' at column 0 (function end)
-                goto_pos = goto_match.start()
-                # Strategy: find all top-level '}' (at start of line) after goto_pos
-                brace_pat = re.compile(r'^\}', re.MULTILINE)
-                func_end_match = brace_pat.search(current_text, goto_pos)
-                if func_end_match:
-                    insert_pos = func_end_match.start()
-                    label_code = f'\n{label_name}:; /* auto-fix: missing label for goto */\n'
-                    current_text = current_text[:insert_pos] + label_code + current_text[insert_pos:]
-                    fixes += 1
-                    logger.info(f"      \U0001f527 Pattern fix (C2094): added missing label '{label_name}'")
-                else:
-                    # Fallback: replace goto with a comment
-                    current_text = goto_pat.sub(f'/* auto-fix: removed goto {label_name} (label undefined) */ ;', current_text)
-                    fixes += 1
-                    logger.info(f"      \U0001f527 Pattern fix (C2094): removed goto to undefined label '{label_name}'")
-
-            lines = current_text.split('\n')
-
-        # ── 10a. Fix C2044 "illegal continue/break" — continue/break outside loop ──
-        # LLM mutations sometimes place continue/break outside their loops.
-        # Fix: replace with /* removed */ comment to avoid cascading errors.
-        for err in errors:
-            m = re.search(r'[\(:]\s*(\d+)\s*[\):].*C2044.*illegal\s+(continue|break)', err)
-            if m:
-                line_num = int(m.group(1))
-                keyword = m.group(2)
-                idx = line_num - 1
-                if 0 <= idx < len(lines):
-                    old_line = lines[idx]
-                    # Replace the continue/break statement
-                    new_line = re.sub(
-                        r'\b' + keyword + r'\s*;',
-                        f'/* auto-fix: removed illegal {keyword} */ ;',
-                        old_line
-                    )
-                    if new_line != old_line:
-                        lines[idx] = new_line
-                        fixes += 1
-                        logger.info(f"      \U0001f527 Pattern fix (C2044): removed illegal '{keyword}' at line {line_num}")
-
-        # ── 10b. Fix C2561 "function must return a value" ──
-        # LLM mutations may remove return statements from non-void functions.
-        # Fix: (a) replace bare `return;` with `return 0;` in the function body
-        #      (b) add `return 0;` before the closing brace of the function.
-        for err in errors:
-            m = re.search(r'[\(:]\s*(\d+)\s*[\):].*C2561.*\'([^\']+)\'.*must return', err)
-            if m:
-                err_line = int(m.group(1))
-                func_name = m.group(2)
-                decl_line = err_line - 1  # 0-indexed
-                # Scan function body: replace bare return; and add return 0; at end
-                for idx in range(max(0, decl_line), len(lines)):
-                    stripped = lines[idx].strip()
-                    # Replace bare 'return;' with 'return 0;'
-                    if re.match(r'^\s*return\s*;', lines[idx]):
-                        lines[idx] = re.sub(r'return\s*;', 'return 0; /* auto-fix: C2561 */', lines[idx], count=1)
-                        fixes += 1
-                        logger.info(f"      \U0001f527 Pattern fix (C2561): replaced bare 'return;' with 'return 0;' at line {idx+1}")
-                    if stripped == '}' and idx > decl_line + 1:
-                        # Reached closing brace - check if return 0 already present
-                        prev_stripped = lines[idx-1].strip() if idx > 0 else ''
-                        if not prev_stripped.startswith('return'):
-                            indent = '    '
-                            if idx > 0:
-                                leading = len(lines[idx]) - len(lines[idx].lstrip())
-                                indent = ' ' * (leading + 4) if leading > 0 else '    '
-                            lines.insert(idx, f'{indent}return 0; /* auto-fix: C2561 */')
-                            fixes += 1
-                            logger.info(f"      \U0001f527 Pattern fix (C2561): added 'return 0;' to '{func_name}'")
-                        break
-
-        # ── 10c. Fix C2373/C2491 "redefinition; different type modifiers" / "definition of dllimport function" ──
-        # Source headers may re-declare Win32 functions like BlockInput that conflict with SDK headers.
-        # Fix: wrap the conflicting declaration line with #ifndef guards.
-        redef_funcs: set = set()
-        for err in errors:
-            m = re.search(r'[\(:]\s*(\d+)\s*[\):].*(?:C2373|C2491).*\'([^\']+)\'', err)
-            if m:
-                redef_funcs.add((int(m.group(1)), m.group(2)))
-        for (err_line, func_name) in redef_funcs:
-            idx = err_line - 1
-            if 0 <= idx < len(lines):
-                orig_line = lines[idx]
-                # Wrap with #ifndef guard
-                indent = orig_line[:len(orig_line) - len(orig_line.lstrip())]
-                lines[idx] = f'{indent}/* auto-fix: C2373/C2491 - commented out conflicting declaration */\n{indent}// {orig_line.strip()}'
-                fixes += 1
-                logger.info(f"      \U0001f527 Pattern fix (C2373): commented out conflicting '{func_name}' at line {err_line}")
-
-        # ── 10d. Fix linker pragma /ENTRY: directive that bypasses CRT initialization ──
-        # Some malware uses #pragma comment(linker, "/ENTRY:Main") which prevents CRT from initializing.
-        # This causes LNK2019 for _malloc, _free, _memset, etc. in modern MSVC.
-        has_entry_pragma_issue = any('LNK2019' in e and ('_malloc' in e or '_memset' in e or '__stdio_common' in e) for e in errors)
-        if has_entry_pragma_issue:
-            for i, line in enumerate(lines):
-                if re.search(r'#pragma\s+comment\s*\(\s*linker\s*,.*(/ENTRY:|/entry:)', line):
-                    lines[i] = f'// {line.strip()}  /* auto-fix: disabled /ENTRY to allow CRT init */'
-                    fixes += 1
-                    logger.info(f"      \U0001f527 Pattern fix (LNK2019/CRT): commented out /ENTRY pragma at line {i+1}")
-
-        # ── 11. Fix C2365 "redefinition; previous definition was 'function'" ──
-        # This happens when LLM #defines or declares a variable with the same
-        # name as a Win32 API function (e.g., `int GetProcAddress;` or
-        # `#define GetProcAddress ...`).  Remove the offending line.
-        c2365_names: set = set()
-        for err in errors:
-            m = re.search(r'C2365.*\'([^\']+)\'.*redefinition.*previous.*function', err)
-            if m:
-                c2365_names.add(m.group(1))
-
-        if c2365_names:
-            new_lines: list = []
-            removed_2365 = 0
-            for line in lines:
-                stripped = line.strip()
-                skip = False
-                for name in c2365_names:
-                    # #define NAME ...
-                    if re.match(rf'^#\s*define\s+{re.escape(name)}\b', stripped):
-                        skip = True
-                        break
-                    # int NAME; / HANDLE NAME; / FARPROC NAME; etc.
-                    if re.match(
-                        rf'^(?:int|HANDLE|FARPROC|DWORD|BOOL|UINT|LONG|void\s*\*|LPVOID|HMODULE)\s+{re.escape(name)}\s*[;=]',
-                        stripped
-                    ):
-                        skip = True
-                        break
-                if skip:
-                    removed_2365 += 1
-                    logger.info(f"      \U0001f527 Pattern fix (C2365): removed line redefining '{name}': {stripped[:80]}")
-                else:
-                    new_lines.append(line)
-            if removed_2365 > 0:
-                lines = new_lines
-                fixes += removed_2365
-
-        # ── 11a. Fix C2733 "cannot overload extern 'C' linkage" / C2373 "redefinition" ──
-        # When LLM or auto-fixer adds an extern "C" forward declaration for a
-        # function that's already declared in an SDK header, MSVC reports C2733/C2373.
-        # Fix: remove the offending declaration line(s) and clean up extern blocks.
-        c2733_c2373_names: set = set()
-        for err in errors:
-            m = re.search(r'C2733.*\'([^\']+)\'.*overload.*extern\s*"C"', err)
-            if m:
-                c2733_c2373_names.add(m.group(1))
-            m = re.search(r'C2373.*\'([^\']+)\'.*redefinition.*different type', err)
-            if m:
-                c2733_c2373_names.add(m.group(1))
-
-        if c2733_c2373_names:
-            new_lines = []
-            removed_redecl = 0
-            for line in lines:
-                stripped = line.strip()
-                skip = False
-                for name in c2733_c2373_names:
-                    if name in stripped:
-                        # Match forward declarations: "BOOL CryptFunc(...);" or "extern ... CryptFunc(...);"
-                        if re.search(r'\b' + re.escape(name) + r'\s*\(', stripped) and \
-                           stripped.endswith(';') and '{' not in stripped:
-                            skip = True
-                            break
-                        # Match "const DWORD CONSTANT_NAME;"
-                        if re.match(
-                            r'^(?:const\s+)?(?:DWORD|int|unsigned|BOOL)\s+' + re.escape(name) + r'\s*;',
-                            stripped
-                        ):
-                            skip = True
-                            break
-                if skip:
-                    removed_redecl += 1
-                    logger.info(f"      \U0001f527 Pattern fix (C2733/C2373): removed redeclaration: {stripped[:80]}")
-                else:
-                    new_lines.append(line)
-            if removed_redecl > 0:
-                lines = new_lines
-                fixes += removed_redecl
-                # Clean up empty extern "C" { } blocks
-                current_text = '\n'.join(lines)
-                current_text = re.sub(r'extern\s+"C"\s*\{[\s\n]*\}', '', current_text)
-                current_text = re.sub(r'//\s*Forward declarations for missing symbols\s*\n(?=\s*\n)', '', current_text)
-                lines = current_text.split('\n')
-
-        # ── 11b. Fix C2059 "syntax error: 'constant'" from SDK macro redefinition ──
-        # When code declares "const DWORD PROV_RSA_FULL;" but <wincrypt.h> already
-        # defines PROV_RSA_FULL as a macro (#define PROV_RSA_FULL 1), MSVC sees
-        # "const DWORD 1;" which is C2059. Remove the offending line.
-        for err in errors:
-            m = re.search(r'[\(:]\s*(\d+)\s*[\):].*C2059.*syntax error.*\'constant\'', err)
-            if m:
-                line_num = int(m.group(1))
-                idx = line_num - 1
-                if 0 <= idx < len(lines):
-                    stripped = lines[idx].strip()
-                    # Check if this line looks like a const declaration of an SDK macro
-                    if re.match(r'^(?:const\s+)?(?:DWORD|int|unsigned|BOOL)\s+\d+', stripped):
-                        # This is the result of macro expansion, the original declared a known constant
-                        logger.info(f"      \U0001f527 Pattern fix (C2059): removed expanded macro declaration at line {line_num}: {stripped[:60]}")
-                        lines[idx] = f'/* auto-fix: removed SDK constant redeclaration */'
-                        fixes += 1
-
-        # ── 11c. Fix C2664 "cannot convert" — wide-string functions with narrow char args ──
-        # When mutation changes strcpy→wcscpy, strlen→wcslen etc. but the arrays
-        # are still char[], MSVC reports C2664. Fix: replace wide functions with narrow equivalents.
-        _WIDE_TO_NARROW = {
-            'wcscpy': 'strcpy', 'wcscpy_s': 'strcpy_s',
-            'wcsncpy': 'strncpy', 'wcsncpy_s': 'strncpy_s',
-            'wcscat': 'strcat', 'wcscat_s': 'strcat_s',
-            'wcsncat': 'strncat', 'wcsncat_s': 'strncat_s',
-            'wcslen': 'strlen', 'wcscmp': 'strcmp',
-            'wcsncmp': 'strncmp', 'wcschr': 'strchr',
-            'wcsrchr': 'strrchr', 'wcsstr': 'strstr',
-            'swprintf': 'sprintf', 'swprintf_s': 'sprintf_s',
-            '_snwprintf': '_snprintf', '_snwprintf_s': '_snprintf_s',
-            'swscanf': 'sscanf', 'swscanf_s': 'sscanf_s',
-            'wsprintf': 'sprintf', 'wsprintfA': 'sprintf',
-        }
-        c2664_wide_lines: Dict[int, Set[str]] = {}  # line_num → set of wide funcs
-        for err in errors:
-            # Match C2664 errors involving wide-string functions with char arguments
-            # MSVC format: zip.cpp(2333): error C2664: 'size_t wcslen(const wchar_t *)': cannot convert argument 1 from 'char [260]'
-            m = re.search(r'\((\d+)\).*(?:error\s+)?C2664', err, re.IGNORECASE)
-            if m and 'char' in err.lower():
-                line_num = int(m.group(1))
-                # Find any wide-string function name in the error text
-                for wide_func in _WIDE_TO_NARROW:
-                    if re.search(r'\b' + re.escape(wide_func) + r'\b', err):
-                        c2664_wide_lines.setdefault(line_num, set()).add(wide_func)
-        
-        if c2664_wide_lines:
-            wide_fix_count = 0
-            # Get the range of affected lines (expand ±50 lines to catch all related wide calls)
-            if c2664_wide_lines:
-                min_err_line = min(c2664_wide_lines.keys())
-                max_err_line = max(c2664_wide_lines.keys())
-            for idx, line in enumerate(lines):
-                line_num = idx + 1
-                # Fix wide-string functions within the error range ±50 lines
-                if min_err_line - 50 <= line_num <= max_err_line + 50:
-                    for wide_func, narrow_func in _WIDE_TO_NARROW.items():
-                        if wide_func in line:
-                            lines[idx] = line.replace(wide_func, narrow_func)
-                            line = lines[idx]
-                            wide_fix_count += 1
-            if wide_fix_count > 0:
-                fixes += wide_fix_count
-                logger.info(f"      \U0001f527 Pattern fix (C2664): replaced {wide_fix_count} wide-string "
-                           f"function(s) with narrow equivalents (wcscpy→strcpy etc.)")
 
         # ── 12. Fix LNK2019/LNK2001 — detect arch mismatch and missing libs ──
-        # Map common Win32 API symbols to required libraries.
-        _SYMBOL_TO_LIB = {
-            # kernel32
-            'CloseHandle': 'kernel32.lib', 'CreateFileW': 'kernel32.lib',
-            'CreateFileA': 'kernel32.lib', 'ReadFile': 'kernel32.lib',
-            'WriteFile': 'kernel32.lib', 'GetLastError': 'kernel32.lib',
-            'VirtualAlloc': 'kernel32.lib', 'VirtualFree': 'kernel32.lib',
-            'VirtualAllocEx': 'kernel32.lib', 'VirtualFreeEx': 'kernel32.lib',
-            'GetProcAddress': 'kernel32.lib', 'LoadLibraryA': 'kernel32.lib',
-            'LoadLibraryW': 'kernel32.lib', 'GetModuleHandleW': 'kernel32.lib',
-            'GetModuleHandleA': 'kernel32.lib', 'CreateProcessW': 'kernel32.lib',
-            'CreateProcessA': 'kernel32.lib', 'ExitProcess': 'kernel32.lib',
-            'GetCurrentProcess': 'kernel32.lib', 'OpenProcess': 'kernel32.lib',
-            'TerminateProcess': 'kernel32.lib', 'CreateRemoteThread': 'kernel32.lib',
-            'WriteProcessMemory': 'kernel32.lib', 'Sleep': 'kernel32.lib',
-            'GetTickCount': 'kernel32.lib', 'CreateMutexW': 'kernel32.lib',
-            'CreateEventW': 'kernel32.lib', 'SetEvent': 'kernel32.lib',
-            'WaitForSingleObject': 'kernel32.lib', 'HeapAlloc': 'kernel32.lib',
-            'HeapFree': 'kernel32.lib', 'GetProcessHeap': 'kernel32.lib',
-            'CreateDirectoryW': 'kernel32.lib', 'DeleteFileW': 'kernel32.lib',
-            'CopyFileW': 'kernel32.lib', 'GetSystemInfo': 'kernel32.lib',
-            'MultiByteToWideChar': 'kernel32.lib', 'WideCharToMultiByte': 'kernel32.lib',
-            'SetLastError': 'kernel32.lib', 'DuplicateHandle': 'kernel32.lib',
-            'GetProcessVersion': 'kernel32.lib', 'ResumeThread': 'kernel32.lib',
-            'SuspendThread': 'kernel32.lib', 'TerminateThread': 'kernel32.lib',
-            'GetComputerNameW': 'kernel32.lib', 'IsBadReadPtr': 'kernel32.lib',
-            'EnterCriticalSection': 'kernel32.lib', 'LeaveCriticalSection': 'kernel32.lib',
-            'lstrlenA': 'kernel32.lib', 'lstrlenW': 'kernel32.lib',
-            'lstrcpyA': 'kernel32.lib', 'lstrcpyW': 'kernel32.lib',
-            'lstrcatA': 'kernel32.lib', 'lstrcatW': 'kernel32.lib',
-            'GetVersionExW': 'kernel32.lib',
-            # user32
-            'GetMessageW': 'user32.lib', 'TranslateMessage': 'user32.lib',
-            'DispatchMessageW': 'user32.lib', 'RegisterClassExW': 'user32.lib',
-            'CreateWindowExW': 'user32.lib', 'wsprintfW': 'user32.lib',
-            'GetSystemMetrics': 'user32.lib', 'GetUserNameW': 'advapi32.lib',
-            # advapi32
-            'AdjustTokenPrivileges': 'advapi32.lib', 'OpenProcessToken': 'advapi32.lib',
-            'LookupPrivilegeValueW': 'advapi32.lib', 'RegCloseKey': 'advapi32.lib',
-            'RegCreateKeyExW': 'advapi32.lib', 'RegOpenKeyExW': 'advapi32.lib',
-            'RegQueryValueExW': 'advapi32.lib', 'RegSetValueExW': 'advapi32.lib',
-            'RegDeleteKeyW': 'advapi32.lib', 'RegNotifyChangeKeyValue': 'advapi32.lib',
-            # shell32
-            'SHGetFolderPathW': 'shell32.lib',
-            # wininet
-            'InternetOpenW': 'wininet.lib', 'InternetCloseHandle': 'wininet.lib',
-            'InternetConnectW': 'wininet.lib', 'InternetOpenUrlW': 'wininet.lib',
-            'InternetReadFile': 'wininet.lib', 'HttpOpenRequestW': 'wininet.lib',
-            'HttpSendRequestW': 'wininet.lib', 'InternetGetCookieW': 'wininet.lib',
-            # shlwapi
-            'StrStrW': 'shlwapi.lib', 'StrCmpNIW': 'shlwapi.lib',
-            # rpcrt4
-            'RpcStringFreeA': 'rpcrt4.lib', 'UuidToStringA': 'rpcrt4.lib',
-            # ole32
-            'CoCreateGuid': 'ole32.lib',
-            # tlhelp32 (in kernel32)
-            'CreateToolhelp32Snapshot': 'kernel32.lib',
-            'Process32FirstW': 'kernel32.lib', 'Process32NextW': 'kernel32.lib',
-        }
+        # Map loaded from configs/win32_knowledge.json
+        _SYMBOL_TO_LIB = _load_win32_knowledge().get('symbol_to_lib', {})
         lnk_errors: list = []
         lnk_missing_libs: set = set()
         lnk_arch_mismatch = False
@@ -1795,39 +1232,71 @@ class AutoFixer:
             logger.warning("         This is a compiler configuration issue, not a source code issue.")
             logger.warning("         Fix: set msvc_arch to match the project target in project_config.json")
 
-        # Note: we can't add libraries from auto_fixer (that's a compiler flag issue),
-        # but we log the missing ones for diagnostic purposes.
+        # Return detected libraries so callers can add them to linker flags.
         if lnk_missing_libs:
             logger.info(f"      \U0001f527 LNK diagnostic: missing libraries detected: {', '.join(sorted(lnk_missing_libs))}")
 
         if fixes > 0:
-            return '\n'.join(lines), fixes
-        return source_code, 0
+            return '\n'.join(lines), fixes, lnk_missing_libs
+        return source_code, 0, lnk_missing_libs
 
     @classmethod
-    def _validate_header_structure(cls, original_code: str, fixed_code: str) -> Tuple[bool, str]:
+    def _validate_header_structure(cls, original_code: str, fixed_code: str,
+                                    language: str = "c") -> Tuple[bool, str]:
         """
         Validate that LLM didn't break the header file structure.
+        Uses AST snapshots when available; regex counters as fallback.
         Returns (is_valid, error_message).
         """
+        # ── AST path (preferred) ──
+        sv = get_semantic_validator() if get_semantic_validator else None
+        if sv and sv.available:
+            orig_snap = sv.extract_snapshot(original_code, language)
+            fix_snap = sv.extract_snapshot(fixed_code, language)
+            if orig_snap and fix_snap:
+                # Functions must be preserved
+                missing_funcs = orig_snap.function_names - fix_snap.function_names
+                if missing_funcs:
+                    return False, (
+                        f"Header validation (AST): {len(missing_funcs)} function(s) "
+                        f"removed: {', '.join(sorted(list(missing_funcs)[:5]))}"
+                    )
+                # Types must be preserved
+                missing_types = orig_snap.type_names - fix_snap.type_names
+                if missing_types:
+                    return False, (
+                        f"Header validation (AST): {len(missing_types)} type(s) "
+                        f"removed: {', '.join(sorted(list(missing_types)[:5]))}"
+                    )
+                # Parse errors must not increase
+                if fix_snap.error_count > orig_snap.error_count + 2:
+                    return False, (
+                        f"Header validation (AST): parse errors increased "
+                        f"({orig_snap.error_count} → {fix_snap.error_count})"
+                    )
+                return True, ""
+
+        # ── Regex fallback ──
         # Count namespace declarations
         orig_ns = len(re.findall(r'\bnamespace\s+\w+\s*\{', original_code))
         fixed_ns = len(re.findall(r'\bnamespace\s+\w+\s*\{', fixed_code))
         if fixed_ns != orig_ns:
             return False, f"Namespace count changed: {orig_ns} -> {fixed_ns}"
         
-        # Check that no new #ifdef was added inside existing code
-        # (comparing line count of #ifdef before and after)
+        # Check that no excessive #ifdef was added
         orig_ifdefs = len(re.findall(r'#\s*if(?:def|ndef)?', original_code))
         fixed_ifdefs = len(re.findall(r'#\s*if(?:def|ndef)?', fixed_code))
-        if fixed_ifdefs > orig_ifdefs + 2:  # Allow adding up to 2 new #ifdef (for missing headers)
+        if fixed_ifdefs > orig_ifdefs + 2:
             return False, f"Too many #ifdef added: {orig_ifdefs} -> {fixed_ifdefs}"
         
-        # Check that function declaration count is approximately the same
-        orig_funcs = len(re.findall(r'\)\s*;', original_code))
-        fixed_funcs = len(re.findall(r'\)\s*;', fixed_code))
-        if abs(fixed_funcs - orig_funcs) > 5:  # Allow small variance
-            return False, f"Function declaration count changed significantly: {orig_funcs} -> {fixed_funcs}"
+        # Function signature preservation (regex fallback)
+        orig_funcs = set(_extract_function_signatures(original_code))
+        fixed_funcs = set(_extract_function_signatures(fixed_code))
+        missing = orig_funcs - fixed_funcs
+        if missing:
+            return False, (
+                f"Header function(s) removed: {', '.join(sorted(list(missing)[:5]))}"
+            )
         
         return True, ""
     
@@ -1840,6 +1309,7 @@ class AutoFixer:
         cloud_file_size_limit: int = 15000,
         mode: str = "hybrid",
         fix_history_path: Optional[str] = None,
+        compiler_type: str = 'auto',
     ):
         """
         Initialize auto-fixer.
@@ -1851,12 +1321,14 @@ class AutoFixer:
             local_model: Local Ollama model name
             cloud_file_size_limit: Files BELOW this use cloud, ABOVE use local
             mode: Operation mode ("hybrid", "local_only", "cloud_only")
+            compiler_type: 'msvc', 'gcc', 'clang', or 'auto' (auto-detect from errors)
         """
         self.llm_model = llm_model
         self.api_key = api_key
         self.llm_provider = None
         self.use_hybrid = use_hybrid
         self._fix_mode = mode  # store for tracking
+        self.compiler_type = compiler_type
 
         # ── Fix History RAG ──
         self.fix_history_rag = None
@@ -2120,43 +1592,37 @@ class AutoFixer:
             )
         
         # Gate 4: BRACE BALANCE — fixed code must have balanced braces
-        brace_depth = 0
-        in_string = False
-        in_char = False
-        in_line_comment = False
-        in_block_comment = False
-        prev_ch = ''
-        for ch in fixed_code:
-            if in_line_comment:
-                if ch == '\n':
-                    in_line_comment = False
-            elif in_block_comment:
-                if prev_ch == '*' and ch == '/':
-                    in_block_comment = False
-            elif in_string:
-                if ch == '"' and prev_ch != '\\':
-                    in_string = False
-            elif in_char:
-                if ch == "'" and prev_ch != '\\':
-                    in_char = False
-            else:
-                if prev_ch == '/' and ch == '/':
-                    in_line_comment = True
-                elif prev_ch == '/' and ch == '*':
-                    in_block_comment = True
-                elif ch == '"':
-                    in_string = True
-                elif ch == "'":
-                    in_char = True
-                elif ch == '{':
-                    brace_depth += 1
-                elif ch == '}':
-                    brace_depth -= 1
-            prev_ch = ch
+        def _count_brace_depth(code: str) -> int:
+            depth = 0
+            in_str = in_chr = in_lc = in_bc = False
+            prev = ''
+            for ch in code:
+                if in_lc:
+                    if ch == '\n': in_lc = False
+                elif in_bc:
+                    if prev == '*' and ch == '/': in_bc = False
+                elif in_str:
+                    if ch == '"' and prev != '\\': in_str = False
+                elif in_chr:
+                    if ch == "'" and prev != '\\': in_chr = False
+                else:
+                    if prev == '/' and ch == '/': in_lc = True
+                    elif prev == '/' and ch == '*': in_bc = True
+                    elif ch == '"': in_str = True
+                    elif ch == "'": in_chr = True
+                    elif ch == '{': depth += 1
+                    elif ch == '}': depth -= 1
+                prev = ch
+            return depth
+
+        brace_depth = _count_brace_depth(fixed_code)
+        orig_brace_depth = _count_brace_depth(original_code)
         
-        if brace_depth != 0:
+        # Only reject if the fix made brace balance WORSE than original
+        if brace_depth != 0 and abs(brace_depth) > abs(orig_brace_depth):
             return False, (
-                f"Fix rejected: unbalanced braces (depth={brace_depth}). "
+                f"Fix rejected: unbalanced braces (depth={brace_depth}, "
+                f"original={orig_brace_depth}). "
                 f"LLM likely added/removed braces incorrectly."
             )
         
@@ -2173,6 +1639,48 @@ class AutoFixer:
                 f"LLM replaced real code with stubs."
             )
         
+        # Gate 6: AST-BASED SEMANTIC VALIDATION — uses tree-sitter to compare
+        # original vs fixed AST for structural equivalence.
+        if language.lower() in ('c', 'cpp', 'c++'):
+            sv = get_semantic_validator() if get_semantic_validator else None
+            if sv and sv.available:
+                is_valid, reason, sem_diff = sv.validate_fix(
+                    original_code, fixed_code, language
+                )
+                if not is_valid and reason:
+                    return False, f"Fix rejected (semantic): {reason}"
+                # Even if AST validation passed, log if diff detected changes
+                if sem_diff and (sem_diff.added_functions or sem_diff.signature_changes):
+                    logger.info(
+                        "AST diff: added_funcs=%s, sig_changes=%s",
+                        sem_diff.added_functions, sem_diff.signature_changes,
+                    )
+            else:
+                # DEGRADED MODE: Regex fallback when tree-sitter unavailable.
+                # Use STRICTER thresholds to compensate for loss of AST analysis.
+                logger.debug("Gate 6: using regex fallback (degraded mode)")
+                orig_funcs_set = set(_extract_function_signatures(original_code))
+                fix_funcs_set  = set(_extract_function_signatures(fixed_code))
+                missing_funcs = orig_funcs_set - fix_funcs_set
+                missing_funcs.discard('main')
+                # Degraded: reject if ANY function was removed (vs 30% in AST mode)
+                if missing_funcs:
+                    return False, (
+                        f"Fix rejected [degraded mode]: {len(missing_funcs)} function(s) removed: "
+                        f"{', '.join(sorted(list(missing_funcs)[:5]))}. "
+                        f"(Stricter threshold because AST validation is unavailable.)"
+                    )
+                # Degraded: also reject if line count dropped more than 15%
+                # (AST mode checks this structurally; regex mode compensates with tighter bound)
+                if orig_lines > 30:
+                    if line_ratio < 0.50:
+                        return False, (
+                            f"Fix rejected [degraded mode]: "
+                            f"line count dropped to {line_ratio:.0%} "
+                            f"({fix_lines} vs {orig_lines} lines). "
+                            f"(Stricter threshold because AST validation is unavailable.)"
+                        )
+
         # All gates passed
         return True, None
     
@@ -2507,6 +2015,16 @@ Return the fixed header code.
                 except Exception as e:
                     logger.debug(f"   Region {region_idx+1}: Clang context error: {e}")
 
+            # Detect if this is a header file
+            _is_hdr = source_file_path and os.path.splitext(source_file_path)[1].lower() in ('.h', '.hh', '.hpp', '.hxx')
+            _hdr_surgical_warning = ""
+            if _is_hdr:
+                _hdr_surgical_warning = (
+                    "\n⚠️ THIS IS A HEADER FILE included by a .c/.cpp file that already includes system headers.\n"
+                    "DO NOT add #include, typedef struct for SDK types, or forward-declare Win32 API functions.\n"
+                    "All system types and functions are already available from the parent .c file's includes.\n"
+                )
+
             system_prompt = (
                 f"You are a {language} compiler error fixer. "
                 "Fix ONLY the errors in the given code section. "
@@ -2519,6 +2037,7 @@ Return the fixed header code.
                 "5. NEVER remove #include, function definitions, or variable declarations.\n"
                 "6. Preserve brace balance ({/}).\n"
                 "7. Wrap output in: ```" + language + "\\n<code>\\n```\n"
+                + _hdr_surgical_warning +
                 "\nFEW-SHOT PATTERNS:\n"
                 "- Brace mismatch: add the missing } at the right scope, never delete lines.\n"
                 "- Undeclared type X: add 'typedef struct X X;' before usage, not remove usage.\n"
@@ -2632,10 +2151,13 @@ Return the fixed header code.
                     orig_line_count = reg_end - reg_start + 1
                     fixed_line_count = len(fixed_section.split('\n'))
                     delta_pct = abs(fixed_line_count - orig_line_count) / max(orig_line_count, 1)
-                    if delta_pct > 0.25:
+                    # Degraded mode uses tighter threshold (15% vs 25%)
+                    max_delta = 0.15 if not _AST_AVAILABLE else 0.25
+                    if delta_pct > max_delta:
                         logger.warning(
                             f"   Region {region_idx+1}: line count changed too much "
-                            f"({orig_line_count} → {fixed_line_count}, {delta_pct:.0%}), skipping"
+                            f"({orig_line_count} → {fixed_line_count}, {delta_pct:.0%}, "
+                            f"max={max_delta:.0%}{'[degraded]' if not _AST_AVAILABLE else ''}), skipping"
                         )
                         continue
 
@@ -2649,34 +2171,57 @@ Return the fixed header code.
                         )
                         continue
 
-                    # ── Validation Gate 3: Include preservation ──
-                    fixed_includes = set(re.findall(
-                        r'^\s*#\s*include\s+[<"][^>"]+[>"]', fixed_section, re.MULTILINE
-                    ))
-                    removed_includes = orig_includes - fixed_includes
-                    if removed_includes:
-                        logger.warning(
-                            f"   Region {region_idx+1}: fix removed #include(s): "
-                            f"{removed_includes}, skipping"
-                        )
-                        continue
+                    # ── Validation Gate 3: AST-based semantic validation ──
+                    # Uses tree-sitter to compare original vs fixed region structure.
+                    sv = get_semantic_validator() if get_semantic_validator else None
+                    if sv and sv.available:
+                        orig_snap = sv.extract_snapshot(section_text, language)
+                        fix_snap = sv.extract_snapshot(fixed_section, language)
+                        if orig_snap is not None and fix_snap is not None:
+                            sem_diff = sv.diff(orig_snap, fix_snap)
+                            if not sem_diff.is_safe:
+                                reason = sem_diff.rejection_reason or "unknown semantic violation"
+                                logger.warning(
+                                    f"   Region {region_idx+1}: AST validation failed — {reason}, skipping"
+                                )
+                                continue
+                    else:
+                        # DEGRADED MODE: Regex fallback — stricter checks
+                        logger.debug(f"   Region {region_idx+1}: AST unavailable, using degraded validation")
 
-                    # ── Validation Gate 4: Function signature preservation ──
-                    fixed_func_sigs = _extract_function_signatures(fixed_section)
-                    missing_funcs = set(orig_func_sigs) - set(fixed_func_sigs)
-                    if missing_funcs:
-                        logger.warning(
-                            f"   Region {region_idx+1}: fix removed function(s): "
-                            f"{missing_funcs}, skipping"
-                        )
-                        continue
+                        # Regex fallback: include preservation (strict: 0 removals)
+                        fixed_includes = set(re.findall(
+                            r'^\s*#\s*include\s+[<"][^>"]+[>"]', fixed_section, re.MULTILINE
+                        ))
+                        removed_includes = orig_includes - fixed_includes
+                        if removed_includes:
+                            logger.warning(
+                                f"   Region {region_idx+1}: [degraded] fix removed #include(s): "
+                                f"{removed_includes}, skipping"
+                            )
+                            continue
+
+                        # Regex fallback: ANY missing function rejects (strict)
+                        fixed_func_sigs = _extract_function_signatures(fixed_section)
+                        missing_funcs = set(orig_func_sigs) - set(fixed_func_sigs)
+                        if missing_funcs:
+                            logger.warning(
+                                f"   Region {region_idx+1}: [degraded] fix removed function(s): "
+                                f"{missing_funcs}, skipping"
+                            )
+                            continue
 
                     # ── Validation Gate 5: Cross-region symbol preservation ──
                     if cross_region_syms:
                         missing_syms = []
                         for sym in cross_region_syms:
-                            if not re.search(r'\b' + re.escape(sym) + r'\b', fixed_section):
-                                missing_syms.append(sym)
+                            if _AST_AVAILABLE and sv is not None:
+                                refs = sv.find_symbol_references(fixed_section, sym, language)
+                                if not refs:
+                                    missing_syms.append(sym)
+                            else:
+                                if not re.search(r'\b' + re.escape(sym) + r'\b', fixed_section):
+                                    missing_syms.append(sym)
                         if missing_syms:
                             logger.warning(
                                 f"   Region {region_idx+1}: fix removed cross-region symbol(s): "
@@ -2739,6 +2284,7 @@ Return the fixed header code.
         clang_analysis = None,  # Clang AnalysisResult for per-region AST context
         source_file_path: Optional[str] = None,  # Source file path for Clang context
         previous_fix_errors: Optional[List[str]] = None,  # Errors from a prior failed fix attempt
+        compiler_type: Optional[str] = None,  # 'msvc', 'gcc', 'clang', or None (use self.compiler_type)
     ) -> Tuple[str, bool, List[str]]:
         """
         Fix compilation errors using LLM with multi-turn conversation.
@@ -2792,6 +2338,12 @@ Return the fixed header code.
             self.fix_tracking[_normal_track_key]['errors_before'] += len(errors)
         logger.info(f"[TRACK] Normal fix path: {_normal_track_key} | errors_in={len(errors)} | file_size={len(source_code)}")
         
+        # Resolve effective compiler type
+        _eff_compiler = compiler_type or self.compiler_type
+        if _eff_compiler == 'auto' and detect_compiler_from_errors:
+            _eff_compiler = detect_compiler_from_errors(errors)
+        _is_msvc = _eff_compiler in (COMPILER_MSVC, COMPILER_AUTO)
+        
         error_text = "\n".join([f"  - {error}" for error in errors[:20]])
         if len(errors) > 20:
             error_text += f"\n  ... and {len(errors) - 20} more errors"
@@ -2799,16 +2351,16 @@ Return the fixed header code.
         # Analyze errors to get better context
         if ErrorAnalyzer:
             try:
-                error_infos = ErrorAnalyzer.classify_errors(errors)
-                strategy = ErrorAnalyzer.get_fix_strategy(error_infos)
+                error_infos = ErrorAnalyzer.classify_errors(errors, compiler_type=_eff_compiler)
+                strategy = ErrorAnalyzer.get_fix_strategy(error_infos, compiler_type=_eff_compiler)
                 system_prompt = self._build_system_prompt(language, strategy)
                 error_context = self._build_error_context(error_infos, strategy)
             except Exception as e:
                 logger.warning(f"Error analysis failed, using fallback: {e}")
-                system_prompt = self._build_fallback_system_prompt(language)
+                system_prompt = self._build_fallback_system_prompt(language, compiler_type=_eff_compiler)
                 error_context = self._build_fallback_error_context(errors)
         else:
-            system_prompt = self._build_fallback_system_prompt(language)
+            system_prompt = self._build_fallback_system_prompt(language, compiler_type=_eff_compiler)
             error_context = self._build_fallback_error_context(errors)
         
         # Build context section
@@ -2838,51 +2390,106 @@ Return the fixed header code.
                 "DO NOT add another WinMain to this file.\n"
             )
 
-        # Detect VLA pattern: undeclared identifier used as array size (MSVC C2065+C2057+C2466+C2133)
+        # Detect VLA pattern: undeclared identifier used as array size
+        # MSVC: C2065+C2057+C2466+C2133;  GCC/Clang: 'variable-length array' or similar
         vla_warning = ""
         import re as _re
         vla_ids = []
-        for err in errors:
-            # C2065 'ident': undeclared + C2057 expected constant + C2466 array of constant size 0
-            m = _re.search(r"C2065.*'([^']+)'.*undeclared", err)
-            if m:
-                ident = m.group(1)
-                # Check if same identifier also has C2057 (expected constant expression)
-                has_c2057 = any(ident in e and 'C2057' in e for e in errors)
-                if has_c2057 and ident not in vla_ids:
-                    vla_ids.append(ident)
-        if vla_ids:
-            vla_warning = (
-                f"\n🚫 VLA (Variable-Length Array) DETECTED — MSVC does NOT support C99 VLAs:\n"
-                f"   Undeclared array-size identifiers: {', '.join(vla_ids)}\n"
-                f"   These identifiers are used as array sizes but are not defined as constants.\n"
-                f"   FIX: Add these lines near the top of the file (after includes, before code):\n"
-            )
-            for vid in vla_ids:
-                vla_warning += f"   #ifndef {vid}\n   #define {vid} 256\n   #endif\n"
-            vla_warning += (
-                f"   Use #ifndef guard so it doesn't conflict if defined elsewhere.\n"
-                f"   Keep the array declarations as-is: char buf[{vla_ids[0]}]; — just add the #define.\n"
-                f"   NEVER use 'string' as a variable/type name — it conflicts with Windows SDK.\n"
+        if _is_msvc:
+            for err in errors:
+                m = _re.search(r"C2065.*'([^']+)'.*undeclared", err)
+                if m:
+                    ident = m.group(1)
+                    has_c2057 = any(ident in e and 'C2057' in e for e in errors)
+                    if has_c2057 and ident not in vla_ids:
+                        vla_ids.append(ident)
+            if vla_ids:
+                vla_warning = (
+                    f"\n🚫 VLA (Variable-Length Array) DETECTED — MSVC does NOT support C99 VLAs:\n"
+                    f"   Undeclared array-size identifiers: {', '.join(vla_ids)}\n"
+                    f"   These identifiers are used as array sizes but are not defined as constants.\n"
+                    f"   FIX: Add these lines near the top of the file (after includes, before code):\n"
+                )
+                for vid in vla_ids:
+                    vla_warning += f"   #ifndef {vid}\n   #define {vid} 256\n   #endif\n"
+                vla_warning += (
+                    f"   Use #ifndef guard so it doesn't conflict if defined elsewhere.\n"
+                    f"   Keep the array declarations as-is: char buf[{vla_ids[0]}]; — just add the #define.\n"
+                    f"   NEVER use 'string' as a variable/type name — it conflicts with Windows SDK.\n"
+                )
+        else:
+            # GCC/Clang: VLAs are valid C99 but we still warn if size ident is undeclared
+            for err in errors:
+                m = _re.search(r"'([^']+)' undeclared", err)
+                if m:
+                    ident = m.group(1)
+                    if any('variable' in e and 'size' in e and ident in e for e in errors):
+                        if ident not in vla_ids:
+                            vla_ids.append(ident)
+            if vla_ids:
+                vla_warning = (
+                    f"\n⚠️ Undeclared array-size identifiers detected: {', '.join(vla_ids)}\n"
+                    f"   These are used as array sizes but not defined. Either:\n"
+                    f"   a) Add `#define {vla_ids[0]} 256` (preferred for portability), OR\n"
+                    f"   b) Declare them as `const size_t` variables (C99+ VLA).\n"
+                )
+
+        # Detect header file being fixed via normal path — warn about include context
+        header_file_warning = ""
+        if source_file_path and os.path.splitext(source_file_path)[1].lower() in ('.h', '.hh', '.hpp', '.hxx'):
+            _hdr_name = os.path.basename(source_file_path)
+            header_file_warning = (
+                f"\n⚠️  HEADER FILE CONTEXT — THIS FILE IS '{_hdr_name}':\n"
+                f"This is a .h header file that is #include'd by a .c/.cpp file.\n"
+                f"The .c file ALREADY includes system headers like <windows.h>, <winioctl.h>, <stdio.h>,\n"
+                f"<stdlib.h>, <string.h>, etc. BEFORE including this header.\n"
+                f"Therefore:\n"
+                f"- DO NOT add #include <windows.h> or any system #include at the top of this file\n"
+                f"- DO NOT add typedef struct for SDK types (STORAGE_PROPERTY_QUERY, STORAGE_DEVICE_DESCRIPTOR, etc.)\n"
+                f"- DO NOT add forward declarations for Win32 API functions (CreateFileA, DeviceIoControl, CloseHandle, etc.)\n"
+                f"- DO NOT redefine macros already in system headers (FILE_SHARE_READ, OPEN_EXISTING, etc.)\n"
+                f"- DO NOT re-declare CRT functions (strcpy_s, memcpy, sprintf, etc.)\n"
+                f"All these symbols are ALREADY available from the system headers included by the parent .c file.\n"
+                f"Only fix actual code errors within the existing function bodies.\n"
             )
 
-        # Detect LNK2019/LNK2001 linker errors — usually caused by removed #include <windows.h>
+        # Detect linker errors (MSVC: LNK2019/LNK2001, GCC/Clang: 'undefined reference to')
         lnk_warning = ""
         lnk_symbols = []
-        for err in errors:
-            m = _re.search(r'LNK2019.*unresolved external symbol\s+(\S+)', err)
-            if not m:
-                m = _re.search(r'LNK2001.*unresolved external symbol\s+(\S+)', err)
-            if m and len(lnk_symbols) < 5:
-                lnk_symbols.append(m.group(1))
-        if lnk_symbols:
-            lnk_warning = (
-                f"\n🔗 LINKER ERRORS DETECTED (LNK2019/LNK2001):\n"
-                f"   Unresolved Win32 symbols: {', '.join(lnk_symbols[:5])}\n"
-                f"   ROOT CAUSE: A critical #include was removed (e.g. <windows.h>, <winsock2.h>).\n"
-                f"   FIX: Restore the missing #include at the top of the file.\n"
-                f"   NEVER remove #include <windows.h> — it provides hundreds of Win32 API declarations.\n"
-            )
+        if _is_msvc:
+            for err in errors:
+                m = _re.search(r'LNK2019.*unresolved external symbol\s+(\S+)', err)
+                if not m:
+                    m = _re.search(r'LNK2001.*unresolved external symbol\s+(\S+)', err)
+                if m and len(lnk_symbols) < 5:
+                    lnk_symbols.append(m.group(1))
+            if lnk_symbols:
+                lnk_warning = (
+                    f"\n🔗 LINKER ERRORS DETECTED (LNK2019/LNK2001):\n"
+                    f"   Unresolved symbols: {', '.join(lnk_symbols[:5])}\n"
+                    f"   Possible causes (check ALL before acting):\n"
+                    f"   a) A critical #include was removed (e.g. <windows.h>) → restore the #include.\n"
+                    f"   b) A required import library is missing → add #pragma comment(lib, \"name.lib\").\n"
+                    f"   c) A function prototype does not match the actual definition (calling convention,\n"
+                    f"      name decoration, or parameter mismatch) → fix the declaration to match.\n"
+                    f"   Choose the fix that matches the actual root cause. Do NOT blindly assume (a).\n"
+                )
+        else:
+            for err in errors:
+                m = _re.search(r'undefined reference to [`\'"]?(\w+)', err)
+                if m and len(lnk_symbols) < 5:
+                    lnk_symbols.append(m.group(1))
+            if lnk_symbols:
+                lnk_warning = (
+                    f"\n🔗 LINKER ERRORS DETECTED (undefined reference):\n"
+                    f"   Unresolved symbols: {', '.join(lnk_symbols[:5])}\n"
+                    f"   Possible causes:\n"
+                    f"   a) A required #include was removed → restore it.\n"
+                    f"   b) A function is declared but not defined in any compiled source file.\n"
+                    f"   c) A function is defined as `static` in another file (not visible to linker).\n"
+                    f"   d) Missing `-l` library flag → add the function's definition or declaration.\n"
+                    f"   Choose the fix that matches the actual root cause.\n"
+                )
 
         # ── Build previous failure feedback section ──
         prev_fail_section = ""
@@ -2906,6 +2513,62 @@ Return the fixed header code.
             except Exception as e:
                 logger.debug(f"[RAG] Retrieval failed: {e}")
 
+        # ── RAG: Retrieve anti-examples (failed fixes) ──
+        rag_anti_section = ""
+        if self.fix_history_rag:
+            try:
+                anti = self.fix_history_rag.retrieve_anti_examples(
+                    errors, language=language, top_k=1, min_similarity=0.35
+                )
+                if anti:
+                    rag_anti_section = self.fix_history_rag.format_anti_examples(anti)
+            except Exception as e:
+                logger.debug(f"[RAG] Anti-example retrieval failed: {e}")
+
+        # ── Build compiler-specific rules and error patterns for user prompt ──
+        if _is_msvc:
+            _compiler_rules_block = (
+                "8. NEVER use VLAs — use #define constants for array sizes\n"
+                "9. NEVER define 'string', 'bool', or any Windows reserved type name"
+            )
+            _compiler_error_patterns = (
+                "COMMON MSVC ERROR PATTERNS AND FIXES:\n"
+                "- C2039 \"'X' is not a member of 'Y'\": A struct/context is missing a field. ADD the missing field to the struct definition with the correct type inferred from usage.\n"
+                "- C2065 \"'X': undeclared identifier\": A variable or type is not declared. For types (DWORD, HANDLE, etc.) — add the correct #include. For variables — add a declaration at the top of the enclosing block.\n"
+                "- C2075 \"initialization requires brace-enclosed initializer list\": In C, arrays cannot be copy-initialized from another array. Change `type arr[] = other;` to `const type *arr = other;`\n"
+                "- C2082 \"redefinition of formal parameter\": A local variable has the same name as a function parameter. Remove the redundant local declaration.\n"
+                "- C2084 \"function already has a body\": A function is defined twice (e.g. in both .h and .c files). In the header, convert the definition to a forward declaration (remove the body, add `;`).\n"
+                "- C2143 \"missing ';'\": Add the missing semicolon at the indicated position.\n"
+                "- C2365 \"'X': redefinition; previous definition was 'function'\": A variable or struct field was named after a Win32 API function (e.g. `GetUserNameA`, `HeapAlloc`). Rename the variable to a non-conflicting name (e.g. prefix with `_pf` like `_pfGetUserNameA`).\n"
+                "- C2371 \"'X': redefinition; different basic types\": A type is defined twice. If it's an SDK type, remove the user-defined duplicate. If two state-machine context structs have the same name (e.g. both named `_Ctx`), rename the second one to `_Ctx2`.\n"
+                "- C2373/C2491 \"redefinition; different type modifiers\": A function redeclares a Win32 API. Remove the conflicting redeclaration but NEVER comment out #define macros.\n"
+                "- C2561 \"function must return a value\": Add `return 0;` or appropriate return statement.\n"
+                "- C2664 \"cannot convert argument\": Usually a wide/narrow string mismatch. Use the correct function variant (e.g. `strcpy` instead of `wcscpy`).\n"
+                "- C2733 \"cannot overload extern 'C' linkage\": A function in the source file conflicts with an SDK declaration. Remove the conflicting definition.\n"
+                "- C3861 \"'X': identifier not found\": A Win32 API function needs a specific header (#include <wincrypt.h> for Crypt* functions, etc.).\n"
+                "- C2059/C2374/C2373 cascading after '}}': The function above likely closed too early. Move the premature '}}' to the correct end of the function."
+            )
+        else:
+            _compiler_rules_block = (
+                "8. VLAs are valid in C99+ but prefer fixed-size arrays or dynamic allocation for portability\n"
+                "9. Variables can be declared anywhere in a block (C99+), for-loop initializers are OK"
+            )
+            _gcc_or_clang = 'Clang' if _eff_compiler == COMPILER_CLANG else 'GCC'
+            _compiler_error_patterns = (
+                f"COMMON {_gcc_or_clang} ERROR PATTERNS AND FIXES:\n"
+                "- \"implicit declaration of function 'X'\": Add the correct #include or a forward declaration before the call site.\n"
+                "- \"'X' undeclared (first use in this function)\": Declare or #include the missing type/variable. For Win32 types — add #include <windows.h>.\n"
+                "- \"incompatible pointer types\": Add an explicit cast to the target type — do NOT change the pointer type or remove the assignment.\n"
+                "- \"redefinition of 'X'\": A type/struct/variable is defined twice. Use #ifndef include guards or remove the duplicate.\n"
+                "- \"undefined reference to 'X'\": The function is declared but not defined. Ensure it exists in a compiled source file or add `extern` declaration.\n"
+                "- \"multiple definition of 'X'\": A function/variable is defined in multiple TUs. Mark it `static` or `static inline` in the header.\n"
+                "- \"expected ';' before ...\": Add the missing semicolon or fix the preceding statement.\n"
+                "- \"expected declaration or statement at end of input\": Missing closing brace '}}'. Count and balance all braces.\n"
+                "- \"'X' has no member named 'Y'\": A struct is missing a field. ADD the missing field to the struct definition.\n"
+                "- \"control reaches end of non-void function\": Add `return 0;` or appropriate return statement.\n"
+                "- \"conflicting types for 'X'\": A function is declared with different signatures. Fix the declaration to match the definition."
+            )
+
         # ── Build initial user prompt ──
         initial_user_prompt = f"""The following {language} code has compilation errors:
 
@@ -2920,19 +2583,25 @@ COMPILATION ERRORS:
 {entry_point_warning}
 {vla_warning}
 {lnk_warning}
+{header_file_warning}
 {prev_fail_section}
 {rag_few_shot_section}
+{rag_anti_section}
 YOUR TASK:
-1. Fix ALL compilation errors to make the code compile successfully
-2. For missing declarations: add forward declarations or minimal stubs
-3. For missing headers: comment them out, add minimal forward declarations
-4. For syntax errors: fix them completely
-5. Maintain the core functionality of the code
+1. Fix ALL compilation errors while PRESERVING the original runtime behavior.
+2. For missing declarations: add forward declarations with correct types (infer from usage).
+3. For missing headers: keep the #include line, add forward declarations for the needed types/functions
+   above it so the code compiles even if the header is absent. NEVER comment out or delete #include lines.
+4. For syntax errors: fix them completely.
+5. SEMANTIC PRESERVATION IS PARAMOUNT — every API call, control flow branch, and data structure
+   in the original code must remain intact and reachable in the fixed code.
 6. DO NOT redefine functions that are defined in other files
 7. NEVER add WinMain/main if the project already has one
-8. NEVER use VLAs — use #define constants for array sizes
-9. NEVER define 'string', 'bool', or any Windows reserved type name
-10. NEVER remove ANY #include directive — especially #include <windows.h>
+{_compiler_rules_block}
+10. NEVER remove ANY #include directive
+11. NEVER comment out or remove #define macros or typedef lines from the original source code
+
+{_compiler_error_patterns}
 
 CRITICAL OUTPUT FORMAT:
 - Return ONLY the complete, compilable source code
@@ -3004,6 +2673,18 @@ CRITICAL OUTPUT FORMAT:
                     
                     if not is_valid:
                         logger.warning(f"⚠️  Fix validation failed: {validation_error}")
+                        # ── RAG: Store failed fix as anti-example ──
+                        if self.fix_history_rag:
+                            try:
+                                self.fix_history_rag.store_negative_fix(
+                                    errors=errors,
+                                    original_code=source_code,
+                                    failed_code=cleaned_code,
+                                    language=language,
+                                    failure_reason=validation_error or "validation rejected",
+                                )
+                            except Exception as e:
+                                logger.debug(f"[RAG] Negative store failed: {e}")
                         # Add the failed response + feedback to conversation
                         messages.append({"role": "assistant", "content": response})
                         messages.append({"role": "user", "content": 
@@ -3213,26 +2894,56 @@ Please fix these issues. Return only the fixed code within code blocks.
         "           MY_STRUCT* ptr;  // now compiles\n\n"
         "Example 3 — Removed #include causing cascade (LNK2019/C2065):\n"
         "  WRONG: Removing more code to suppress the cascade errors.\n"
-        "  RIGHT: Restore the removed #include <windows.h> at the top.\n"
+        "  RIGHT: Restore the removed #include <windows.h> at the top.\n\n"
+        "Example 4 — Array copy-initialization (C2075: initialization requires brace-enclosed list):\n"
+        "  WRONG: const unsigned char arr[] = other_arr;  // C arrays cannot be copy-initialized\n"
+        "  RIGHT: const unsigned char *arr = other_arr;   // Use pointer instead\n"
+        "  Or if inside a macro that tries `type _e[] = enc;`, change to `const type *_e = enc;`\n\n"
+        "Example 5 — Redefinition of formal parameter (C2082):\n"
+        "  WRONG: void f(int x) { int x; ... }  // redeclares parameter x\n"
+        "  RIGHT: void f(int x) { ... }          // remove the redundant declaration\n\n"
+        "Example 6 — Early function close causing file-scope code (cascading C2059/C2143/C2374):\n"
+        "  WRONG: void func() { /* code */ }  /* stray } closed function too early */\n"
+        "         int a = 1; if(x) { }  // these are now at file scope → many errors\n"
+        "  RIGHT: Move the stray } to the correct end of function.\n"
+        "  HINT: If you see many C2059/C2374 'redefinition' errors from lines after a },\n"
+        "        the function above closed too early. Remove the premature } and close at the end.\n\n"
+        "Example 7 — Static local with non-constant initializer (C2099):\n"
+        "  WRONG: static FnType pFn = (FnType)GetProcAddress(LoadLibraryA(\"x\"), \"y\");  // C2099: must be constant\n"
+        "  RIGHT: FnType pFn = (FnType)GetProcAddress(LoadLibraryA(\"x\"), \"y\");         // remove 'static'\n\n"
+        "Example 8 — Local variable shadows Win32 API name (C2063/C2059):\n"
+        "  WRONG: char *SHGetFolderPathW = (char*)GetProcAddress(...);  // shadows the real API\n"
+        "         SHGetFolderPathW(0, CSIDL, ...);  // C2063: not a function (it's a char* now!)\n"
+        "  RIGHT: HRESULT(WINAPI*_pfnSHGet)(HWND,int,HANDLE,DWORD,LPWSTR) = ...; _pfnSHGet(0, CSIDL, ...);\n\n"
+        "Example 9 — C++ syntax in .c file (C2065 'static_cast' undeclared / C2059 syntax error '>'):\n"
+        "  WRONG: static_cast<MyCtx*>(ctx)->field = 1;  // .c file compiled as C, not C++\n"
+        "  RIGHT: ((MyCtx*)ctx)->field = 1;              // use C-style cast\n"
+        "  ALSO: Replace nullptr→NULL, bool→BOOL, true→TRUE, false→FALSE, new→malloc, delete→free.\n"
         "─────────────────────────────────────────\n"
     )
 
-    def _build_fallback_system_prompt(self, language: str) -> str:
+    def _build_fallback_system_prompt(self, language: str, compiler_type: str = COMPILER_MSVC) -> str:
         """Fallback system prompt when error analyzer is not available"""
+        _is_msvc = compiler_type in (COMPILER_MSVC, COMPILER_AUTO)
         return (
-            f"You are an expert {language} programmer specializing in fixing compilation errors. "
-            "Your task is to fix ALL compilation errors to make the code compile successfully.\n\n"
+            f"You are an expert {language} programmer. Fix compilation errors while PRESERVING "
+            "the original runtime behavior — every API call, branch, and data structure must survive.\n\n"
             "CRITICAL INSTRUCTIONS:\n"
-            "1. For missing SYSTEM header files (like <stdio.h>): Comment them out or remove them, add minimal stubs if needed\n"
-            "2. NEVER comment out or remove project-specific includes (paths with ../, ./, or relative paths like \"path/header.h\")\n"
+            "1. For missing SYSTEM header files: keep the #include line, add forward declarations\n"
+            "   for the types/functions actually used so code compiles without the header.\n"
+            "   NEVER comment out or delete ANY #include line.\n"
+            "2. NEVER comment out or remove project-specific includes (quoted paths like \"path/header.h\")\n"
             "   - Keep project includes like #include \"chacha20/...\" or #include \"../common.h\" UNCHANGED\n"
-            "3. For undefined symbols: Add forward declarations or minimal implementations\n"
+            "3. For undefined symbols: Add forward declarations with correct types (infer from usage).\n"
+            "   NEVER replace typed pointers with void* or add stub functions that return 0.\n"
             "4. For syntax errors: Fix all syntax issues completely\n"
             "5. For non-standard functions: Replace with standard equivalents\n"
             "   - _halloc() → malloc(), _hfree() → free()\n"
             "   - _strdup() → strdup(), _stricmp() → strcasecmp()\n"
-            "6. IMPORTANT: The code MUST compile successfully after your fix.\n\n"
-            + self.FEW_SHOT_FIX_EXAMPLES +
+            "6. IMPORTANT: The code MUST compile AND preserve all original behavior.\n\n"
+            + self.FEW_SHOT_FIX_EXAMPLES
+            + (self._get_msvc_strict_rules() if _is_msvc else self._get_gcc_clang_rules(compiler_type))
+            +
             "OUTPUT FORMAT:\n"
             "- Return ONLY complete, compilable source code\n"
             "- NEVER include instructions like 'Add #include' or 'Remove line X'\n"
@@ -3251,8 +2962,8 @@ Please fix these issues. Return only the fixed code within code blocks.
             context += "\n⚠️ MISSING HEADERS DETECTED:\n"
             for err in missing_headers[:5]:
                 context += f"    - {err}\n"
-            context += "\n  ACTION: Comment out SYSTEM #include statements (with <angle brackets>) and add minimal stubs.\n"
-            context += "  CRITICAL: NEVER touch project-specific includes (quoted paths like \"path/file.h\").\n\n"
+            context += "\n  ACTION: Keep #include lines, add forward declarations for types/functions used so code compiles without the header.\n"
+            context += "  CRITICAL: NEVER remove or comment out ANY #include line.\n\n"
         
         if syntax_errors:
             context += "\n⚠️ SYNTAX ERRORS DETECTED:\n"
@@ -3265,33 +2976,33 @@ Please fix these issues. Return only the fixed code within code blocks.
     def _build_system_prompt(self, language: str, strategy: dict) -> str:
         """Build system prompt based on error analysis strategy"""
         prompt = (
-            f"You are an expert {language} programmer specializing in fixing compilation errors. "
-            "Your task is to fix ALL compilation errors to make the code compile successfully.\n\n"
+            f"You are an expert {language} programmer. Fix compilation errors while "
+            "PRESERVING the original runtime behavior — every API call, branch, and "
+            "data structure must survive in the fixed code.\n\n"
             "CRITICAL INSTRUCTIONS:\n"
         )
         
         if strategy.get('has_missing_headers'):
             prompt += (
                 "1. For missing SYSTEM header files (e.g., 'No such file or directory', 'fatal error'):\n"
-                "   - If the header is NOT used in the code: REMOVE the #include line completely\n"
-                "   - If the header IS used: Comment out the #include and add minimal stub declarations\n"
-                "   - For each missing header, add forward declarations for types/functions used\n"
-                "   - Example: If 'dokani.h' is missing, comment out '#include <dokani.h>' and add:\n"
-                "     // #include <dokani.h>  // Missing header - commented out\n"
-                "     // Forward declarations for types/functions from dokani.h\n\n"
-                "   CRITICAL: NEVER comment out or remove project-specific includes:\n"
-                "     - Keep #include \"path/header.h\" (quoted includes with relative paths) UNCHANGED\n"
-                "     - Keep includes like \"chacha20/...\", \"../common.h\", \"./utils.h\" UNCHANGED\n"
-                "     - Only system includes (with <angle brackets>) can be commented out\n\n"
+                "   - KEEP the #include line (do NOT comment it out or remove it).\n"
+                "   - Add forward declarations for types and functions actually used from that header.\n"
+                "   - This lets the code compile without the header while preserving intent.\n"
+                "   - Example: If 'dokani.h' is missing and code uses DokanInit():\n"
+                "     typedef void* DOKAN_HANDLE; // forward-declare types from dokani.h\n"
+                "     int DokanInit(void);        // forward-declare used functions\n\n"
+                "   CRITICAL: NEVER comment out or remove ANY #include directive.\n\n"
             )
         
         if strategy.get('has_undefined_symbols'):
             prompt += (
                 "2. For undefined symbols (functions, variables, types):\n"
                 "   - Add forward declarations at the top of the file\n"
-                "   - For functions: Add minimal stub implementations if needed\n"
-                "   - For types: Use void* or add minimal struct definitions\n"
-                "   - For variables: Add extern declarations or remove if unused\n\n"
+                "   - For functions: Add a forward declaration with the correct signature\n"
+                "     (infer params from call sites). Do NOT add stub bodies that return 0 — just declare.\n"
+                "   - For types: Add 'typedef struct NAME NAME;' or a minimal struct definition\n"
+                "     with the fields actually used in the code. NEVER replace a typed pointer with void*.\n"
+                "   - For variables: Add 'extern TYPE NAME;' declarations — NEVER delete usage code.\n\n"
             )
         
         if strategy.get('has_syntax_errors'):
@@ -3309,41 +3020,114 @@ Please fix these issues. Return only the fixed code within code blocks.
                 "   - Fix function signatures to match declarations\n"
                 "   - Ensure return types match function definitions\n\n"
             )
+
+        if strategy.get('has_linking_errors'):
+            linker_syms = strategy.get('linker_symbols', [])
+            prompt += (
+                "5. For LINKER errors (LNK2019/LNK2001 unresolved externals):\n"
+                "   - ROOT CAUSE: a critical #include was removed, OR a #pragma comment(lib,...) is missing.\n"
+                "   - Restore the missing #include at the top (e.g. <windows.h>, <winsock2.h>).\n"
+                "   - NEVER remove #include <windows.h> — it provides hundreds of Win32 API declarations.\n"
+            )
+            if linker_syms:
+                prompt += f"   Unresolved symbols: {', '.join(linker_syms[:10])}\n"
+            prompt += "\n"
+
+        if strategy.get('has_redefinitions'):
+            prompt += (
+                "6. For redefinition errors (C2011/C2086/C2370/C2371):\n"
+                "   - Do NOT add a second definition of the same struct/type/variable.\n"
+                "   - Use #ifndef include guards or check if the type already exists.\n"
+                "   - If the redefinition is in YOUR code, remove the duplicate — keep the first.\n\n"
+            )
+
+        if strategy.get('has_environment_issues'):
+            prompt += (
+                "⚠️ ENVIRONMENT ISSUE DETECTED: Some SDK headers (windows.h, etc.) are reported missing.\n"
+                "   This is an SDK/toolchain setup problem, NOT a code bug.\n"
+                "   Do NOT remove or comment out these #includes — they are correct.\n"
+                "   Focus only on fixing actual CODE errors.\n\n"
+            )
         
         prompt += (
-            "5. IMPORTANT: The code MUST compile successfully after your fix.\n"
-            "   - Be aggressive: Comment out problematic code if necessary\n"
-            "   - Add minimal stubs to make code compile\n"
+            "5. IMPORTANT: The code MUST compile AND preserve the original runtime behavior.\n"
+            "   - NEVER comment out, delete, or stub-out code that performs real work (API calls,\n"
+            "     network I/O, file I/O, process manipulation, registry access, crypto ops).\n"
+            "   - ONLY add declarations, typedefs, casts, or missing headers to resolve errors.\n"
+            "   - If a symbol is undeclared, add its declaration — do NOT remove the code that uses it.\n"
+            "   - If a type is unknown, add a typedef or forward-declare the struct — do NOT replace with void*.\n"
             "   - Return ONLY the complete fixed code, nothing else.\n"
         )
 
         prompt += self.FEW_SHOT_FIX_EXAMPLES
 
-        # MSVC/Windows-specific forbidden patterns — CRITICAL
+        # Compiler-specific forbidden patterns
+        _strategy_compiler = strategy.get('compiler_type', self.compiler_type)
+        _is_msvc = _strategy_compiler in (COMPILER_MSVC, COMPILER_AUTO)
         if language.lower() in ('c', 'cpp', 'c++'):
-            prompt += (
-                "\n🚫 MSVC/WINDOWS STRICT RULES (violation causes 100+ cascade errors in Windows SDK headers):\n"
-                "- NEVER use Variable-Length Arrays (VLAs): char buf[n] where n is a runtime variable.\n"
-                "  MSVC C does NOT support C99 VLAs. To fix: add '#define IDENTIFIER 256' at top of file\n"
-                "  and use the constant: char buf[IDENTIFIER]; — use #ifndef guard to avoid redef.\n"
-                "- NEVER define, typedef, or #define an identifier named 'string'.\n"
-                "  'string' is used as a SAL annotation keyword in Windows SDK winnt.h — redefining it\n"
-                "  causes 100+ errors like \"missing ':' before 'string'\" across ALL Windows headers.\n"
-                "  Use 'char*', 'LPSTR', or 'LPCSTR' instead.\n"
-                "- NEVER #define or typedef: bool (use BOOL/int), byte, CHAR, DWORD, HANDLE, UINT,\n"
-                "  LONG, LPSTR, LPCSTR, LPVOID, WORD, TRUE, FALSE — already defined in windows.h.\n"
-                "- NEVER add C++ headers in .c files: <string>, <vector>, <iostream>, <map>, etc.\n"
-                "- NEVER use 'using namespace std;' in C code.\n"
-                "- For 'C2065: undeclared identifier' used as array size (C2057/C2466/C2133):\n"
-                "  Add at the TOP of the file: #ifndef IDENTIFIER\n  #define IDENTIFIER 256\n  #endif\n"
-                "  Then keep: char buf[IDENTIFIER]; — do NOT change to dynamic allocation.\n"
-            )
+            if _is_msvc:
+                prompt += self._get_msvc_strict_rules()
+            else:
+                prompt += self._get_gcc_clang_rules(_strategy_compiler)
 
         return prompt
-    
+
+    # ── Compiler-specific rule blocks for system prompts ──
+
+    @staticmethod
+    def _get_msvc_strict_rules() -> str:
+        """Return MSVC/Windows-specific forbidden patterns for fix prompts."""
+        return (
+            "\n🚫 MSVC/WINDOWS STRICT RULES (violation causes 100+ cascade errors in Windows SDK headers):\n"
+            "- NEVER use Variable-Length Arrays (VLAs): char buf[n] where n is a runtime variable.\n"
+            "  MSVC C does NOT support C99 VLAs. To fix: add '#define IDENTIFIER 256' at top of file\n"
+            "  and use the constant: char buf[IDENTIFIER]; — use #ifndef guard to avoid redef.\n"
+            "- NEVER define, typedef, or #define an identifier named 'string'.\n"
+            "  'string' is used as a SAL annotation keyword in Windows SDK winnt.h — redefining it\n"
+            "  causes 100+ errors like \"missing ':' before 'string'\" across ALL Windows headers.\n"
+            "  Use 'char*', 'LPSTR', or 'LPCSTR' instead.\n"
+            "- NEVER #define or typedef: bool (use BOOL/int), byte, CHAR, DWORD, HANDLE, UINT,\n"
+            "  LONG, LPSTR, LPCSTR, LPVOID, WORD, TRUE, FALSE — already defined in windows.h.\n"
+            "- NEVER add C++ headers in .c files: <string>, <vector>, <iostream>, <map>, etc.\n"
+            "- NEVER use 'using namespace std;' in C code.\n"
+            "- Declare ALL variables at the TOP of a block before any statements (MSVC C89 compat).\n"
+            "- For 'C2065: undeclared identifier' used as array size (C2057/C2466/C2133):\n"
+            "  Add at the TOP of the file: #ifndef IDENTIFIER\n  #define IDENTIFIER 256\n  #endif\n"
+            "  Then keep: char buf[IDENTIFIER]; — do NOT change to dynamic allocation.\n"
+        )
+
+    @staticmethod
+    def _get_gcc_clang_rules(compiler_type: str = COMPILER_GCC) -> str:
+        """Return GCC/Clang-specific rules for fix prompts."""
+        compiler_name = 'Clang' if compiler_type == COMPILER_CLANG else 'GCC'
+        return (
+            f"\n🔧 {compiler_name} COMPILER RULES:\n"
+            "- Variable-Length Arrays (VLAs) ARE supported in C99/C11 mode but should be avoided\n"
+            "  for portability. Prefer fixed-size arrays or dynamic allocation.\n"
+            "- Variables CAN be declared anywhere in a block (C99+), not just at the top.\n"
+            "- For-loop initializers like `for(int i=0; ...)` are valid in C99+ mode.\n"
+            "- 'implicit declaration of function' warnings: add the correct #include or a\n"
+            "  forward declaration before the call site — do NOT remove the call.\n"
+            "- 'incompatible pointer types' warnings: add an explicit cast — do NOT change\n"
+            "  the pointer type or remove the assignment.\n"
+            "- 'undefined reference to' linker errors: ensure the function is defined in EXACTLY\n"
+            "  one translation unit and the source file is compiled, OR add `extern` declarations.\n"
+            "- 'multiple definition of' errors: if a function/variable is defined in a header,\n"
+            "  mark it `static` or `static inline` to avoid duplicate symbols across TUs.\n"
+            "- 'redefinition of struct/type' errors: use `#ifndef` include guards or `#pragma once`.\n"
+            "- NEVER add C++ headers (<string>, <vector>, <iostream>) in .c files.\n"
+            "- Use C-style casts, NULL (not nullptr), and standard C types in .c files.\n"
+        )
+
     def _build_error_context(self, error_infos: List, strategy: dict) -> str:
         """Build detailed error context for LLM"""
         context = ""
+
+        if strategy.get('has_environment_issues'):
+            context += (
+                "\n🔧 ENVIRONMENT ISSUE — the following are SDK/toolchain problems, NOT code bugs:\n"
+                "  Do NOT modify code to work around these. They will resolve when the SDK is configured.\n\n"
+            )
         
         if strategy.get('has_missing_headers'):
             context += "\n⚠️ MISSING HEADERS DETECTED:\n"
@@ -3357,8 +3141,8 @@ Please fix these issues. Return only the fixed code within code blocks.
                 header_errors = [e.error_text for e in error_infos if e.error_type == ErrorType.MISSING_HEADER]
                 for err in header_errors[:5]:
                     context += f"    - {err}\n"
-            context += "\n  ACTION: Comment out SYSTEM #include statements (with <angle brackets>) and add minimal stubs.\n"
-            context += "  CRITICAL: NEVER touch project-specific includes (quoted paths like \"path/file.h\").\n\n"
+            context += "\n  ACTION: Keep #include lines, add forward declarations for types/functions used so code compiles without the header.\n"
+            context += "  CRITICAL: NEVER remove or comment out ANY #include line.\n\n"
         
         if strategy.get('has_undefined_symbols'):
             context += "\n⚠️ UNDEFINED SYMBOLS DETECTED:\n"

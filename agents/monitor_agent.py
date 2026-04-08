@@ -97,6 +97,8 @@ class MonitorAgent(BaseAgent):
             language=envelope.language,
             requested_strategies=envelope.requested_strategies,
             num_functions=envelope.num_functions,
+            target_functions=envelope.target_functions,
+            sandbox_backend=envelope.sandbox_backend,
         )
         if self._ctx.state_store:
             await self._ctx.state_store.save(state)

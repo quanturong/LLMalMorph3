@@ -12,6 +12,7 @@ Features:
 - MinGW/GCC support (fallback)
 """
 
+import glob
 import os
 import subprocess
 import shutil
@@ -146,12 +147,39 @@ class ProjectCompiler:
         self.lib_dirs = []
         self.libraries = []
         
+        # vcpkg integration — auto-detect vcpkg installed libraries
+        self.vcpkg_root = self._find_vcpkg()
+        self.vcpkg_include = None
+        self.vcpkg_lib = None
+        if self.vcpkg_root:
+            triplet = 'x64-windows-static'
+            self.vcpkg_include = os.path.join(self.vcpkg_root, 'installed', triplet, 'include')
+            self.vcpkg_lib = os.path.join(self.vcpkg_root, 'installed', triplet, 'lib')
+            if os.path.isdir(self.vcpkg_include):
+                logger.info(f"   vcpkg found: {self.vcpkg_root} (triplet: {triplet})")
+            else:
+                self.vcpkg_include = None
+                self.vcpkg_lib = None
+        
         # Default flags for malware compilation
         if self.compiler_type == 'msvc':
             self._setup_msvc_flags()
         else:
             self._setup_default_flags()
     
+    def _find_vcpkg(self) -> Optional[str]:
+        """Find vcpkg installation"""
+        candidates = [
+            r'E:\vcpkg',
+            r'C:\vcpkg',
+            os.path.join(os.environ.get('VCPKG_ROOT', ''), '') if os.environ.get('VCPKG_ROOT') else None,
+            os.path.join(os.environ.get('USERPROFILE', ''), 'vcpkg'),
+        ]
+        for p in candidates:
+            if p and os.path.isdir(p) and os.path.exists(os.path.join(p, 'vcpkg.exe')):
+                return p
+        return None
+
     def _find_msvc(self) -> Optional[str]:
         """Find MSVC vcvarsall.bat"""
         for path in self._MSVC_SEARCH_PATHS:
@@ -259,15 +287,24 @@ class ProjectCompiler:
                 # cl.exe with no args shows banner and returns 0
                 # Also check INCLUDE env var is set (for Windows SDK headers like WinSock2.h)
                 if 'Microsoft' in cl_check.stderr.decode('utf-8', errors='ignore'):
-                    if os.environ.get('INCLUDE'):
-                        logger.info(f"✓ cl.exe already available in environment")
-                        self.compiler_type = 'msvc'
-                        self.msvc_env = os.environ.copy()  # Use current environment
-                        # Resolve full path to avoid CreateProcess PATH issues
-                        cl_full = shutil.which('cl.exe') or 'cl.exe'
-                        compilers['c'] = cl_full
-                        compilers['cpp'] = cl_full
-                        return compilers
+                    include_val = os.environ.get('INCLUDE', '')
+                    if include_val:
+                        # Validate that INCLUDE paths actually exist on disk
+                        # (guards against stale env pointing to wrong SDK version)
+                        inc_dirs = [d.strip() for d in include_val.split(';') if d.strip()]
+                        missing = [d for d in inc_dirs if not os.path.isdir(d)]
+                        if missing:
+                            logger.info(f"⚠️  cl.exe found but INCLUDE has {len(missing)} non-existent path(s), running vcvarsall...")
+                            logger.info(f"   Stale: {missing[0]}")
+                        else:
+                            logger.info(f"✓ cl.exe already available in environment")
+                            self.compiler_type = 'msvc'
+                            self.msvc_env = os.environ.copy()  # Use current environment
+                            # Resolve full path to avoid CreateProcess PATH issues
+                            cl_full = shutil.which('cl.exe') or 'cl.exe'
+                            compilers['c'] = cl_full
+                            compilers['cpp'] = cl_full
+                            return compilers
                     else:
                         logger.info(f"⚠️  cl.exe found but INCLUDE not set, running vcvarsall...")
             except Exception:
@@ -445,6 +482,35 @@ class ProjectCompiler:
         """Add library to link"""
         if lib not in self.libraries:
             self.libraries.append(lib)
+
+    @staticmethod
+    def cleanup_build_intermediates(output_dir: str, keep_exe: bool = True) -> int:
+        """
+        Securely wipe build intermediates (.obj, .pdb, .ilk, .exp, .lib, .o)
+        from output_dir.  Returns number of files removed.
+
+        The .exe is kept by default (it goes to artifact store which handles
+        encryption).  Intermediates are overwritten with zeros before deletion
+        to prevent forensic recovery of partial PE content.
+        """
+        intermediate_exts = {".obj", ".o", ".pdb", ".ilk", ".exp", ".lib", ".idb", ".pch"}
+        removed = 0
+        for ext in intermediate_exts:
+            for fpath in glob.glob(os.path.join(output_dir, f"*{ext}")):
+                try:
+                    # Overwrite with zeros before unlinking
+                    sz = os.path.getsize(fpath)
+                    with open(fpath, "wb") as f:
+                        f.write(b"\x00" * min(sz, 4096))  # zero first 4K (fast)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.unlink(fpath)
+                    removed += 1
+                except OSError:
+                    pass
+        if removed:
+            logger.info(f"   🧹 Wiped {removed} build intermediates from {output_dir}")
+        return removed
     
     def _build_msvc_compile_cmd(self, project, language, compiler_cmd, executable_path, optimization, output_dir):
         """Build MSVC cl.exe compilation command"""
@@ -741,8 +807,9 @@ FILE * __cdecl __iob_func(void) {
         # intentionally bypass CRT (e.g., malware with custom _entryPoint).
         try:
             entry_match = _re.search(
-                r'#pragma\s+comment\s*\(\s*linker\s*,\s*"\s*(/ENTRY:|/entry:)([^"\s]+)',
-                all_content
+                r'^[^/\n]*#pragma\s+comment\s*\(\s*linker\s*,\s*"\s*(/ENTRY:|/entry:)([^"\s]+)',
+                all_content,
+                _re.MULTILINE
             )
             if entry_match:
                 custom_entry = entry_match.group(2)
@@ -772,9 +839,53 @@ FILE * __cdecl __iob_func(void) {
         if additional_libs:
             logger.info(f"   Auto-detected libraries: {', '.join(additional_libs)}")
         
-        # Libraries
+        # Libraries - always use full library set
+        # Projects with /NODEFAULTLIB pragma handle CRT exclusion themselves;
+        # our explicit libraries (ntdll.lib etc.) still get searched by the linker
         compile_cmd.extend(self.libraries)
         compile_cmd.extend(additional_libs)
+        
+        # === vcpkg external library integration ===
+        # Detect which external libraries this project needs and add vcpkg paths
+        vcpkg_libs_needed = set()
+        if self.vcpkg_include and self.vcpkg_lib:
+            try:
+                # OpenSSL
+                if any(h in all_content for h in ['openssl/evp.h', 'openssl/aes.h', 'openssl/sha.h',
+                        'openssl/ecdh.h', 'openssl/ssl.h', 'openssl/rsa.h', 'openssl/pem.h',
+                        'openssl/ec.h', 'openssl/bn.h']):
+                    vcpkg_libs_needed.update(['libcrypto.lib', 'libssl.lib'])
+                    # Remove old OpenSSL lib pragmas that won't resolve (libeay32, ssleay32)
+                    compile_cmd = [x for x in compile_cmd if x.lower() not in
+                                   ('libeay32.lib', 'ssleay32.lib')]
+                # Crypto++
+                if 'cryptopp/' in all_content:
+                    vcpkg_libs_needed.add('cryptopp.lib')
+                # libcurl
+                if 'curl/curl.h' in all_content:
+                    vcpkg_libs_needed.update(['libcurl.lib', 'zlib.lib'])
+                    compile_cmd.append('/DCURL_STATICLIB')
+                # libjpeg
+                if 'jpeglib.h' in all_content:
+                    vcpkg_libs_needed.add('jpeg.lib')
+                # nlohmann/json (header-only, just needs include path)
+                # fmt
+                if 'fmt/core.h' in all_content or 'fmt/format.h' in all_content:
+                    vcpkg_libs_needed.add('fmt.lib')
+                # cpr
+                if 'cpr/cpr.h' in all_content:
+                    vcpkg_libs_needed.update(['cpr.lib', 'libcurl.lib', 'zlib.lib', 'libssl.lib', 'libcrypto.lib'])
+                    compile_cmd.append('/DCURL_STATICLIB')
+                
+                if vcpkg_libs_needed:
+                    # Add vcpkg include path (before source files)
+                    compile_cmd.insert(1, f'/I{self.vcpkg_include}')
+                    # Add vcpkg lib path and libraries
+                    compile_cmd.append(f'/LIBPATH:{self.vcpkg_lib}')
+                    compile_cmd.extend(vcpkg_libs_needed)
+                    logger.info(f"   vcpkg libraries: {', '.join(vcpkg_libs_needed)}")
+            except Exception as e:
+                logger.debug(f"   vcpkg detection error: {e}")
         
         # Add /LIBPATH for directories containing .lib files in the project
         lib_dirs_added = set()
@@ -800,7 +911,7 @@ FILE * __cdecl __iob_func(void) {
             f.write(' '.join(compile_cmd))
         logger.info(f"   Saved to: {cmd_file}")
         
-        return compile_cmd, self.msvc_env
+        return compile_cmd, getattr(self, '_project_msvc_env', self.msvc_env)
     
     def _build_gcc_compile_cmd(self, project, language, compiler_cmd, executable_path, optimization, output_dir):
         """Build GCC/MinGW compilation command"""
@@ -1010,6 +1121,55 @@ FILE * __cdecl __iob_func(void) {
         logger.info(f"Header files: {len(project.header_files)}")
         logger.info(f"Output: {executable_path}")
         
+        # === ADAPT FLAGS FOR DETECTED PROJECT BUILD CONFIG ===
+        msvc_ver = getattr(project, 'target_msvc_version', '')
+        target_arch = getattr(project, 'target_arch', 'x64')
+        nodefaultlib = getattr(project, 'nodefaultlib', False)
+        custom_ntdll = getattr(project, 'has_custom_ntdll_h', False)
+        needs_gs_off = getattr(project, 'needs_gs_disabled', False)
+        extra_defines = getattr(project, 'extra_defines', [])
+
+        if msvc_ver:
+            logger.info(f"   Detected project target: {msvc_ver.upper()}, arch={target_arch}")
+        if nodefaultlib:
+            logger.info(f"   Project excludes default CRT (/NODEFAULTLIB)")
+        if custom_ntdll:
+            logger.info(f"   Project has custom ntdll.h (may conflict with SDK)")
+
+        # NOTE: We always use x64 compilation even for projects originally targeting x86.
+        # Modern MSVC 2022 x64 builds are compatible with most old x86 code patterns,
+        # and switching arch at runtime requires re-resolving cl.exe path which is fragile.
+        self._project_msvc_env = self.msvc_env
+
+        # Rebuild compile_flags per-project to avoid accumulation
+        if self.compiler_type == 'msvc':
+            self._setup_msvc_flags()
+        else:
+            self._setup_default_flags()
+
+        # Apply project-specific flag adjustments
+        if self.compiler_type == 'msvc':
+            # --- GS (buffer security check) ---
+            if needs_gs_off:
+                self.compile_flags.append('/GS-')
+                logger.info(f"   Added /GS- (project excludes CRT)")
+
+            # --- Extra defines for old MSVC projects ---
+            for define in extra_defines:
+                self.compile_flags.append(f'/D{define}')
+
+            # --- Old MSVC 6.0 projects: add compatibility flags ---
+            if msvc_ver in ('msvc6', 'msvc7', 'msvc8'):
+                # These old projects often use deprecated APIs and K&R-ish code
+                if '/Zc:twoPhase-' not in self.compile_flags:
+                    self.compile_flags.append('/Zc:twoPhase-')
+                # Allow implicit int (common in MSVC 6 C code)
+                if '/Zc:implicitNoexcept-' not in self.compile_flags:
+                    pass  # /w already suppresses warnings
+
+        # Reset include dirs for each project to prevent cross-contamination
+        self.include_dirs = []
+        
         # Add project's root directory and subdirectories as include paths
         self.add_include_dir(project.root_dir)
         
@@ -1127,7 +1287,8 @@ FILE * __cdecl __iob_func(void) {
             elif use_mahoraga and MAHORAGA_AVAILABLE and MahoragaAdaptiveFixer:
                 try:
                     # Resolve API key based on model name
-                    if llm_model.startswith('deepseek-'):
+                    # Ollama-format names (with ':') go to RunPod, not DeepSeek API
+                    if llm_model.startswith('deepseek-') and ':' not in llm_model:
                         api_key = os.environ.get('DEEPSEEK_API_KEY')
                     elif llm_model.startswith('codestral-') or llm_model.startswith('mistral-'):
                         api_key = os.environ.get('MISTRAL_API_KEY')
@@ -1152,7 +1313,8 @@ FILE * __cdecl __iob_func(void) {
             if not llm_fixer and use_llm_fixer and AUTOFIXER_AVAILABLE:
                 try:
                     # Resolve API key based on model name
-                    if llm_model.startswith('deepseek-'):
+                    # Ollama-format names (with ':') go to RunPod, not DeepSeek API
+                    if llm_model.startswith('deepseek-') and ':' not in llm_model:
                         api_key = os.environ.get('DEEPSEEK_API_KEY')
                     elif llm_model.startswith('codestral-') or llm_model.startswith('mistral-'):
                         api_key = os.environ.get('MISTRAL_API_KEY')
@@ -1165,7 +1327,8 @@ FILE * __cdecl __iob_func(void) {
                         local_model=hybrid_local_model,
                         cloud_file_size_limit=hybrid_cloud_file_size_limit,
                         mode=hybrid_mode,
-                        fix_history_path=os.path.join(output_dir, '..', 'fix_history.json'),
+                        fix_history_path=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'fix_history_global.json'),
+                        compiler_type=self.compiler_type,
                     )
                     if use_hybrid_llm:
                         logger.info(f"✓ HYBRID LLM-powered AutoFixer initialized")
@@ -1620,12 +1783,18 @@ FILE * __cdecl __iob_func(void) {
                                         # 2. Undeclared local vars (C2065 alone) → add declaration
                                         # 3. Missing includes for known Win32 types
                                         import re as _re_vla
-                                        pattern_fixed_code, pattern_fix_count = AutoFixer.apply_generic_pattern_fixes(
-                                            source_code, file_errors, language
+                                        pattern_fixed_code, pattern_fix_count, lnk_libs = AutoFixer.apply_generic_pattern_fixes(
+                                            source_code, file_errors, language, file_path=source_file
                                         )
                                         if pattern_fix_count > 0:
                                             source_code = pattern_fixed_code
                                             logger.info(f"      ✓ Generic pattern fixes applied: {pattern_fix_count} fix(es)")
+                                        # Add missing libraries detected from LNK errors
+                                        if lnk_libs:
+                                            new_libs = lnk_libs - set(self.libraries)
+                                            if new_libs:
+                                                self.libraries.extend(sorted(new_libs))
+                                                logger.info(f"      ✓ Added linker libraries: {', '.join(sorted(new_libs))}")
 
                                         # Legacy VLA detection (for the skip-LLM logic below)
                                         # Note: VLA defines may already be added by apply_generic_pattern_fixes above.
@@ -1699,7 +1868,7 @@ FILE * __cdecl __iob_func(void) {
                                             source_code,
                                             file_errors,
                                             language=language,
-                                            max_attempts=1,
+                                            max_attempts=2,
                                             max_code_length=llm_fixer_max_code_length,
                                             project_context=project_context_str,
                                             file_context=file_context_str,
@@ -1896,6 +2065,40 @@ FILE * __cdecl __iob_func(void) {
         with open(result_file, 'w', encoding='utf-8') as f:
             json.dump(result_dict, f, indent=2)
         
+        # ── Evidence: log SHA-256 of the compiled PE so it can be verified later
+        if result.success and result.executable_path and os.path.exists(result.executable_path):
+            try:
+                import hashlib as _hl
+                _h = _hl.sha256()
+                with open(result.executable_path, "rb") as _f:
+                    for _chunk in iter(lambda: _f.read(65536), b""):
+                        _h.update(_chunk)
+                exe_sha256 = _h.hexdigest()
+                exe_size = os.path.getsize(result.executable_path)
+                logger.info(f"   📦 PE evidence: {os.path.basename(result.executable_path)} "
+                            f"sha256={exe_sha256} size={exe_size}")
+                # Persist hash alongside compile result for audit trail
+                evidence_file = os.path.join(output_dir, "pe_evidence.json")
+                evidence = {
+                    "executable": os.path.basename(result.executable_path),
+                    "sha256": exe_sha256,
+                    "size_bytes": exe_size,
+                    "compiled_at": None,
+                    "project": project.name,
+                }
+                try:
+                    from datetime import datetime as _dt
+                    evidence["compiled_at"] = _dt.now().isoformat()
+                except Exception:
+                    pass
+                with open(evidence_file, "w", encoding="utf-8") as _f:
+                    json.dump(evidence, _f, indent=2)
+            except Exception as _ev_err:
+                logger.warning(f"   ⚠️  Could not compute PE evidence (file may have been quarantined): {_ev_err}")
+
+        # ── Secure cleanup: wipe build intermediates ──────────────────────
+        self.cleanup_build_intermediates(output_dir, keep_exe=True)
+
         return result
     
     # ──────────────────────────────────────────────────────────────────────
@@ -1944,6 +2147,21 @@ FILE * __cdecl __iob_func(void) {
         logger.info(f"Entry point: {entry_file}")
         logger.info(f"Source files: {len(project.source_files)}")
         logger.info(f"Output: {output_dir}/{output_name}.exe")
+
+        # Pre-compilation: obfuscate all string/int literals in source files
+        # This handles module-level constants (DB_PATH, SQL queries, URLs, etc.)
+        # that the LLM mutation step never touches.
+        try:
+            import importlib.util as _ilu, sys as _sys
+            _obf_path = os.path.join(os.path.dirname(__file__), 'python_source_obfuscator.py')
+            _spec = _ilu.spec_from_file_location('python_source_obfuscator', _obf_path)
+            _obf_mod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_obf_mod)
+            _obf_stats = _obf_mod.obfuscate_project_dir(project.root_dir)
+            logger.info(f"   🔐 Source obfuscation: {_obf_stats['files_modified']} files modified, "
+                        f"{_obf_stats['files_failed']} failed")
+        except Exception as _obf_err:
+            logger.warning(f"   ⚠ Source obfuscation step failed (non-fatal): {_obf_err}")
 
         # Syntax check first
         for sf in project.source_files:
@@ -2143,21 +2361,28 @@ FILE * __cdecl __iob_func(void) {
 
         # Check if pkg is available
         pkg_cmd = shutil.which('pkg')
+        node_cmd = shutil.which('node')
         if not pkg_cmd:
             # Try via npx
             npx_cmd = shutil.which('npx')
             if npx_cmd:
                 pkg_cmd = npx_cmd
-                cmd = [pkg_cmd, 'pkg', entry_file, '--target', 'node18-win-x86',
+                cmd = [pkg_cmd, 'pkg', entry_file, '--target', 'node18-win-x64',
                        '--output', executable_path]
             else:
                 result.errors = "pkg not found"
                 return result
         else:
-            cmd = [pkg_cmd, entry_file, '--target', 'node18-win-x86',
-                   '--output', executable_path]
+            # On Windows, .CMD wrappers fail under subprocess; call node directly
+            pkg_js = os.path.join(os.path.dirname(pkg_cmd), 'node_modules', 'pkg', 'lib-es5', 'bin.js')
+            if node_cmd and os.path.isfile(pkg_js):
+                cmd = [node_cmd, pkg_js, entry_file, '--target', 'node18-win-x64',
+                       '--output', executable_path]
+            else:
+                cmd = [pkg_cmd, entry_file, '--target', 'node18-win-x64',
+                       '--output', executable_path]
 
-        logger.info(f"   Trying pkg: {' '.join(cmd[:4])} ...")
+        logger.info(f"   Trying pkg: {' '.join(str(c) for c in cmd[:4])} ...")
 
         try:
             proc = subprocess.run(
@@ -2192,17 +2417,24 @@ FILE * __cdecl __iob_func(void) {
         result = CompilationResult()
 
         nexe_cmd = shutil.which('nexe')
+        node_cmd = shutil.which('node')
         if not nexe_cmd:
             npx_cmd = shutil.which('npx')
             if npx_cmd:
                 cmd = [npx_cmd, 'nexe', entry_file, '--output', executable_path,
-                       '--target', 'windows-x86-14.15.3']
+                       '--target', 'windows-x64-14.15.3']
             else:
                 result.errors = "nexe not found"
                 return result
         else:
-            cmd = [nexe_cmd, entry_file, '--output', executable_path,
-                   '--target', 'windows-x86-14.15.3']
+            # On Windows, .CMD wrappers fail under subprocess; call node directly
+            nexe_js = os.path.join(os.path.dirname(nexe_cmd), 'node_modules', 'nexe', 'index.js')
+            if node_cmd and os.path.isfile(nexe_js):
+                cmd = [node_cmd, nexe_js, entry_file, '--output', executable_path,
+                       '--target', 'windows-x64-14.15.3']
+            else:
+                cmd = [nexe_cmd, entry_file, '--output', executable_path,
+                       '--target', 'windows-x64-14.15.3']
 
         logger.info(f"   Trying nexe: {' '.join(cmd[:4])} ...")
 
@@ -2345,7 +2577,7 @@ FILE * __cdecl __iob_func(void) {
                 ]
                 for inc_dir in self.include_dirs:
                     cmd.append(f'/I{inc_dir}')
-                run_env = self.msvc_env
+                run_env = getattr(self, '_project_msvc_env', self.msvc_env)
             else:
                 object_file = os.path.join(output_dir, f"{source_name}.o")
                 cmd = [

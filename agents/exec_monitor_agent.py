@@ -200,6 +200,8 @@ class ExecMonitorAgent(BaseAgent):
             _state = await self._ctx.state_store.get(job_id)
             if _state:
                 _state.raw_report_artifact_id = artifact_id
+                # Save state immediately so handle_event() can detect completion
+                await self._ctx.state_store.save(_state)
                 # Also poll the original binary submission if one was made
                 if _state.original_sandbox_task_id:
                     await self._monitor_original_task(
@@ -209,8 +211,6 @@ class ExecMonitorAgent(BaseAgent):
                         state=_state,
                         log=log,
                     )
-                else:
-                    await self._ctx.state_store.save(_state)
 
     async def _monitor_original_task(
         self,

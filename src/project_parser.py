@@ -203,6 +203,23 @@ class ProjectParser:
             else:
                 logger.warning(f"   ✗ Failed: {file_result.get('error', 'Unknown error')}")
         
+        # Also parse header files that contain function implementations
+        # (some C projects like TreasureHunter put all code in .h files)
+        for header_file in getattr(project, 'header_files', []):
+            try:
+                content = open(header_file, 'r', errors='replace').read()
+                # Check if header has function bodies (contains '{' after a function-like pattern)
+                import re as _re
+                if _re.search(r'\)\s*\{', content):
+                    logger.info(f"  [header] Parsing: {os.path.basename(header_file)}")
+                    file_result = self._parse_file(header_file)
+                    if file_result.get('success') and file_result.get('functions'):
+                        result.add_file_result(header_file, file_result)
+                        funcs = len(file_result.get('functions', []))
+                        logger.info(f"   ✓ Functions: {funcs} (from header)")
+            except Exception as e:
+                logger.debug(f"   Skipped header {os.path.basename(header_file)}: {e}")
+        
         # Update statistics
         result.update_statistics()
         
@@ -304,6 +321,34 @@ class ProjectParser:
                 globals_vars.append({'name': node.target.id})
             elif isinstance(node, ast.ClassDef):
                 classes.append({'name': node.name})
+                # Also extract methods from inside the class
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        start_line = getattr(item, 'lineno', 1)
+                        end_line = _end_lineno(item)
+                        body_text = '\n'.join(lines[start_line - 1:end_line])
+
+                        arg_names = []
+                        for arg in getattr(item.args, 'posonlyargs', []):
+                            arg_names.append(arg.arg)
+                        for arg in item.args.args:
+                            arg_names.append(arg.arg)
+                        if item.args.vararg:
+                            arg_names.append('*' + item.args.vararg.arg)
+                        for arg in item.args.kwonlyargs:
+                            arg_names.append(arg.arg)
+                        if item.args.kwarg:
+                            arg_names.append('**' + item.args.kwarg.arg)
+
+                        signature = f"{node.name}.{item.name}({', '.join(arg_names)})"
+
+                        functions.append({
+                            'name_only': f"{node.name}.{item.name}",
+                            'name_with_params': signature,
+                            'body': body_text,
+                            'start_line': start_line,
+                            'end_line': end_line,
+                        })
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 start_line = getattr(node, 'lineno', 1)
                 end_line = _end_lineno(node)
@@ -379,13 +424,26 @@ class ProjectParser:
                 if global_match and not stripped.startswith(('def ', 'class ', 'if ', 'for ', 'while ', 'try:', 'with ')):
                     globals_vars.append({'name': global_match.group(1)})
 
-        # Extract top-level function blocks by indentation boundaries.
+        # Extract all function blocks (top-level and class methods) by indentation.
+        current_class = None
         i = 0
         while i < len(lines):
             line = lines[i]
-            if line.startswith((' ', '\t')):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
                 i += 1
                 continue
+
+            # Track current class context
+            class_match = class_re.match(line)
+            if class_match and not line.startswith((' ', '\t')):
+                current_class = class_match.group(1)
+                i += 1
+                continue
+
+            # Reset class context at top-level non-class statements
+            if not line.startswith((' ', '\t')) and not stripped.startswith('def '):
+                current_class = None
 
             def_match = def_re.match(line)
             if not def_match:
@@ -413,9 +471,11 @@ class ProjectParser:
             end_line = j if j > i + 1 else i + 1
             body_text = '\n'.join(lines[i:end_line])
 
+            qualified_name = f"{current_class}.{func_name}" if current_class and def_indent > 0 else func_name
+
             functions.append({
-                'name_only': func_name,
-                'name_with_params': f"{func_name}({params})",
+                'name_only': qualified_name,
+                'name_with_params': f"{qualified_name}({params})",
                 'body': body_text,
                 'start_line': start_line,
                 'end_line': end_line,

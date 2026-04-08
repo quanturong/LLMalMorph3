@@ -68,6 +68,29 @@ class CapeAdapter:
             ),
         )
 
+    async def submit_bytes(
+        self,
+        file_bytes: bytes,
+        filename: str = "sample.exe",
+        platform: str = "windows",
+        timeout_analysis: int = 120,
+        machine: str = "",
+        options: Optional[Dict[str, str]] = None,
+    ) -> Optional[int]:
+        """Submit in-memory bytes (no plaintext on disk). Returns task_id."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._client.submit_bytes(
+                file_bytes=file_bytes,
+                filename=filename,
+                machine=machine,
+                platform=platform,
+                timeout_analysis=timeout_analysis,
+                options=options or {},
+            ),
+        )
+
     async def get_task_status(self, task_id: int) -> str:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(

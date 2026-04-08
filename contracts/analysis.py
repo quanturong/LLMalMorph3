@@ -285,6 +285,7 @@ class BehaviorEquivalenceResult(BaseModel):
     api_calls_only_in_original: List[str] = Field(default_factory=list)
     api_calls_only_in_mutated: List[str] = Field(default_factory=list)
     api_call_jaccard_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    api_call_sequence_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
 
     # Resource-access diff
     registry_keys_only_in_original: List[str] = Field(default_factory=list)

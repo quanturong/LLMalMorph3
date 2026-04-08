@@ -187,6 +187,8 @@ async def _build_llm_provider(cfg: dict[str, Any], redis_client):
     api_key = llm_cfg.get("api_key", "")
     if cloud_provider == "deepseek":
         api_key = api_key or os.getenv("DEEPSEEK_API_KEY", "")
+    elif cloud_provider == "salad":
+        api_key = api_key or os.getenv("SALAD_API_KEY", "") or os.getenv("RUNPOD_API_KEY", "")
     elif cloud_provider in ("runpod", "openai_compatible"):
         api_key = api_key or os.getenv("RUNPOD_API_KEY", "")
     elif cloud_provider == "azure":
@@ -196,12 +198,14 @@ async def _build_llm_provider(cfg: dict[str, Any], redis_client):
 
     if mode == "deepseek" and not api_key:
         raise ValueError("DEEPSEEK_API_KEY is required when llm.enabled=true and llm.mode=deepseek")
-    if cloud_provider in ("runpod", "openai_compatible") and not api_key:
-        raise ValueError("RUNPOD_API_KEY is required when llm.cloud_provider=runpod")
-    if cloud_provider in ("runpod", "openai_compatible") and not (
-        cloud_base_url or os.getenv("RUNPOD_OPENAI_BASE_URL", "")
+    if cloud_provider in ("runpod", "openai_compatible", "salad") and not api_key:
+        # Allow "none" or "dummy" for Ollama endpoints that don't need auth
+        raise ValueError(f"{cloud_provider.upper()} API key is required when llm.cloud_provider={cloud_provider}. "
+                         f"Use api_key='none' for endpoints without authentication.")
+    if cloud_provider in ("runpod", "openai_compatible", "salad") and not (
+        cloud_base_url or os.getenv("CLOUD_URL", "") or os.getenv("SALAD_URL", "")
     ):
-        raise ValueError("RUNPOD_OPENAI_BASE_URL (or llm.cloud_base_url) is required when llm.cloud_provider=runpod")
+        raise ValueError("CLOUD_URL (or llm.cloud_base_url) is required when llm.cloud_provider={cloud_provider}")
     if mode in ("mistral", "cloud_only") and cloud_provider != "deepseek" and not api_key:
         raise ValueError("MISTRAL_API_KEY is required when llm.enabled=true and llm.mode uses mistral/cloud_only")
     if cloud_provider == "azure" and not api_key:
@@ -218,6 +222,7 @@ async def _build_llm_provider(cfg: dict[str, Any], redis_client):
         cloud_provider=cloud_provider,
         fallback_provider=llm_cfg.get("fallback_provider", "deepseek"),
         fallback_model=llm_cfg.get("fallback_model", "deepseek-chat"),
+        cloud_extra_urls=llm_cfg.get("cloud_extra_urls", []),
     )
 
 
@@ -250,6 +255,39 @@ def _export_llm_env_vars(cfg: dict[str, Any]) -> None:
     if api_key and cloud_provider in ("runpod", "openai_compatible") and not os.environ.get("RUNPOD_API_KEY"):
         os.environ["RUNPOD_API_KEY"] = api_key
 
+    if api_key and cloud_provider == "salad":
+        if not os.environ.get("SALAD_API_KEY"):
+            os.environ["SALAD_API_KEY"] = api_key
+        # Also set RUNPOD env vars for legacy code paths that check them
+        if not os.environ.get("RUNPOD_API_KEY"):
+            os.environ["RUNPOD_API_KEY"] = api_key
+
+    if cloud_base_url and cloud_provider in ("salad",) and not os.environ.get("CLOUD_URL"):
+        os.environ["CLOUD_URL"] = cloud_base_url
+    # RunPod/OpenAI-compatible: ALWAYS override CLOUD_URL (may be stale from .env)
+    if cloud_base_url and cloud_provider in ("runpod", "openai_compatible"):
+        os.environ["CLOUD_URL"] = cloud_base_url
+
+    # Export the cloud model name so the auto-fixer uses the correct model on RunPod
+    cloud_model = llm_cfg.get("cloud_model", "")
+    if cloud_model and cloud_provider in ("runpod", "openai_compatible"):
+        os.environ["FIXER_MODEL"] = cloud_model
+
+    # Parallel race: export extra cloud URLs for RaceLLMProvider
+    extra_urls = llm_cfg.get("cloud_extra_urls", [])
+    if extra_urls:
+        # Normalize: ensure /v1 suffix
+        normalized = []
+        for u in extra_urls:
+            u = u.strip().rstrip("/")
+            if not u.endswith("/v1"):
+                u += "/v1"
+            normalized.append(u)
+        os.environ["CLOUD_URLS"] = ",".join(normalized)
+
+    if api_key and cloud_provider == "deepseek" and not os.environ.get("DEEPSEEK_API_KEY"):
+        os.environ["DEEPSEEK_API_KEY"] = api_key
+
 
 async def run_production(config_path: Path, dry_run: bool = False) -> int:
     _load_dotenv_file(ROOT_DIR / ".env")
@@ -276,7 +314,12 @@ async def run_production(config_path: Path, dry_run: bool = False) -> int:
     llm_provider = await _build_llm_provider(cfg, redis_client)
 
     state_store = StateStore(redis_client=redis_client, db_path=cfg["storage"]["db_path"])
-    artifact_store = ArtifactStore(base_dir=cfg["storage"]["artifact_dir"], db_path=cfg["storage"]["db_path"])
+    artifact_store = ArtifactStore(
+        base_dir=cfg["storage"]["artifact_dir"],
+        db_path=cfg["storage"]["db_path"],
+        encrypt_pe=cfg["storage"].get("encrypt_pe", False),
+        encryption_key=cfg["storage"].get("encryption_key") or os.environ.get("ARTIFACT_ENCRYPTION_KEY"),
+    )
     report_store = ReportStore(db_path=cfg["storage"]["db_path"], reports_dir=cfg["storage"]["report_dir"])
     cape = CapeAdapter(api_url=cape_url, api_token=cape_token)
     vt = VirusTotalAdapter(api_key=vt_api_key, api_url=vt_api_url) if vt_api_key else None
@@ -330,6 +373,7 @@ async def run_production(config_path: Path, dry_run: bool = False) -> int:
                                             [mutation_cfg.get("default_strategy", "strat_1")]),
             num_functions=int(sample.get("num_functions",
                                         mutation_cfg.get("num_functions_per_project", 3))),
+            target_functions=sample.get("target_functions", []),
             metadata=sample.get("metadata", {}),
         )
         envelopes.append((sample["sample_id"], envelope))

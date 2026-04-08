@@ -52,10 +52,16 @@ class OpenAICompatibleProvider(LLMProviderInterface):
         if not endpoint.endswith("/chat/completions"):
             endpoint = f"{endpoint}/chat/completions"
 
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
+        if self._provider_name.startswith("salad"):
+            headers = {
+                "Salad-Api-Key": self._api_key,
+                "Content-Type": "application/json",
+            }
+        else:
+            headers = {
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            }
         body: dict = {
             "model": model,
             "messages": [
@@ -84,7 +90,12 @@ class OpenAICompatibleProvider(LLMProviderInterface):
             raise LLMError(f"{self._provider_name} request failed: {exc}")
 
         data = resp.json()
-        content = data["choices"][0]["message"]["content"]
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or ""
+        # Ollama returns reasoning models' chain-of-thought in a separate "reasoning" field.
+        # If content is empty but reasoning exists, use reasoning as content.
+        if not content.strip() and msg.get("reasoning"):
+            content = msg["reasoning"]
         usage = data.get("usage", {})
         return LLMResponse(
             content=content,

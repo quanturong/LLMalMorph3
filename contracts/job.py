@@ -86,6 +86,7 @@ class JobEnvelope(BaseModel):
     # Pipeline parameters
     requested_strategies: List[str] = Field(default_factory=list)
     num_functions: int = 3
+    target_functions: List[str] = Field(default_factory=list)  # force specific functions by name
     sandbox_backend: str = "cape"      # "cape" | "virustotal" | "inetsim"
     sandbox_timeout_s: int = 300
 
@@ -127,6 +128,7 @@ class JobState(BaseModel):
     language: str = ""
     requested_strategies: List[str] = Field(default_factory=list)
     num_functions: int = 3
+    target_functions: List[str] = Field(default_factory=list)
 
     # Retry tracking
     retry_count: int = 0

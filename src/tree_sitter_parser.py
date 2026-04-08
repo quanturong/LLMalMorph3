@@ -77,7 +77,7 @@ def get_body_with_template_declaration(node, source_code):
 
 
 def read_source_code(filename):
-    with open(filename, "r") as file:
+    with open(filename, "r", encoding="utf-8", errors="ignore") as file:
         return file.read()
 
 
@@ -530,6 +530,8 @@ def initialize_parser(source_file):
                 )
         else:
             parser = Parser(CPP_LANGUAGE)
+    elif file_extension in [".py", ".js", ".mjs"]:
+        return None  # Handled by project_parser fallback parsers
     else:
         raise ValueError(f"Unsupported file extension: {file_extension}")
 

@@ -14,10 +14,22 @@ from .quality_assurance import (
     QualityIssue,
     IssueSeverity,
 )
-from .integrated_pipeline import IntegratedPipeline
-from .error_analyzer import ErrorAnalyzer, ErrorType, ErrorInfo
+try:
+    from .integrated_pipeline import IntegratedPipeline
+except ImportError:
+    IntegratedPipeline = None
+from .error_analyzer import (
+    ErrorAnalyzer, ErrorType, ErrorInfo,
+    detect_compiler_from_errors,
+    COMPILER_MSVC, COMPILER_GCC, COMPILER_CLANG, COMPILER_AUTO,
+)
 from .fix_strategies import FixStrategies
-from .mahoraga_fixer import MahoragaAdaptiveFixer, FixMemory
+try:
+    from .mahoraga_fixer import MahoragaAdaptiveFixer, FixMemory
+except ImportError:
+    MahoragaAdaptiveFixer = None
+    FixMemory = None
+from .semantic_validator import SemanticValidator, get_semantic_validator
 
 __all__ = [
     'CompilationPipeline',
@@ -34,6 +46,11 @@ __all__ = [
     'ErrorAnalyzer',
     'ErrorType',
     'ErrorInfo',
+    'detect_compiler_from_errors',
+    'COMPILER_MSVC',
+    'COMPILER_GCC',
+    'COMPILER_CLANG',
+    'COMPILER_AUTO',
     'FixStrategies',
 ]
 

@@ -29,7 +29,7 @@
     "mode": "hybrid",
     "cloud_provider": "runpod",
     "cloud_model": "qwen2.5:32b",
-    "cloud_base_url": "${RUNPOD_OPENAI_BASE_URL}",
+    "cloud_base_url": "${CLOUD_URL}",
     "api_key": "${RUNPOD_API_KEY}",
     "fallback_provider": "deepseek",
     "fallback_model": "deepseek-chat",
@@ -37,7 +37,7 @@
   },
   "mutation": {
     "num_functions_per_project": 1,
-    "default_strategy": "strat_0",
+    "default_strategy": "strat_1",
     "retry_attempts": 3,
     "max_feedback_loops": 2
   },
@@ -62,7 +62,7 @@
       "language": "c",
       "sandbox_backend": "cape",
       "priority": 5,
-      "requested_strategies": ["strat_0"],
+      "requested_strategies": ["strat_1"],
       "num_functions": 1,
       "metadata": {
         "profile": "smoke"
