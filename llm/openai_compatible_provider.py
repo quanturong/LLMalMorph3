@@ -74,6 +74,9 @@ class OpenAICompatibleProvider(LLMProviderInterface):
         if request.response_format == "json_object":
             body["response_format"] = {"type": "json_object"}
 
+        # Ollama qwen3 models: thinking is separated into "reasoning" field by default.
+        # Do NOT set reasoning_effort="none" — that merges thinking INTO content.
+
         start = time.monotonic()
         try:
             resp = requests.post(endpoint, headers=headers, json=body, timeout=request.timeout_s)
@@ -92,10 +95,8 @@ class OpenAICompatibleProvider(LLMProviderInterface):
         data = resp.json()
         msg = data["choices"][0]["message"]
         content = msg.get("content") or ""
-        # Ollama returns reasoning models' chain-of-thought in a separate "reasoning" field.
-        # If content is empty but reasoning exists, use reasoning as content.
-        if not content.strip() and msg.get("reasoning"):
-            content = msg["reasoning"]
+        # Ollama thinking models return chain-of-thought in "reasoning" field.
+        # We only want the actual content; ignore reasoning (thinking) text.
         usage = data.get("usage", {})
         return LLMResponse(
             content=content,

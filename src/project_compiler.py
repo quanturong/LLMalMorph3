@@ -102,6 +102,7 @@ class CompilationResult:
         self.warnings = []
         self.compile_time = 0.0
         self.executable_size = 0
+        self.auto_fix_attempts = 0
         
     def to_dict(self):
         return {
@@ -113,6 +114,7 @@ class CompilationResult:
             'warnings': self.warnings,
             'compile_time': self.compile_time,
             'executable_size': self.executable_size,
+            'auto_fix_attempts': self.auto_fix_attempts,
         }
 
 
@@ -129,6 +131,147 @@ class ProjectCompiler:
         r"C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvarsall.bat",
     ]
     
+    @staticmethod
+    def analyze_best_compiler(project) -> str:
+        """Analyze project source code to determine the best compiler.
+        
+        Scans source files for compiler-specific signals and returns
+        'msvc', 'gcc', or 'auto' based on heuristic scoring.
+        
+        Args:
+            project: MalwareProject instance with source_files, header_files, build_files
+            
+        Returns:
+            'msvc', 'gcc', or 'auto'
+        """
+        msvc_score = 0
+        gcc_score = 0
+        reasons_msvc = []
+        reasons_gcc = []
+        
+        # ── Signal 1: Build system files ──
+        build_lower = [os.path.basename(f).lower() for f in getattr(project, 'build_files', [])]
+        if any(f.endswith(('.vcxproj', '.vcproj', '.sln', '.dsp', '.dsw')) for f in build_lower):
+            msvc_score += 3
+            reasons_msvc.append("VS project files present")
+        if any(f in ('makefile', 'gnumakefile') or f == 'cmakelists.txt' for f in build_lower):
+            # CMake is neutral, but plain Makefile leans GCC
+            if any(f in ('makefile', 'gnumakefile') for f in build_lower):
+                gcc_score += 2
+                reasons_gcc.append("Makefile present")
+        
+        # ── Signal 2: MSVC version metadata ──
+        if getattr(project, 'target_msvc_version', ''):
+            msvc_score += 2
+            reasons_msvc.append(f"targets {project.target_msvc_version}")
+        
+        # ── Signal 3: Scan source content ──
+        all_content = ""
+        source_files = getattr(project, 'source_files', []) + getattr(project, 'header_files', [])
+        for sf in source_files:
+            try:
+                with open(sf, 'r', encoding='utf-8', errors='replace') as f:
+                    all_content += f.read()
+            except Exception:
+                continue
+        
+        if not all_content:
+            logger.info(f"[CompilerSelect] No source content to analyze, using auto")
+            return 'auto'
+        
+        # ── MSVC-specific signals ──
+        # #pragma comment(lib, ...) - MSVC pragma
+        if re.search(r'#pragma\s+comment\s*\(\s*lib\s*,', all_content):
+            msvc_score += 3
+            reasons_msvc.append("#pragma comment(lib)")
+        
+        # __declspec(dllexport/dllimport)
+        if '__declspec' in all_content:
+            msvc_score += 1
+            reasons_msvc.append("__declspec")
+        
+        # MSVC SEH: __try/__except/__finally
+        if re.search(r'\b__try\b', all_content) and re.search(r'\b__except\b', all_content):
+            msvc_score += 3
+            reasons_msvc.append("SEH __try/__except")
+        
+        # #pragma once (works on both but strongly associated with MSVC)
+        # (weak signal, don't count)
+        
+        # MSVC intrinsics
+        if re.search(r'\b__readfsdword\b|\b__writefsdword\b|\b__readgsqword\b', all_content):
+            msvc_score += 2
+            reasons_msvc.append("MSVC intrinsics")
+        
+        # ── GCC-specific signals ──
+        # __attribute__((...))
+        if re.search(r'__attribute__\s*\(\(', all_content):
+            gcc_score += 3
+            reasons_gcc.append("__attribute__")
+        
+        # typeof / __typeof__
+        if re.search(r'\b(__)?typeof(__)?(\s*)\(', all_content):
+            gcc_score += 2
+            reasons_gcc.append("typeof")
+        
+        # __builtin_* functions
+        if re.search(r'\b__builtin_\w+', all_content):
+            gcc_score += 2
+            reasons_gcc.append("__builtin_*")
+        
+        # GCC statement expressions ({...})  
+        if re.search(r'\(\{[^}]+\}\)', all_content):
+            gcc_score += 2
+            reasons_gcc.append("statement expressions")
+        
+        # Variable Length Arrays (VLA) - C99, supported by GCC, NOT by MSVC
+        # Pattern: type name[variable] where variable is not a constant/macro
+        vla_pattern = re.findall(r'\b(?:int|char|unsigned|BYTE|DWORD|float|double|uint8_t|uint16_t|uint32_t)\s+\w+\s*\[\s*([a-z_]\w*)\s*\]', all_content)
+        if vla_pattern:
+            # Filter out common constants/macros (ALL_CAPS = likely #define)
+            vla_vars = [v for v in vla_pattern if not v.isupper() and v not in ('sizeof', 'true', 'false', 'NULL')]
+            if vla_vars:
+                gcc_score += 4  # Strong signal — MSVC cannot compile VLA at all
+                reasons_gcc.append(f"VLA ({len(vla_vars)} instances)")
+        
+        # POSIX headers
+        posix_headers = ['<unistd.h>', '<sys/socket.h>', '<sys/types.h>', '<dlfcn.h>', 
+                         '<pthread.h>', '<sys/mman.h>', '<sys/wait.h>']
+        found_posix = [h for h in posix_headers if h in all_content]
+        if found_posix:
+            gcc_score += 3
+            reasons_gcc.append(f"POSIX headers: {', '.join(found_posix[:3])}")
+        
+        # #ifdef __GNUC__ guards (code specifically written for GCC)
+        gnuc_guards = len(re.findall(r'#\s*if(?:def)?\s+__GNUC__', all_content))
+        msc_guards = len(re.findall(r'#\s*if(?:def)?\s+_MSC_VER', all_content))
+        if gnuc_guards > msc_guards:
+            gcc_score += 1
+            reasons_gcc.append(f"__GNUC__ guards ({gnuc_guards}>{msc_guards})")
+        elif msc_guards > gnuc_guards:
+            msvc_score += 1
+            reasons_msvc.append(f"_MSC_VER guards ({msc_guards}>{gnuc_guards})")
+        
+        # ── Decide ──
+        total = msvc_score + gcc_score
+        if total == 0:
+            logger.info(f"[CompilerSelect] No compiler signals found, using auto")
+            return 'auto'
+        
+        logger.info(f"[CompilerSelect] MSVC={msvc_score} ({', '.join(reasons_msvc) or 'none'}) | "
+                     f"GCC={gcc_score} ({', '.join(reasons_gcc) or 'none'})")
+        
+        # Threshold: need at least 2-point lead to override auto
+        if gcc_score >= msvc_score + 2:
+            logger.info(f"[CompilerSelect] → Selecting GCC (score {gcc_score} vs MSVC {msvc_score})")
+            return 'gcc'
+        elif msvc_score >= gcc_score + 2:
+            logger.info(f"[CompilerSelect] → Selecting MSVC (score {msvc_score} vs GCC {gcc_score})")
+            return 'msvc'
+        else:
+            logger.info(f"[CompilerSelect] → Scores too close, using auto (MSVC-preferred with GCC fallback)")
+            return 'auto'
+    
     def __init__(self, compiler: str = 'auto', msvc_arch: str = 'x64'):
         """
         Initialize compiler
@@ -137,6 +280,8 @@ class ProjectCompiler:
             compiler: 'msvc', 'gcc', 'g++', 'auto' (auto-detect, prefers MSVC)
         """
         self.compiler_type = None  # 'msvc' or 'gcc'
+        self._original_compiler = compiler  # Track for potential GCC fallback
+        self._gcc_fallback_attempted = False  # Prevent infinite fallback
         self.msvc_env = None       # Captured MSVC environment variables
         self.vcvarsall_path = None # Path to vcvarsall.bat
         self.msvc_arch = msvc_arch if msvc_arch in ('x86', 'x64') else 'x64'
@@ -708,10 +853,27 @@ FILE * __cdecl __iob_func(void) {
             if 'getenv(' in all_content:
                 ansi_score += 1
             
+            # --- Anti-UNICODE guards ---
+            # Some projects explicitly forbid UNICODE compilation via compile-time
+            # assertions like C_ASSERT(FALSE) or #error inside #if _UNICODE blocks.
+            # Detect these and force ANSI mode regardless of scoring.
+            anti_unicode_guard = False
+            anti_unicode_pattern = _re.search(
+                r'#if(?:def)?\s+(?:_?UNICODE)\b[^#]*?(?:C_ASSERT\s*\(\s*FALSE\s*\)|#error\b)',
+                all_content, _re.DOTALL
+            )
+            if anti_unicode_pattern:
+                anti_unicode_guard = True
+                logger.info(f"   Detected anti-UNICODE guard (C_ASSERT(FALSE) or #error under #if UNICODE)")
+            
             logger.info(f"   UNICODE score: {unicode_score}, ANSI score: {ansi_score}")
             
             # Enable UNICODE when wide usage exceeds narrow usage
-            if unicode_score >= 3 and unicode_score > ansi_score:
+            # BUT respect explicit anti-UNICODE guards in source code
+            if anti_unicode_guard:
+                needs_unicode = False
+                logger.info(f"   Forced ANSI mode: project has anti-UNICODE compile guard")
+            elif unicode_score >= 3 and unicode_score > ansi_score:
                 needs_unicode = True
                 logger.info(f"   Auto-detected UNICODE mode (wide={unicode_score} >> ansi={ansi_score})")
             else:
@@ -1350,6 +1512,16 @@ FILE * __cdecl __iob_func(void) {
         
         # Track error signatures for fix-loop detection
         error_signature_history = []
+        
+        # Backup original source files for potential compiler fallback (GCC if MSVC fails)
+        _original_source_backups = {}
+        if self.compiler_type == 'msvc' and self._original_compiler == 'auto' and not self._gcc_fallback_attempted:
+            for _sf in project.source_files:
+                try:
+                    with open(_sf, 'r', encoding='utf-8', errors='ignore') as _f:
+                        _original_source_backups[_sf] = _f.read()
+                except Exception:
+                    pass
         
         try:
             import time
@@ -2008,6 +2180,82 @@ FILE * __cdecl __iob_func(void) {
             logger.error(f"\n❌ Compilation exception: {e}")
             result.errors = str(e)
         
+        # ── GCC Fallback: if MSVC failed in auto mode, retry with GCC/MinGW ──
+        if (not result.success
+            and self.compiler_type == 'msvc'
+            and self._original_compiler == 'auto'
+            and not self._gcc_fallback_attempted
+            and _original_source_backups):
+            
+            # Check if GCC/MinGW is available
+            _gcc_check = shutil.which('gcc') or shutil.which('g++') or shutil.which('x86_64-w64-mingw32-gcc')
+            if _gcc_check:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"🔄 GCC FALLBACK: MSVC compilation failed, retrying with GCC/MinGW")
+                logger.info(f"{'='*60}")
+                
+                # Restore original source files (undo MSVC auto-fix changes)
+                _restored = 0
+                for _sf, _content in _original_source_backups.items():
+                    try:
+                        with open(_sf, 'w', encoding='utf-8') as _f:
+                            _f.write(_content)
+                        _restored += 1
+                    except Exception:
+                        pass
+                if _restored:
+                    logger.info(f"   Restored {_restored} source file(s) to original state")
+                
+                # Switch to GCC
+                self._gcc_fallback_attempted = True
+                _saved_msvc_env = self.msvc_env
+                _saved_compiler_type = self.compiler_type
+                self.compiler = self._find_compiler('gcc')
+                
+                if self.compiler_type == 'gcc':
+                    self._setup_default_flags()
+                    logger.info(f"   Switched to GCC, retrying full compilation...")
+                    
+                    # Recurse with GCC (fallback flag prevents infinite recursion)
+                    gcc_result = self.compile_project(
+                        project=project,
+                        output_dir=output_dir,
+                        output_name=output_name,
+                        optimization=optimization,
+                        auto_fix=auto_fix,
+                        max_fix_attempts=max_fix_attempts,
+                        llm_model=llm_model,
+                        use_llm_fixer=use_llm_fixer,
+                        llm_fixer_max_code_length=llm_fixer_max_code_length,
+                        permissive_mode=permissive_mode,
+                        parse_result=parse_result,
+                        pre_validate=pre_validate,
+                        auto_generate_headers=auto_generate_headers,
+                        use_enhanced_categorization=use_enhanced_categorization,
+                        use_project_context=use_project_context,
+                        use_hybrid_llm=use_hybrid_llm,
+                        hybrid_local_model=hybrid_local_model,
+                        hybrid_cloud_file_size_limit=hybrid_cloud_file_size_limit,
+                        hybrid_mode=hybrid_mode,
+                        use_mahoraga=use_mahoraga,
+                        mahoraga_memory_file=mahoraga_memory_file,
+                        external_fixer=external_fixer,
+                        clang_analysis=clang_analysis,
+                    )
+                    if gcc_result.success:
+                        logger.info(f"\n✅ GCC FALLBACK SUCCESSFUL!")
+                        return gcc_result
+                    else:
+                        logger.warning(f"\n⚠️ GCC fallback also failed")
+                        # Restore MSVC state for result reporting
+                        self.compiler_type = _saved_compiler_type
+                        self.msvc_env = _saved_msvc_env
+                else:
+                    logger.warning(f"   ⚠️ No GCC/MinGW compiler found, cannot fallback")
+                    # Restore MSVC state
+                    self.compiler_type = _saved_compiler_type
+                    self.msvc_env = _saved_msvc_env
+        
         # Add auto-fix summary to result
         if llm_fixer and fix_history:
             result.output += f"\n\n=== LLM AUTO-FIX SUMMARY ===\n"
@@ -2098,6 +2346,9 @@ FILE * __cdecl __iob_func(void) {
 
         # ── Secure cleanup: wipe build intermediates ──────────────────────
         self.cleanup_build_intermediates(output_dir, keep_exe=True)
+
+        # Track how many fix attempts were made (beyond the initial compilation)
+        result.auto_fix_attempts = max(0, compilation_attempt - 1)
 
         return result
     

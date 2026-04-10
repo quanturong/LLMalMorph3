@@ -126,11 +126,11 @@ class MutationAgent(BaseAgent):
         elif strategy == "strat_all":
             multiplier, lo, hi = 4.0, 4096, 16384
         elif strategy == "strat_2":
-            multiplier, lo, hi = 2.5, 3072, 12288
+            multiplier, lo, hi = 2.5, 4096, 10240
         elif strategy in ("strat_3", "strat_5"):
             multiplier, lo, hi = 2.5, 4096, 10240
         elif strategy == "strat_4":
-            multiplier, lo, hi = 3.5, 4096, 12288
+            multiplier, lo, hi = 3.5, 4096, 16384
         else:
             multiplier, lo, hi = 2.0, 2048, 10240
 
@@ -152,10 +152,10 @@ class MutationAgent(BaseAgent):
         # Strategy-based base cap
         if strategy == "strat_all":
             strategy_cap = 5      # expensive, higher compile-failure risk
-        elif strategy in ("strat_2", "strat_4"):
-            strategy_cap = 5      # structural transforms — fewer to avoid cross-file conflicts
+        elif strategy == "strat_2":
+            strategy_cap = 8      # error hardening is moderate — can mutate many functions
         else:
-            strategy_cap = 8      # string-only obfuscation is lighter
+            strategy_cap = 8      # string obfuscation / literal encoding is lighter
 
         # Don't try to mutate more than ~60% of available functions
         availability_cap = max(2, int(n * 0.6))
@@ -242,10 +242,23 @@ class MutationAgent(BaseAgent):
             body = s.get("body", "")
             if body:
                 _file_structs.setdefault(fpath, []).append(body)
+        # Extract void-returning function names project-wide for strat_2 context
+        _void_funcs: set[str] = set()
+        for fn in functions:
+            body = fn.get("body", "")
+            if body:
+                sig_line = body[:body.find('{')] if '{' in body else body[:200]
+                sig_line = ' '.join(sig_line.split())
+                if re.match(r'\s*(?:static\s+|inline\s+)?void\s+', sig_line):
+                    _void_funcs.add(fn.get("name", ""))
+        if _void_funcs:
+            log.info("detected_void_functions", count=len(_void_funcs),
+                     names=sorted(_void_funcs))
         self._file_context_cache = {
             "file_funcs": _file_funcs,
             "file_structs": _file_structs,
             "globals": _globals_list,
+            "void_funcs": _void_funcs,
         }
 
         # ── 1a. Filter out functions containing inline assembly ────────────
@@ -271,7 +284,7 @@ class MutationAgent(BaseAgent):
         # failed results, so skip them upfront and save API calls.
         _MAX_BODY_CHARS = {
             "strat_all": 12000,   # 12K chars → ~14K tokens output, fits 16384
-            "strat_2":   20000,   # state-machine is less verbose
+            "strat_2":   25000,   # error hardening adds ~30-50% overhead
         }
         _limit = _MAX_BODY_CHARS.get(strategy, 25000)
         oversized = [f for f in functions if len(f.get("body", "")) > _limit]
@@ -329,8 +342,8 @@ class MutationAgent(BaseAgent):
             )
             if not selected:
                 # Fallback: take all functions if LLM selection fails
-                selected = functions
-                log.warning("llm_selection_fallback", reason="LLM selection returned empty, using all functions")
+                selected = functions[:max_select]
+                log.warning("llm_selection_fallback", reason="LLM selection returned empty, using first max_select functions", max_select=max_select)
 
         log.info("mutation_start", num_selected=len(selected),
                  num_total=len(functions),
@@ -367,6 +380,17 @@ class MutationAgent(BaseAgent):
                     parts.append("Existing struct/type definitions in this file:\n" +
                                  "\n".join(_file_struct_bodies[:10]))
                 file_context = "\n".join(parts)
+
+            # For strat_2: include project-wide void function names so LLM
+            # knows which calls must NOT be wrapped in assignments/if-checks
+            if effective_strategy == "strat_2":
+                _void_funcs = self._file_context_cache.get("void_funcs", set())
+                if _void_funcs:
+                    _vf_line = ", ".join(sorted(_void_funcs))
+                    file_context += (
+                        f"\nVOID FUNCTIONS in this project (do NOT wrap in _ok= or if-checks):\n"
+                        f"  {_vf_line}\n"
+                    )
 
             mutated_body = await self._mutate_function(
                 func_name=func_name,
@@ -527,16 +551,15 @@ class MutationAgent(BaseAgent):
             f"Do NOT include any explanation, just the JSON array."
         )
 
-        # Disable thinking mode for qwen3 models
-        if "qwen3" in os.environ.get("FIXER_MODEL", "").lower():
-            user_prompt += "\n/nothink"
+        # Disable thinking mode (for qwen3 and other thinking models)
+        user_prompt += "\n/no_think"
 
         try:
             request = LLMRequest(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 temperature=0.1,
-                max_tokens=2048,
+                max_tokens=8192,
                 response_format="text",
                 timeout_s=120,
             )
@@ -547,14 +570,14 @@ class MutationAgent(BaseAgent):
             match = re.search(r'\[[\d\s,]*\]', raw)
             if not match:
                 log.warning("llm_selection_parse_failed", raw_response=raw[:200])
-                return functions
+                return functions[:max_select]
 
             indices = json.loads(match.group())
             # Validate indices
             valid_indices = [i for i in indices if isinstance(i, int) and 0 <= i < len(functions)]
             if not valid_indices:
                 log.warning("llm_selection_no_valid_indices", parsed=indices)
-                return functions
+                return functions[:max_select]
 
             # Hard cap: take only the first max_select indices
             if len(valid_indices) > max_select:
@@ -574,7 +597,7 @@ class MutationAgent(BaseAgent):
 
         except Exception as e:
             log.warning("llm_selection_error", error=str(e), error_type=type(e).__name__)
-            return functions
+            return functions[:max_select]
 
     # ──────────────────────────────────────────────────────────────────────
     # Core mutation logic
@@ -680,12 +703,14 @@ class MutationAgent(BaseAgent):
                 f"4. Output the complete code: any helpers first, then the transformed main function.\n\n"
                 f"SAFETY VALVE: If a transformation would break semantics or produce code you are unsure about, "
                 f"SKIP it and leave that code section unchanged. Partially-transformed CORRECT code > fully-transformed BROKEN code.\n\n"
-                f"YOUR OUTPUT MUST show major visible changes inside the function body. "
-                f"If your output looks similar to the input, you have FAILED the task.\n\n"
-                f"Here is the code to transform:\n"
+                + (f"YOUR OUTPUT MUST show major visible changes inside the function body. "
+                   f"If your output looks similar to the input, you have FAILED the task.\n\n"
+                   if strategy not in ("strat_4",) else
+                   f"YOUR OUTPUT MUST rename ALL local variables and parameters to generic names and add anti-analysis checks. "
+                   f"If your output still uses the original variable names, you have FAILED the task.\n\n")
+                + f"Here is the code to transform:\n"
             )
             _is_strat_all = strategy == "strat_all"
-            _is_strat_2 = strategy == "strat_2"
             if _is_strat_all:
                 _role_desc = (
                     f"You transform function bodies by: (1) building ALL strings on the stack "
@@ -694,22 +719,64 @@ class MutationAgent(BaseAgent):
                     f"and (3) applying semantic substitutions where safe. "
                     f"Use short generic variable names like _s0, _pf0 to keep the code clean."
                 )
-            elif _is_strat_2:
+            elif strategy == "strat_4":
                 _role_desc = (
-                    f"You transform function control flow into state-machine dispatch loops. "
-                    f"You define a context struct and static state handler functions OUTSIDE the main function, "
-                    f"then replace the function body with a dispatch loop."
+                    f"You split large functions into smaller static helper functions. "
+                    f"STEP 1: Identify 2-5 logical blocks in the function (initialization, loops, conditionals, cleanup). "
+                    f"STEP 2: Extract each block into a separate `static` helper function defined BEFORE the original function. "
+                    f"STEP 3: The original function calls the helpers, passing only the variables each block needs (by pointer for modified values). "
+                    f"NAMING: helpers are `static` with names like _sub_FUNCNAME_0, _sub_FUNCNAME_1. "
+                    f"PARAMETERS: pass needed variables as parameters. Use pointers for out-params. "
+                    f"SAFETY: the split function MUST produce IDENTICAL behavior to the original for ALL inputs. "
+                    f"NEVER change the original function's signature, return type, or name. "
+                    f"NEVER add #include, extern, or global declarations. "
+                    f"Output ALL helper functions FIRST, then the modified original function LAST."
+                )
+            elif strategy == "strat_2":
+                _role_desc = (
+                    f"You insert dead code, opaque predicates, and flatten control flow using a "
+                    f"while/switch state-machine dispatcher. "
+                    f"DEAD CODE: add `volatile DWORD _junk; _junk = GetCurrentProcessId() ^ 0xBAAD;` between real blocks. "
+                    f"OPAQUE PREDICATES: add `volatile int _opq0 = 0; if (_opq0) {{ CreateFileA(\"NUL\", ...); }}` — "
+                    f"always-false branches with real Win32 API calls that never execute. "
+                    f"CFG FLATTENING: convert if/else chains and sequential blocks into "
+                    f"`int _state = 0; while (_state != 99) {{ switch (_state) {{ case 0: ... }} }}`. "
+                    f"CRITICAL: ALL original logic MUST remain functionally identical — same inputs, same outputs. "
+                    f"CRITICAL: Declare ALL new variables (_state, _opq0, _junk) at the TOP of the function body. "
+                    f"CRITICAL: NEVER introduce unclosed comments — every /* must have a matching */. "
+                    f"CRITICAL: For very small functions (< 5 lines), just add opaque predicates + dead code, skip flattening. "
+                    f"This destroys control flow graph patterns, adds noise to static analysis, "
+                    f"and changes byte-level signatures and file entropy."
+                )
+            elif strategy == "strat_5":
+                _role_desc = (
+                    f"You substitute every recognizable built-in operation, loop pattern, string operation, "
+                    f"and function call with a semantically equivalent but syntactically unrecognizable alternative. "
+                    f"CRT: replace memcpy/strcmp/strcpy/strlen/memset/strcat with manual byte-level loops. "
+                    f"ARITHMETIC: a+b→a-(~b)-1, a*2→a<<1, a%%2→a&1, a==b→!(a^b) (integers ONLY). "
+                    f"LOOPS: for→while+iterator, ascending→descending, forEach→manual index loop. "
+                    f"API CALLS: replace known APIs with alternative SAME-LAYER APIs achieving the same result. "
+                    f"MIX techniques — don't apply the same pattern uniformly. "
+                    f"SAFETY: every substitution MUST produce identical results for ALL inputs. "
+                    f"NEVER use NT-layer APIs, NEVER change function signatures or pointer types."
                 )
             else:
                 _role_desc = (
                     f"You transform function bodies to protect string literals: "
                     f"building strings at runtime via stack character assignment or arithmetic expressions."
                 )
-            # strat_2 needs typedef/struct/extern for context struct and state functions
-            if _is_strat_2:
+            # strat_all needs external function declarations for GetProcAddress boilerplate
+            if _is_strat_all:
                 _struct_rule = (
-                    "You MUST define a context struct and static state functions OUTSIDE (before) the main function. "
+                    "You MAY define typedef and function pointer types OUTSIDE the main function for GetProcAddress. "
                     "Use unique names with the function name suffix to avoid collisions. "
+                )
+            elif strategy == "strat_4":
+                _struct_rule = (
+                    "You MUST define static helper functions BEFORE the original function at file scope. "
+                    "Each helper is a complete `static` function with its own signature and body. "
+                    "NEVER add #include, extern, typedef, or global variable declarations. "
+                    "The original function's local variables that helpers need MUST be passed as parameters (by pointer if modified). "
                 )
             else:
                 _struct_rule = (
@@ -721,24 +788,54 @@ class MutationAgent(BaseAgent):
                              f"{_role_desc} "
                              f"You output valid MSVC-compilable {lang_label} code only."
                              + (" This is C code — do NOT use any C++ syntax." if language == "c" else "")
-                             + " IMPORTANT: Output ONLY the transformed code. "
+                             + " IMPORTANT: Output ONLY the complete transformed function. "
+                               "Do NOT explain your reasoning. Do NOT output comments describing what you plan to do. "
+                               "Start your output with the function signature and end with the closing brace. "
                                "NEVER rename the function itself, its parameters, or any Win32 API calls. "
                              + _struct_rule
-                             + "No prose, no markdown, no explanations outside code comments.")
+                             + "No prose, no markdown, no explanations.")
 
         if language not in ("python", "javascript"):
             user_prompt = mutation_prompt + func_body
         else:
             user_prompt = mutation_prompt + "\nHere is the code:\n" + func_body
 
+        # For strat_2, add post-body reminder — the LLM tends to output fragments
+        # or reasoning instead of the complete function
+        if strategy == "strat_2":
+            user_prompt += (
+                "\n\nOUTPUT THE COMPLETE FUNCTION from its original signature line "
+                "to the closing }. Do NOT output only the changed parts. "
+                "Do NOT add comments. Do NOT explain.\n"
+            )
+        elif strategy == "strat_4":
+            user_prompt += (
+                "\n\nOutput ALL static helper functions FIRST, then the COMPLETE modified original function LAST. "
+                "Every helper and the original function must be complete from signature to closing brace. "
+                "Do NOT add comments. Do NOT explain.\n"
+            )
+
         # Disable thinking mode for qwen3 models (produces 10-18x bloated output)
+        # Also add explicit code fence instructions — qwen3 ignores "no markdown"
+        # and outputs prose mixed with code; fenced blocks are parsed reliably.
         _model_name = os.environ.get("FIXER_MODEL", "")
         if "qwen3" in _model_name.lower():
-            user_prompt += "\n/nothink"
+            user_prompt += (
+                "\n\nIMPORTANT: Wrap your ENTIRE output in a single ```c code fence. "
+                "Do NOT write any text before or after the fence. "
+                "Do NOT explain, plan, or reason. ONLY output the code.\n"
+                "/no_think"
+            )
 
         # Adaptive token budget based on function size + strategy
         _temperature = 0.4 if language not in ("python", "javascript") else 0.2
         _max_tokens = self._adaptive_max_tokens(func_body, strategy, language)
+        # Thinking models (qwen3) need extra headroom: thinking consumes tokens
+        # from the same max_tokens budget, leaving too little for content output.
+        # Large functions (>2000 chars) especially suffer — thinking can use 8000+ tokens.
+        _model = os.environ.get("FIXER_MODEL", "")
+        if "qwen3" in _model.lower():
+            _max_tokens = min(_max_tokens + 8192, 32768)
         logger.info("adaptive_token_budget",
                     name=func_name, body_chars=len(func_body),
                     strategy=strategy, max_tokens=_max_tokens)
@@ -767,6 +864,23 @@ class MutationAgent(BaseAgent):
                     logger.info("think_stripped", name=func_name, remaining_len=len(raw_output),
                                 first_100=raw_output[:100] if raw_output else "(empty)")
 
+                # Strip leading reasoning prose that appears before code
+                # (qwen3 often outputs planning text without <think> tags)
+                if language not in ("python", "javascript") and raw_output:
+                    _code_kw = re.search(
+                        r'^[ \t]*(?:void|int|unsigned|char|short|long|float|double|BOOL|DWORD|HANDLE|'
+                        r'HINSTANCE|LPSTR|LPCSTR|HRESULT|HWND|UINT|WORD|BYTE|SIZE_T|LPARAM|WPARAM|'
+                        r'static|extern|typedef|struct|enum|union|#define|#include|#pragma|#if|'
+                        r'__declspec|WINAPI|CALLBACK|APIENTRY)\b',
+                        raw_output, re.MULTILINE
+                    )
+                    if _code_kw and _code_kw.start() > 50:
+                        _stripped_prose = raw_output[_code_kw.start():]
+                        logger.info("pre_extract_prose_stripped",
+                                    name=func_name, stripped_chars=_code_kw.start(),
+                                    first_50=_stripped_prose[:50])
+                        raw_output = _stripped_prose
+
                 # Extract code from response
                 extracted = self._extract_code(raw_output, language)
                 if not extracted:
@@ -774,16 +888,32 @@ class MutationAgent(BaseAgent):
                                    raw_len=len(raw_output), raw_start=raw_output[:200] if raw_output else "(empty)")
                     continue
 
+                # Reject outputs that are predominantly comments/reasoning
+                # (qwen3 sometimes outputs reasoning as // comments instead of code)
+                _code_lines = [l for l in extracted.splitlines() if l.strip()]
+                _comment_lines = [l for l in _code_lines
+                                  if l.strip().startswith('//') or l.strip().startswith('/*')]
+                if _code_lines and len(_comment_lines) / len(_code_lines) > 0.5:
+                    logger.warning("llm_output_mostly_comments", attempt=attempt + 1,
+                                   total=len(_code_lines), comments=len(_comment_lines))
+                    continue
+
+                # Strip interleaved LLM prose from C/C++ code (reasoning text
+                # that ended up inside code fences)
+                if language not in ("python", "javascript"):
+                    prose_stripped = self._strip_llm_prose(extracted)
+                    if prose_stripped:
+                        extracted = prose_stripped
+
                 # Clean LLM artifacts
                 cleaned = self._clean_llm_artifacts(extracted)
 
                 # Sanitize SDK patterns (C/C++ only) — skip struct stripping for strat_2
                 if language not in ("python", "javascript"):
-                    cleaned = self._sanitize_mutation_output(cleaned, allow_structs=_is_strat_2)
+                    cleaned = self._sanitize_mutation_output(cleaned, allow_structs=_is_strat_all)
 
                 # Fix LLM renaming APIs/functions with _funcname suffix (e.g. RegOpenKeyEx_getActivationKey -> RegOpenKeyEx)
-                # Skip for strat_2: state functions intentionally use _funcname suffix (_s0_getActivationKey)
-                if language not in ("python", "javascript") and func_name and not _is_strat_2:
+                if language not in ("python", "javascript") and func_name:
                     _suffix = f"_{func_name}"
                     if _suffix in cleaned:
                         cleaned = cleaned.replace(_suffix, "")
@@ -834,6 +964,11 @@ class MutationAgent(BaseAgent):
     @staticmethod
     def _extract_code(response: str, language: str) -> str | None:
         """Extract code from LLM response (handles markdown fences)."""
+        # Strip reasoning model <think>...</think> blocks first
+        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+        if '<think>' in response:
+            response = re.sub(r'<think>.*', '', response, flags=re.DOTALL).strip()
+
         # Try markdown code blocks first
         blocks = re.findall(r'```(?:\w*)\n(.*?)```', response, re.DOTALL)
         if blocks:
@@ -857,13 +992,11 @@ class MutationAgent(BaseAgent):
         else:
             # C/C++: strip LLM preamble/postamble text that isn't code
             if "{" in stripped:
-                if "}" in stripped:
-                    cleaned = MutationAgent._strip_llm_prose(stripped)
-                    if cleaned:
-                        return cleaned
-                    return stripped
-                # Truncated code (missing }) — return raw so brace autorepair can handle
-                return stripped
+                cleaned = MutationAgent._strip_llm_prose(stripped)
+                if cleaned:
+                    return cleaned
+                # _strip_llm_prose failed — do NOT return raw text with prose
+                return None
 
         return None
 
@@ -873,6 +1006,7 @@ class MutationAgent(BaseAgent):
 
         Removes leading explanation text before the first C declaration
         and trailing explanation text after the last closing brace.
+        Also filters out interleaved English prose lines within code.
         """
         lines = text.split("\n")
 
@@ -889,8 +1023,22 @@ class MutationAgent(BaseAgent):
             re.IGNORECASE,
         )
 
+        # Detect lines that are clearly English prose (not code)
+        _PROSE_LINE = re.compile(
+            r'^\s*(However|But\s|Note\s|Let\'s|Let us|Now,?\s|Since\s|Wait|Remember|'
+            r'The\s|This\s|Here\s|We\s|We\'ll|We\'ve|I\s|So\s|Also|Therefore|'
+            r'First|Second|Third|Finally|Actually|Basically|'
+            r'How\s|Alternatively|Original\w*|In\s+(state|this|the)\s|Then\s|'
+            r'State\s+\d+:|Step\s+\d+:|'
+            r'\d+\.\s+[A-Z]|'
+            r'And\s+(since|the|we|if|because)\s|Given\s+\w+|Moreover|Furthermore|'
+            r'Ensure\s+that|Consider\s+that|Reasoning:|Explanation:|'
+            r'-\s+[a-z]+\s+(is|are|was|were|has|have|can|should|would|will)\s)',
+            re.IGNORECASE,
+        )
+
         # Find the first line that looks like C code
-        start_idx = 0
+        start_idx = None
         for i, line in enumerate(lines):
             ls = line.strip()
             if not ls:
@@ -903,14 +1051,45 @@ class MutationAgent(BaseAgent):
                 start_idx = i + 1  # skip the language label
                 continue
 
-        # Find the last closing brace
-        end_idx = len(lines) - 1
-        for i in range(len(lines) - 1, -1, -1):
-            if "}" in lines[i]:
-                end_idx = i
-                break
+        # No recognizable code start found
+        if start_idx is None:
+            return None
 
-        result = "\n".join(lines[start_idx:end_idx + 1]).strip()
+        # Smarter end detection: stop at first run of 3+ consecutive non-code
+        # lines (reasoning block) instead of scanning to last '}' in the file.
+        def _is_code_ish(ln: str) -> bool:
+            s = ln.strip()
+            if not s:
+                return False
+            if any(c in s for c in (';', '{', '}')):
+                return True
+            if s.startswith('#') or s.startswith('//') or s.startswith('/*') or s.startswith('*'):
+                return True
+            if _CODE_START.match(s):
+                return True
+            return False
+
+        last_code_idx = start_idx
+        noncode_streak = 0
+        for i in range(start_idx, len(lines)):
+            if _is_code_ish(lines[i]):
+                last_code_idx = i
+                noncode_streak = 0
+            else:
+                noncode_streak += 1
+            if noncode_streak >= 3:
+                break
+        end_idx = last_code_idx
+
+        # Filter out prose lines interleaved within code
+        code_lines = []
+        for line in lines[start_idx:end_idx + 1]:
+            ls = line.strip()
+            if ls and _PROSE_LINE.match(ls) and '{' not in ls and '}' not in ls and ';' not in ls:
+                continue  # skip prose line
+            code_lines.append(line)
+
+        result = "\n".join(code_lines).strip()
         if "{" in result and "}" in result:
             return result
         return None
@@ -1008,9 +1187,9 @@ class MutationAgent(BaseAgent):
             if re.search(rf'\b{name}\b', code) and not re.search(rf'\b{name}\b', original):
                 renames.append((name, f'{name}{sfx}'))
 
-        # Generic helper function names: _step0, _step1, _proc0, _helper0 …
+        # Generic helper function names: _step0, _sub0, _proc0, _helper0 …
         seen: set[str] = set()
-        for m in re.finditer(r'\b(_(?:step|proc|helper)\d+)\b', code):
+        for m in re.finditer(r'\b(_(?:step|proc|helper|sub)\d+)\b', code):
             n = m.group(1)
             if n not in seen and not re.search(rf'\b{re.escape(n)}\b', original):
                 renames.append((n, f'{n}{sfx}'))
@@ -1045,7 +1224,7 @@ class MutationAgent(BaseAgent):
         # Gate 1: Size ratio (relaxed)
         if orig_len > 50:  # Lower threshold
             ratio = mut_len / orig_len
-            # strat_2 (state-machine dispatch) naturally produces 10-30x expansion for small functions
+            # strat_2 (dead code/CFG) and strat_4 (algorithm replacement) can produce moderate expansion
             max_ratio = 30.0 if ratio > 10.0 and mut_len < 3000 else 10.0
             if ratio < 0.20 or ratio > max_ratio:
                 logger.warning("validation_gate1_size_ratio", name=func_name,
@@ -1094,6 +1273,29 @@ class MutationAgent(BaseAgent):
             _doubled = f"{func_name}_{func_name}"
             if _doubled in mutated_body:
                 logger.warning("validation_gate3b_func_renamed", name=func_name, doubled=_doubled)
+                return False
+
+            # Gate 3c: Scope depth check — reject statements at file scope
+            # (catches error-handling code placed outside function body)
+            depth = 0
+            for ch in mutated_body:
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                elif ch == ';' and depth == 0:
+                    logger.warning("validation_gate3c_file_scope_stmt",
+                                   name=func_name)
+                    return False
+
+            # Gate 3d: Comment balance check — unclosed /* engulfs closing } and #endif
+            _open_comments = len(re.findall(r'/\*', mutated_body))
+            _close_comments = len(re.findall(r'\*/', mutated_body))
+            if _open_comments != _close_comments:
+                logger.warning("validation_gate3d_comment_imbalance",
+                               name=func_name,
+                               open_comments=_open_comments,
+                               close_comments=_close_comments)
                 return False
 
         return True

@@ -125,6 +125,10 @@ class MistralAPIProvider(LLMProvider):
             if "choices" not in result or not result["choices"]:
                 raise LLMAPIRequestError("Invalid response format from Mistral API")
             content = result["choices"][0]["message"]["content"]
+            # Strip reasoning model <think>...</think> blocks
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+            if '<think>' in content:
+                content = re.sub(r'<think>.*', '', content, flags=re.DOTALL).strip()
             elapsed = time.time() - start_time
             logger.info(
                 f"Mistral API call successful. Model: {model}, Time: {elapsed:.2f}s, "
@@ -213,6 +217,10 @@ class DeepSeekProvider(LLMProvider):
             if "choices" not in result or not result["choices"]:
                 raise LLMAPIRequestError("Invalid response format from DeepSeek API")
             content = result["choices"][0]["message"]["content"]
+            # Strip reasoning model <think>...</think> blocks
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+            if '<think>' in content:
+                content = re.sub(r'<think>.*', '', content, flags=re.DOTALL).strip()
             elapsed = time.time() - start_time
             logger.info(
                 f"DeepSeek API call successful. Model: {model}, Time: {elapsed:.2f}s, "
@@ -294,6 +302,8 @@ class OllamaProvider(LLMProvider):
             )
             elapsed = time.time() - start
             content = re.sub(r'<think>.*?</think>', '', resp["message"]["content"], flags=re.DOTALL).strip()
+            if '<think>' in content:
+                content = re.sub(r'<think>.*', '', content, flags=re.DOTALL).strip()
             logger.info(f"Ollama call successful. Model: {model}, Time: {elapsed:.2f}s")
             return content
         except Exception as e:
@@ -385,6 +395,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise LLMAPIRequestError("Invalid response from OpenAI-compatible API")
             msg = result["choices"][0]["message"]
             content = re.sub(r'<think>.*?</think>', '', msg.get("content") or "", flags=re.DOTALL).strip()
+            if '<think>' in content:
+                content = re.sub(r'<think>.*', '', content, flags=re.DOTALL).strip()
             # Ollama reasoning models return chain-of-thought in "reasoning" field
             if not content and msg.get("reasoning"):
                 content = msg["reasoning"].strip()

@@ -202,7 +202,12 @@ class BuildValidationAgent(BaseAgent):
             
             # Setup compilation parameters
             # Use x86 for malware samples (most use 32-bit inline assembly)
-            compiler = ProjectCompiler(compiler="auto", msvc_arch="x86")
+            # Smart compiler selection: analyze source to pick MSVC vs GCC
+            if project_language in ('c', 'cpp'):
+                best_compiler = ProjectCompiler.analyze_best_compiler(project_obj)
+            else:
+                best_compiler = 'auto'
+            compiler = ProjectCompiler(compiler=best_compiler, msvc_arch="x86")
             output_dir = str(Path(self._ctx.work_dir) / f"build_{job_id[:8]}")
             output_name = f"{project_obj.name}_{job_id[:8]}"
 
@@ -235,6 +240,7 @@ class BuildValidationAgent(BaseAgent):
                 )
                 compilation_time_s = loop.time() - t0
                 auto_fix_attempts = fix_stats.get("total_attempts", 0)
+                fix_stats["compilation_time_s"] = round(compilation_time_s, 3)
 
             # ── 4. Emit result event ──────────────────────────────────────────
             if compile_result and compile_result.success:
@@ -285,6 +291,7 @@ class BuildValidationAgent(BaseAgent):
                     _state = await self._ctx.state_store.get(job_id)
                     if _state:
                         _state.compiled_artifact_id = artifact_id
+                        _state.fix_stats = fix_stats
                         # Also compile the original (unmodified) binary for equivalence checking
                         original_source = source_payload.get("source_path", "")
                         if original_source and os.path.exists(original_source):
@@ -311,6 +318,13 @@ class BuildValidationAgent(BaseAgent):
                 error_category = self._categorize_build_error(error_msg)
                 detailed_error = self._format_detailed_error(error_msg, fix_stats, error_category)
                 
+                # Persist fix_stats to state before emitting failure
+                if self._ctx.state_store:
+                    _state = await self._ctx.state_store.get(job_id)
+                    if _state:
+                        _state.fix_stats = fix_stats
+                        await self._ctx.state_store.save(_state)
+
                 event = BuildFailedEvent(
                     job_id=job_id,
                     sample_id=sample_id,
@@ -581,7 +595,11 @@ class BuildValidationAgent(BaseAgent):
             "fix_loop_detected": False,
             "rollback_triggered": False,
             "error_categories": [],
+            "initial_error_count": 0,
+            "final_error_count": 0,
         }
+
+        last_result = None  # Track last compile result for error counts
 
         # If source scan detected x86 inline asm, rebuild compiler as x86
         if getattr(project, '_requires_x86', False):
@@ -602,9 +620,13 @@ class BuildValidationAgent(BaseAgent):
             )
             fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
             fix_stats["standard_attempts"] += getattr(result, "auto_fix_attempts", 0)
+            last_result = result
+            if fix_stats["initial_error_count"] == 0 and result and result.errors:
+                fix_stats["initial_error_count"] = result.errors.count("error")
             
             if result and result.success:
                 log.info("compile_success_standard")
+                fix_stats["final_error_count"] = 0
                 return result, fix_stats
                 
         except Exception as e:
@@ -627,9 +649,11 @@ class BuildValidationAgent(BaseAgent):
                 )
                 fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
                 fix_stats["permissive_attempts"] += getattr(result, "auto_fix_attempts", 0)
+                last_result = result
                 
                 if result and result.success:
                     log.info("compile_success_permissive", attempt=perm_attempt + 1)
+                    fix_stats["final_error_count"] = 0
                     return result, fix_stats
                     
             except Exception as e:
@@ -656,9 +680,11 @@ class BuildValidationAgent(BaseAgent):
             )
             fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
             fix_stats["surgical_attempts"] += getattr(result, "auto_fix_attempts", 0)
+            last_result = result
             
             if result and result.success:
                 log.info("compile_success_surgical_rag")
+                fix_stats["final_error_count"] = 0
                 return result, fix_stats
                     
         except Exception as e:
@@ -666,6 +692,8 @@ class BuildValidationAgent(BaseAgent):
             fix_stats["error_categories"].append("exception_surgical")
 
         # Final attempt: Return last result or None
+        if last_result and last_result.errors:
+            fix_stats["final_error_count"] = last_result.errors.count("error")
         log.warning("compile_failed_all_tiers", fix_stats=fix_stats)
         return None, fix_stats
 

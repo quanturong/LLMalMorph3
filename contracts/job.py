@@ -161,6 +161,9 @@ class JobState(BaseModel):
     original_analysis_result_id: Optional[str] = None  # Original sample analysis
     comparison_result_id: Optional[str] = None     # Comparison analysis result
 
+    # Build fix statistics (populated by BuildValidationAgent)
+    fix_stats: Optional[Dict[str, Any]] = None
+
     # Error history
     error_history: List[ErrorRecord] = Field(default_factory=list)
 

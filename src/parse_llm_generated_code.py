@@ -108,7 +108,18 @@ def parse_json_from_llm_response(llm_response, language):
     
     return result_json_object
 
+def _strip_think_tags(text: str) -> str:
+    """Strip <think>...</think> reasoning blocks from LLM responses (e.g. qwen3)."""
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    # Handle unclosed <think> (model ran out of tokens mid-reasoning)
+    if '<think>' in text:
+        text = re.sub(r'<think>.*', '', text, flags=re.DOTALL).strip()
+    return text
+
 def parse_code_any_format(llm_response, language, source_code_response_format='backticks'):
+    
+    # Strip reasoning/thinking blocks before code extraction
+    llm_response = _strip_think_tags(llm_response)
     
     code = None
     mapping_information = None
@@ -183,6 +194,8 @@ def parse_code_any_format(llm_response, language, source_code_response_format='b
         
 
 def parse_code(llm_response, language):
+    # Strip reasoning/thinking blocks before code extraction
+    llm_response = _strip_think_tags(llm_response)
     # Extract all code blocks
     code_blocks = re.findall(r'```(.*?)```', llm_response, re.DOTALL)
     

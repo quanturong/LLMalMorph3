@@ -2842,6 +2842,27 @@ Please fix these issues. Return only the fixed code within code blocks.
             logger.error(f"Error fixing code issues: {e}")
             return source_code, False
     
+    @staticmethod
+    def _strip_prose_lines(code: str) -> str:
+        """Remove English prose lines interleaved within C/C++ code."""
+        _PROSE_LINE = re.compile(
+            r"^\s*(However|But\s|Note\s|Let's|Let us|Now,?\s|Since\s|Wait|Remember|"
+            r"The\s|This\s|Here\s|We\s|We'll|We've|I\s|So\s|Also|Therefore|"
+            r"First|Second|Third|Finally|Actually|Basically|"
+            r"How\s|Alternatively|Original\w*|In\s+(state|this|the)\s|Then\s|"
+            r"State\s+\d+:|Step\s+\d+:|"
+            r"\d+\.\s+[A-Z]|"
+            r"-\s+[a-z]+\s+(is|are|was|were|has|have|can|should|would|will)\s)",
+            re.IGNORECASE)
+        lines = code.split('\n')
+        cleaned = []
+        for line in lines:
+            ls = line.strip()
+            if ls and _PROSE_LINE.match(ls) and '{' not in ls and '}' not in ls and ';' not in ls:
+                continue
+            cleaned.append(line)
+        return '\n'.join(cleaned)
+
     def _extract_code_from_response(self, response: str, language: str) -> Optional[str]:
         """
         Extract code from LLM response.
@@ -2853,6 +2874,10 @@ Please fix these issues. Return only the fixed code within code blocks.
         Returns:
             Extracted code or None
         """
+        # Strip reasoning model <think>...</think> blocks
+        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+        if '<think>' in response:
+            response = re.sub(r'<think>.*', '', response, flags=re.DOTALL).strip()
         # Try to find code blocks
         patterns = [
             rf'```{language}\s*\n(.*?)```',
@@ -2865,15 +2890,85 @@ Please fix these issues. Return only the fixed code within code blocks.
             if matches:
                 code = matches[0].strip()
                 if code:
+                    # For C/C++, strip any prose lines that leaked inside code fences
+                    if language not in ('python', 'javascript') and '{' in code and '}' in code:
+                        code = self._strip_prose_lines(code)
                     return code
         
-        # If no code blocks, try to extract if response looks like code
-        lines = response.strip().split('\n')
-        if len(lines) > 5:  # Likely code if many lines
-            # Check if it looks like code (has brackets, semicolons, etc.)
-            code_indicators = ['{', '}', ';', '(', ')', '#include', 'def ', 'class ']
-            if any(indicator in response for indicator in code_indicators):
-                return response.strip()
+        # If no code blocks, try to extract code by stripping prose
+        stripped = response.strip()
+        if language in ('python', 'javascript'):
+            lines = stripped.split('\n')
+            if len(lines) > 5:
+                code_indicators = ['def ', 'class ', 'import ', 'from '] if language == 'python' else ['function ', '=>', '{', 'const ', 'let ', 'var ']
+                if any(indicator in stripped for indicator in code_indicators):
+                    return stripped
+        else:
+            # C/C++: strip leading/trailing prose, keep only code
+            if '{' in stripped and '}' in stripped:
+                lines = stripped.split('\n')
+                _CODE_START = re.compile(
+                    r'^\s*('
+                    r'(static\s+|const\s+|unsigned\s+|signed\s+|extern\s+|inline\s+|volatile\s+)*'
+                    r'(void|int|char|short|long|float|double|BOOL|DWORD|HANDLE|HMODULE|'
+                    r'ULONG_PTR|ULONG|LONG|LPSTR|LPCSTR|LPVOID|PVOID|SIZE_T|HRESULT|'
+                    r'BYTE|WORD|UINT|LPCTSTR|LPTSTR|TCHAR|WCHAR|SOCKET|HINTERNET|'
+                    r'FARPROC|HKEY|LPBYTE|LPDWORD|NTSTATUS|LPWSTR|LPCWSTR|PCHAR|'
+                    r'struct\s+\w+|enum\s+\w+|typedef\s+|#define\s+|#include\s+|#if|#pragma)'
+                    r')', re.IGNORECASE)
+                _PROSE_LINE = re.compile(
+                    r'^\s*(However|But\s|Note\s|Let\'s|Since\s|Wait|Remember|'
+                    r'The\s|This\s|Here\s|We\s|I\s|So\s|Also|Therefore|'
+                    r'First|Second|Third|Finally|Actually|Basically|'
+                    r'How\s|Alternatively|Original\w*\s|In\s+(state|this|the)\s|Then\s|'
+                    r'Now,?\s|Let us|We\'ll|We\'ve|'
+                    r'State\s+\d+:|Step\s+\d+:|'
+                    r'\d+\.\s+[A-Z])', re.IGNORECASE)
+                # Find code start
+                start_idx = None
+                for i, line in enumerate(lines):
+                    ls = line.strip()
+                    if not ls:
+                        continue
+                    if _CODE_START.match(ls) or ls.startswith('{') or (ls.startswith('//') and i > 0):
+                        start_idx = i
+                        break
+                if start_idx is None:
+                    return None
+                # Smarter end detection: stop at first run of 3+ consecutive
+                # non-code lines instead of scanning to last '}'.
+                def _is_code_ish(ln):
+                    s = ln.strip()
+                    if not s:
+                        return False
+                    if any(c in s for c in (';', '{', '}')):
+                        return True
+                    if s.startswith('#') or s.startswith('//') or s.startswith('/*') or s.startswith('*'):
+                        return True
+                    if _CODE_START.match(s):
+                        return True
+                    return False
+                last_code_idx = start_idx
+                noncode_streak = 0
+                for i in range(start_idx, len(lines)):
+                    if _is_code_ish(lines[i]):
+                        last_code_idx = i
+                        noncode_streak = 0
+                    else:
+                        noncode_streak += 1
+                    if noncode_streak >= 3:
+                        break
+                end_idx = last_code_idx
+                # Filter prose lines within code
+                code_lines = []
+                for line in lines[start_idx:end_idx + 1]:
+                    ls = line.strip()
+                    if ls and _PROSE_LINE.match(ls) and '{' not in ls and '}' not in ls and ';' not in ls:
+                        continue
+                    code_lines.append(line)
+                result = '\n'.join(code_lines).strip()
+                if '{' in result and '}' in result:
+                    return result
         
         return None
     

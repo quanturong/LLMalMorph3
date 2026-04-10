@@ -555,6 +555,24 @@ class VirusTotalApiClient:
                 self._url(f'/api/v3/analyses/{task_id}'),
                 timeout=self.timeout
             )
+            if r.status_code == 404:
+                # VT analysis IDs expire once analysis completes.
+                # Fall back to checking /files/{hash} using the hash encoded in task_id.
+                # task_id is base64("{hash}:{timestamp}") where hash is MD5 or SHA256.
+                import base64
+                try:
+                    decoded = base64.b64decode(task_id).decode('utf-8', errors='replace')
+                    file_hash = decoded.split(':')[0]
+                    if file_hash:
+                        fr = self.session.get(
+                            self._url(f'/api/v3/files/{file_hash}'),
+                            timeout=self.timeout
+                        )
+                        if fr.status_code == 200:
+                            return 'completed'
+                except Exception:
+                    pass
+                return 'unknown'
             if r.status_code != 200:
                 return 'unknown'
             status = r.json().get('data', {}).get('attributes', {}).get('status', 'unknown')
@@ -573,6 +591,23 @@ class VirusTotalApiClient:
                 self._url(f'/api/v3/analyses/{task_id}'),
                 timeout=self.timeout
             )
+            if analysis_resp.status_code == 404:
+                # Analysis completed and ID expired — recover via /files/{hash}
+                import base64
+                try:
+                    decoded = base64.b64decode(task_id).decode('utf-8', errors='replace')
+                    file_hash = decoded.split(':')[0]
+                    if file_hash:
+                        file_resp = self.session.get(
+                            self._url(f'/api/v3/files/{file_hash}'),
+                            timeout=self.timeout
+                        )
+                        if file_resp.status_code == 200:
+                            return {'analysis': None, 'file': file_resp.json()}
+                except Exception:
+                    pass
+                logger.error(f"VT analysis fetch failed (404) and fallback also failed")
+                return None
             if analysis_resp.status_code != 200:
                 logger.error(f"VT analysis fetch failed ({analysis_resp.status_code})")
                 return None

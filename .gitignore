@@ -53,7 +53,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
-
+*.md
 # Output directories
 samples/
 output/
@@ -64,7 +64,7 @@ reports/
 llm_logs/
 configs/generated_batches/
 configs/generated_patches/
-
+configs/
 # Pipeline output logs (archived in _old_pipeline_logs/)
 pipeline_*_output.txt
 

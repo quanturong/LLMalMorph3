@@ -137,6 +137,9 @@ class VariantGenerationAgent(BaseAgent):
                 modified_code = original_code
 
             rel_path = os.path.relpath(sf, project_root) if project_root else os.path.basename(sf)
+            # Add include guards to .h files to prevent double-inclusion
+            if language in ("c", "cpp", "c++") and rel_path.endswith('.h'):
+                modified_code = self._add_include_guard(modified_code, rel_path)
             variant_files[rel_path] = modified_code
             files_generated += 1
 
@@ -146,6 +149,9 @@ class VariantGenerationAgent(BaseAgent):
                 with open(hf, 'r', encoding='utf-8', errors='ignore') as f:
                     header_content = f.read()
                 rel_path = os.path.relpath(hf, project_root) if project_root else os.path.basename(hf)
+                # Add include guards to .h files to prevent double-inclusion
+                if language in ("c", "cpp", "c++") and rel_path.endswith('.h'):
+                    header_content = self._add_include_guard(header_content, rel_path)
                 variant_files[rel_path] = header_content
                 files_generated += 1
             except (FileNotFoundError, OSError) as e:
@@ -292,6 +298,15 @@ class VariantGenerationAgent(BaseAgent):
             modified_code = inject_block + modified_code
 
         return modified_code
+
+    @staticmethod
+    def _add_include_guard(code: str, rel_path: str) -> str:
+        """Wrap a .h file with an include guard if one is not already present."""
+        stripped = code.lstrip()
+        if stripped.startswith('#ifndef ') or stripped.startswith('#pragma once'):
+            return code  # already has a guard
+        guard = re.sub(r'[^A-Za-z0-9]', '_', rel_path).upper() + '_'
+        return f"#ifndef {guard}\n#define {guard}\n\n{code}\n\n#endif /* {guard} */\n"
 
     @staticmethod
     def _deduplicate_c_helpers(code: str) -> str:
