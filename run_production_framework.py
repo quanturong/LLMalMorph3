@@ -268,10 +268,19 @@ def _export_llm_env_vars(cfg: dict[str, Any]) -> None:
     if cloud_base_url and cloud_provider in ("runpod", "openai_compatible"):
         os.environ["CLOUD_URL"] = cloud_base_url
 
-    # Export the cloud model name so the auto-fixer uses the correct model on RunPod
+    # Export the cloud model name so the auto-fixer uses the correct model
     cloud_model = llm_cfg.get("cloud_model", "")
-    if cloud_model and cloud_provider in ("runpod", "openai_compatible"):
-        os.environ["FIXER_MODEL"] = cloud_model
+    if cloud_model:
+        os.environ["LLM_CLOUD_MODEL"] = cloud_model
+        os.environ["CLOUD_MODEL"] = cloud_model
+    fixer_model = llm_cfg.get("fixer_model", "") or cloud_model
+    if fixer_model and cloud_provider in ("runpod", "openai_compatible"):
+        os.environ["FIXER_MODEL"] = fixer_model
+    # DeepSeek: export FIXER_MODEL so src/llm_api.py auto-fixer routes to DeepSeek
+    if fixer_model and cloud_provider == "deepseek":
+        os.environ["FIXER_MODEL"] = fixer_model
+        if not os.environ.get("DEEPSEEK_API_KEY") and llm_cfg.get("api_key"):
+            os.environ["DEEPSEEK_API_KEY"] = llm_cfg["api_key"]
 
     # Parallel race: export extra cloud URLs for RaceLLMProvider
     extra_urls = llm_cfg.get("cloud_extra_urls", [])
@@ -297,11 +306,25 @@ async def run_production(config_path: Path, dry_run: bool = False) -> int:
     # (AutoFixer / project_compiler) can route to RunPod without extra config.
     _export_llm_env_vars(cfg)
 
+    # Augmented vs Non-Augmented mode: controls Fix History RAG, Clang AST, project context
+    _augmented = cfg.get("mutation", {}).get("augmented_fix", True)
+    os.environ["AUGMENTED_FIX"] = "1" if _augmented else "0"
+    decision_cfg = cfg.get("decision", {})
+    if "disable_high_score_escalation" in decision_cfg:
+        os.environ["DECISION_DISABLE_HIGH_SCORE_ESCALATION"] = (
+            "1" if decision_cfg.get("disable_high_score_escalation") else "0"
+        )
+    if "escalation_score_threshold" in decision_cfg:
+        os.environ["DECISION_ESCALATION_SCORE_THRESHOLD"] = str(
+            decision_cfg.get("escalation_score_threshold")
+        )
+
     _filtered_print(bool(cfg["runtime"].get("quiet_console", True)))
     configure_logging(level=cfg["logging"]["level"])
 
     cape_url = os.getenv("CAPE_BASE_URL", cfg.get("sandbox", {}).get("cape_base_url", "http://192.168.1.12:8000"))
     cape_token = os.getenv("CAPE_API_TOKEN", cfg.get("sandbox", {}).get("cape_api_token", ""))
+    cape_basic_auth = os.getenv("CAPE_BASIC_AUTH", cfg.get("sandbox", {}).get("cape_basic_auth", ""))
     vt_api_key = os.getenv("VIRUSTOTAL_API_KEY", cfg.get("sandbox", {}).get("virustotal_api_key", ""))
     vt_api_url = cfg.get("sandbox", {}).get("virustotal_api_url", "https://www.virustotal.com")
 
@@ -321,7 +344,7 @@ async def run_production(config_path: Path, dry_run: bool = False) -> int:
         encryption_key=cfg["storage"].get("encryption_key") or os.environ.get("ARTIFACT_ENCRYPTION_KEY"),
     )
     report_store = ReportStore(db_path=cfg["storage"]["db_path"], reports_dir=cfg["storage"]["report_dir"])
-    cape = CapeAdapter(api_url=cape_url, api_token=cape_token)
+    cape = CapeAdapter(api_url=cape_url, api_token=cape_token, http_basic_auth=cape_basic_auth)
     vt = VirusTotalAdapter(api_key=vt_api_key, api_url=vt_api_url) if vt_api_key else None
 
     # Build agent registry for distributed coordination
@@ -348,12 +371,18 @@ async def run_production(config_path: Path, dry_run: bool = False) -> int:
         SamplePrepAgent(ctx),
         MutationAgent(ctx),
         VariantGenerationAgent(ctx),
-        BuildValidationAgent(ctx),
-        SandboxSubmitAgent(ctx, cape_adapter=cape, vt_adapter=vt),
+        BuildValidationAgent(
+            ctx,
+            fixer_model=cfg.get("llm", {}).get("fixer_model")
+            or cfg.get("llm", {}).get("cloud_model")
+            or "",
+        ),
+        SandboxSubmitAgent(ctx, cape_adapter=cape, vt_adapter=vt,
+                           cape_analysis_time_s=int(cfg["runtime"].get("cape_analysis_time_s", 120))),
         ExecMonitorAgent(ctx, cape_adapter=cape, vt_adapter=vt, timeout_s=int(cfg["runtime"]["sandbox_timeout_s"])),
         BehaviorAnalysisAgent(ctx),
         DecisionAgent(ctx),
-        ReportingAgent(ctx),
+        ReportingAgent(ctx, vt_adapter=vt),
     ]
     tasks = [asyncio.create_task(a.start()) for a in agents]
 
@@ -371,9 +400,15 @@ async def run_production(config_path: Path, dry_run: bool = False) -> int:
             priority=int(sample.get("priority", 5)),
             requested_strategies=sample.get("requested_strategies",
                                             [mutation_cfg.get("default_strategy", "strat_1")]),
+            strategy_mode=sample.get("strategy_mode",
+                                     mutation_cfg.get("strategy_mode", "single")),
+            max_generations=int(sample.get("max_generations",
+                                           mutation_cfg.get("max_generations", 1))),
             num_functions=int(sample.get("num_functions",
                                         mutation_cfg.get("num_functions_per_project", 3))),
             target_functions=sample.get("target_functions", []),
+            llm_retry_attempts=int(sample.get("retry_attempts",
+                                               mutation_cfg.get("retry_attempts", 5))),
             metadata=sample.get("metadata", {}),
         )
         envelopes.append((sample["sample_id"], envelope))

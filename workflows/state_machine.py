@@ -125,9 +125,11 @@ VALID_TRANSITIONS: Dict[JobStatus, FrozenSet[JobStatus]] = {
         JobStatus.REPORT_READY,
         JobStatus.RETRY_PENDING,
         JobStatus.FAILED,
+        JobStatus.ESCALATED,       # action=escalate_to_analyst (ReportingAgent handles in production)
     }),
     JobStatus.REPORT_READY: frozenset({
         JobStatus.CLOSED,
+        JobStatus.MUTATING,            # multi-generation evolution: re-enter mutation pipeline
     }),
     JobStatus.RETRY_PENDING: frozenset({
         # Re-entry points after a delay

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import shutil
 from pathlib import Path
@@ -133,6 +134,7 @@ class VariantGenerationAgent(BaseAgent):
                 modified_code = self._ensure_includes_preserved(original_code, modified_code)
                 if language in ("c", "cpp", "c++"):
                     modified_code = self._deduplicate_c_helpers(modified_code)
+                    modified_code = self._reorder_functions(modified_code)
             else:
                 modified_code = original_code
 
@@ -388,3 +390,148 @@ class VariantGenerationAgent(BaseAgent):
             result.append(line)
             i += 1
         return '\n'.join(result)
+
+    @staticmethod
+    def _reorder_functions(code: str) -> str:
+        """Shuffle the order of top-level function definitions in C/C++ source.
+
+        Keeps #include / #define / typedef / struct / global-variable blocks in
+        place at the top.  Only reorders function definitions (detected by
+        brace-balanced blocks starting with a return-type + name pattern).
+        Forward declarations are added for reordered functions so the file
+        still compiles.
+
+        Entry-point functions (main, WinMain, DllMain, wmain, _tmain,
+        wWinMain, WinMainCRTStartup) are always placed LAST.
+        """
+        # Split code into "preamble" (includes, globals, typedefs, structs)
+        # and "function blocks"
+        lines = code.split('\n')
+        preamble_lines: list[str] = []
+        func_blocks: list[tuple[str, list[str]]] = []   # (func_name, lines)
+        current_func_lines: list[str] = []
+        current_func_name = ""
+        brace_depth = 0
+        in_function = False
+
+        _ENTRY_POINTS = frozenset({
+            "main", "wmain", "_tmain", "WinMain", "wWinMain",
+            "DllMain", "WinMainCRTStartup", "DllEntryPoint",
+        })
+
+        # Regex for function definition start (simplified, C/C++ only)
+        _FUNC_DEF_RE = re.compile(
+            r'^(?:static\s+|inline\s+|extern\s+|__declspec\([^)]*\)\s+)*'
+            r'(?:(?:unsigned|signed|long|short|const|volatile|struct|enum)\s+)*'
+            r'\w[\w*\s]*\s+(\w+)\s*\([^;]*$'
+        )
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            if not in_function:
+                # Check if this line starts a function definition
+                m = _FUNC_DEF_RE.match(stripped)
+                if m and '{' not in stripped[:stripped.find('(')] if '(' in stripped else False:
+                    # Could be function def – look for opening brace
+                    pass  # fall through to brace check below
+
+                if m and not stripped.endswith(';'):
+                    # Potential function definition
+                    current_func_name = m.group(1)
+                    current_func_lines = [line]
+                    brace_depth = line.count('{') - line.count('}')
+                    if brace_depth > 0:
+                        in_function = True
+                    elif '{' not in line:
+                        # Signature spans multiple lines — look ahead for brace
+                        in_function = False
+                        j = i + 1
+                        while j < len(lines) and '{' not in lines[j]:
+                            current_func_lines.append(lines[j])
+                            if lines[j].strip().endswith(';'):
+                                # This was a declaration, not definition
+                                break
+                            j += 1
+                        if j < len(lines) and '{' in lines[j]:
+                            current_func_lines.append(lines[j])
+                            brace_depth = sum(l.count('{') - l.count('}') for l in current_func_lines)
+                            in_function = brace_depth > 0
+                            i = j
+                    if not in_function and brace_depth == 0 and current_func_lines:
+                        # Complete single-line or declaration
+                        if any('{' in l for l in current_func_lines):
+                            func_blocks.append((current_func_name, current_func_lines))
+                        else:
+                            preamble_lines.extend(current_func_lines)
+                        current_func_lines = []
+                        current_func_name = ""
+                else:
+                    preamble_lines.append(line)
+            else:
+                current_func_lines.append(line)
+                brace_depth += line.count('{') - line.count('}')
+                if brace_depth <= 0:
+                    func_blocks.append((current_func_name, current_func_lines))
+                    current_func_lines = []
+                    current_func_name = ""
+                    in_function = False
+
+            i += 1
+
+        # Flush any remaining function block
+        if current_func_lines:
+            if current_func_name:
+                func_blocks.append((current_func_name, current_func_lines))
+            else:
+                preamble_lines.extend(current_func_lines)
+
+        # Only reorder if there are 3+ functions (otherwise not worth it)
+        if len(func_blocks) < 3:
+            return code
+
+        # Separate entry points from regular functions
+        entry_funcs = [(n, ls) for n, ls in func_blocks if n in _ENTRY_POINTS]
+        regular_funcs = [(n, ls) for n, ls in func_blocks if n not in _ENTRY_POINTS]
+
+        # Shuffle regular functions
+        random.shuffle(regular_funcs)
+
+        # Build forward declarations for all reordered functions
+        forward_decls: list[str] = []
+        for func_name, func_lines in regular_funcs + entry_funcs:
+            # Extract signature from first line(s)
+            sig_lines = []
+            for fl in func_lines:
+                # Strip inline // comments before joining — otherwise they cut off
+                # remaining parameters when the signature is squished to one line.
+                stripped_line = fl.strip()
+                comment_pos = stripped_line.find('//')
+                if comment_pos >= 0:
+                    stripped_line = stripped_line[:comment_pos].strip()
+                if stripped_line:
+                    sig_lines.append(stripped_line)
+                if '{' in fl:
+                    break
+            sig = ' '.join(sig_lines)
+            # Remove everything from { onwards
+            brace_pos = sig.find('{')
+            if brace_pos >= 0:
+                sig = sig[:brace_pos].strip()
+            if sig and not sig.endswith(';'):
+                forward_decls.append(sig + ';')
+
+        # Reassemble: preamble + forward declarations + shuffled functions + entry points
+        result_parts = ['\n'.join(preamble_lines)]
+        if forward_decls:
+            result_parts.append('\n/* Forward declarations (auto-generated for function reordering) */')
+            result_parts.append('\n'.join(forward_decls))
+            result_parts.append('')
+        for _, func_lines in regular_funcs:
+            result_parts.append('\n'.join(func_lines))
+        for _, func_lines in entry_funcs:
+            result_parts.append('\n'.join(func_lines))
+
+        return '\n'.join(result_parts)

@@ -336,9 +336,15 @@ class OpenAICompatibleProvider(LLMProvider):
         self,
         base_url: str,
         api_key: str = "ollama",
-        model: str = "qwen2.5:32b",
+        model: str = "qwen3-coder:30b",
         timeout: int = 300,
     ):
+        env_timeout = os.getenv("LLM_REQUEST_TIMEOUT_S") or os.getenv("AUTOFIX_LLM_TIMEOUT_S")
+        if env_timeout:
+            try:
+                timeout = int(env_timeout)
+            except ValueError:
+                logger.warning("Ignoring invalid LLM timeout override: %r", env_timeout)
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -355,6 +361,7 @@ class OpenAICompatibleProvider(LLMProvider):
         top_p: float = 0.9,
         seed: Optional[int] = None,
         timeout: Optional[int] = None,
+        max_tokens: Optional[int] = None,
         **kwargs,
     ) -> str:
         model = model or self.model
@@ -378,30 +385,65 @@ class OpenAICompatibleProvider(LLMProvider):
             ],
             "temperature": temperature,
             "top_p": top_p,
+            "stream": True,
         }
         if seed is not None:
             data["seed"] = seed
-        start = time.time()
+        if max_tokens is not None:
+            data["max_tokens"] = max_tokens
+        # Enable think mode for Qwen3 general models only (qwen3-coder does NOT support thinking)
+        if "qwen3" in model.lower() and "coder" not in model.lower():
+            data["think"] = True
+        start = time.monotonic()
+        deadline = start + max(1.0, float(timeout))
+        resp = None
         try:
+            import json as _json
             resp = requests.post(
                 f"{self.base_url}/chat/completions",
                 headers=headers,
                 json=data,
-                timeout=timeout,
+                timeout=(30, timeout),   # (connect_timeout, read_timeout)
+                stream=True,
             )
             resp.raise_for_status()
-            result = resp.json()
-            if "choices" not in result or not result["choices"]:
-                raise LLMAPIRequestError("Invalid response from OpenAI-compatible API")
-            msg = result["choices"][0]["message"]
-            content = re.sub(r'<think>.*?</think>', '', msg.get("content") or "", flags=re.DOTALL).strip()
+            content_chunks = []
+            stream_done = False
+            for line in resp.iter_lines(decode_unicode=True):
+                elapsed = time.monotonic() - start
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "OpenAI-compat stream total timeout. model=%s elapsed=%.1fs chunks=%d",
+                        model,
+                        elapsed,
+                        len(content_chunks),
+                    )
+                    raise LLMAPIRequestError(f"Request total timeout after {timeout}s")
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                if payload == "[DONE]":
+                    stream_done = True
+                    break
+                try:
+                    chunk = _json.loads(payload)
+                except (ValueError, _json.JSONDecodeError):
+                    continue
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                if delta.get("content"):
+                    content_chunks.append(delta["content"])
+            if not stream_done:
+                logger.warning(
+                    "OpenAI-compat stream ended without DONE. model=%s chunks=%d",
+                    model,
+                    len(content_chunks),
+                )
+            content = "".join(content_chunks)
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
             if '<think>' in content:
                 content = re.sub(r'<think>.*', '', content, flags=re.DOTALL).strip()
-            # Ollama reasoning models return chain-of-thought in "reasoning" field
-            if not content and msg.get("reasoning"):
-                content = msg["reasoning"].strip()
-            elapsed = time.time() - start
-            logger.info(f"OpenAI-compat call OK. model={model}, time={elapsed:.1f}s")
+            elapsed = time.monotonic() - start
+            logger.info(f"OpenAI-compat call OK (streamed). model={model}, time={elapsed:.1f}s")
             return content
         except requests.exceptions.Timeout:
             raise LLMAPIRequestError(f"Request timeout after {timeout}s")
@@ -411,6 +453,9 @@ class OpenAICompatibleProvider(LLMProvider):
             raise LLMAPIRequestError(f"HTTP {code}: {text}")
         except requests.exceptions.RequestException as e:
             raise LLMAPIRequestError(f"Request failed: {str(e)}")
+        finally:
+            if resp is not None:
+                resp.close()
 
     def generate_chat(self, messages: list, model: Optional[str] = None, **kwargs) -> str:
         system = ""
@@ -689,6 +734,9 @@ class HybridLLMProvider:
         file_size: int = 10000,
         error_count: int = 3,
         is_header: bool = False,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[int] = None,
     ) -> str:
         provider, reason = self.choose_provider(file_size, error_count, is_header)
         cloud_name = "DeepSeek" if isinstance(self.cloud_provider, DeepSeekProvider) else "Mistral"
@@ -700,13 +748,21 @@ class HybridLLMProvider:
         else:
             self.stats["cloud_calls"] += 1
 
+        _gen_kwargs: dict = dict(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model=model or (self.local_model if provider == self.local_provider else self.cloud_model),
+            seed=seed,
+        )
+        if temperature is not None:
+            _gen_kwargs["temperature"] = temperature
+        if max_tokens is not None:
+            _gen_kwargs["max_tokens"] = max_tokens
+        if timeout is not None:
+            _gen_kwargs["timeout"] = timeout
+
         try:
-            result = provider.generate(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                model=model or (self.local_model if provider == self.local_provider else self.cloud_model),
-                seed=seed,
-            )
+            result = provider.generate(**_gen_kwargs)
             if provider == self.local_provider:
                 self.stats["local_success"] += 1
                 self.stats["cost_saved"] += 0.08
@@ -739,13 +795,20 @@ class HybridLLMProvider:
             if provider == self.local_provider and self.has_cloud:
                 logger.info("Falling back to cloud provider...")
                 self.stats["cloud_calls"] += 1
+                _fb_kwargs: dict = dict(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    model=self.cloud_model,
+                    seed=seed,
+                )
+                if temperature is not None:
+                    _fb_kwargs["temperature"] = temperature
+                if max_tokens is not None:
+                    _fb_kwargs["max_tokens"] = max_tokens
+                if timeout is not None:
+                    _fb_kwargs["timeout"] = timeout
                 try:
-                    result = self.cloud_provider.generate(
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        model=self.cloud_model,
-                        seed=seed,
-                    )
+                    result = self.cloud_provider.generate(**_fb_kwargs)
                     self.stats["cloud_success"] += 1
                     return result
                 except Exception as e2:
@@ -756,13 +819,20 @@ class HybridLLMProvider:
                 logger.info("Cloud failed, falling back to local Ollama...")
                 self.stats["cloud_fallbacks"] += 1
                 self.stats["local_calls"] += 1
+                _fb_kwargs2: dict = dict(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    model=self.local_model,
+                    seed=seed,
+                )
+                if temperature is not None:
+                    _fb_kwargs2["temperature"] = temperature
+                if max_tokens is not None:
+                    _fb_kwargs2["max_tokens"] = max_tokens
+                if timeout is not None:
+                    _fb_kwargs2["timeout"] = timeout
                 try:
-                    result = self.local_provider.generate(
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        model=self.local_model,
-                        seed=seed,
-                    )
+                    result = self.local_provider.generate(**_fb_kwargs2)
                     self.stats["local_success"] += 1
                     self.stats["cost_saved"] += 0.08
                     return result
@@ -783,4 +853,7 @@ class HybridLLMProvider:
             file_size=len(joined),
             error_count=kwargs.get("error_count", 0),
             is_header=kwargs.get("is_header", False),
+            temperature=kwargs.get("temperature"),
+            max_tokens=kwargs.get("max_tokens"),
+            timeout=kwargs.get("timeout"),
         )

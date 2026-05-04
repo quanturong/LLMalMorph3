@@ -9,6 +9,21 @@ import re
 from typing import Dict, List, Optional, Tuple
 from llm_api import get_llm_provider, LLMAPIError
 try:
+    from .msvc_doc_fetcher import enrich_errors_with_msvc_docs, extract_error_codes_from_errors
+except (ImportError, SystemError):
+    try:
+        from msvc_doc_fetcher import enrich_errors_with_msvc_docs, extract_error_codes_from_errors
+    except ImportError:
+        enrich_errors_with_msvc_docs = None  # type: ignore
+        extract_error_codes_from_errors = None  # type: ignore
+try:
+    from .win32_signature_validator import validate_and_format as _w32_validate
+except (ImportError, SystemError):
+    try:
+        from win32_signature_validator import validate_and_format as _w32_validate
+    except ImportError:
+        _w32_validate = None  # type: ignore
+try:
     from .error_analyzer import (
         ErrorAnalyzer, ErrorType,
         detect_compiler_from_errors,
@@ -652,6 +667,14 @@ class AutoFixer:
                 continue
             line = lines[idx]
 
+            if re.search(
+                r'\*\s*\(\s*FARPROC\s*\*\s*\)\s*&\s*'
+                + re.escape(ident)
+                + r'\s*=\s*GetProcAddress\s*\(',
+                line,
+            ):
+                return 'FARPROC'
+
             # IDENT = KnownFunc(...)  →  return type of KnownFunc
             m = re.search(re.escape(ident) + r'\s*=\s*\(?\s*(\w+)\s*\)', line)
             if not m:
@@ -745,12 +768,305 @@ class AutoFixer:
         return func_brace_line
 
     @classmethod
+    def _remove_orphaned_duplicate_param_blocks(cls, source_code: str) -> Tuple[str, int]:
+        """Remove duplicated, orphaned parameter blocks using a linear scan.
+
+        The previous regex version could catastrophically backtrack on large C
+        files before the fixer ever reached the real compiler error.
+        """
+        raw_lines = source_code.splitlines(keepends=True)
+        out: List[str] = []
+        removed = 0
+        i = 0
+        real_decl_re = re.compile(r'^(?:typedef|static|extern|inline|WINAPI|__declspec)\b')
+
+        while i < len(raw_lines):
+            line = raw_lines[i]
+            out.append(line)
+            if line.strip() != ');':
+                i += 1
+                continue
+
+            j = i + 1
+            block: List[str] = []
+            removed_this = False
+            while j < len(raw_lines):
+                candidate = raw_lines[j]
+                stripped = candidate.strip()
+                if not stripped:
+                    break
+                if stripped == ');':
+                    has_real_decl = any(real_decl_re.match(ln.strip()) for ln in block)
+                    if block and not has_real_decl:
+                        removed += 1
+                        i = j + 1
+                        removed_this = True
+                    break
+                if not candidate.startswith((' ', '\t')):
+                    break
+                block.append(candidate)
+                if len(block) > 128:
+                    break
+                j += 1
+
+            if not removed_this:
+                i += 1
+
+        return ''.join(out), removed
+
+    @classmethod
+    def _identifier_edit_distance_at_most_one(cls, left: str, right: str) -> bool:
+        if abs(len(left) - len(right)) > 1:
+            return False
+        if left == right:
+            return True
+        if len(left) == len(right):
+            return sum(a != b for a, b in zip(left, right)) <= 1
+
+        short, long = (left, right) if len(left) < len(right) else (right, left)
+        i = j = edits = 0
+        while i < len(short) and j < len(long):
+            if short[i] == long[j]:
+                i += 1
+                j += 1
+            else:
+                edits += 1
+                if edits > 1:
+                    return False
+                j += 1
+        return True
+
+    @classmethod
+    def _is_close_identifier_typo(cls, missing: str, candidate: str) -> bool:
+        if missing == candidate or len(missing) < 3 or len(candidate) < 3:
+            return False
+        if missing[0] != candidate[0]:
+            return False
+        if missing.startswith(candidate) or candidate.startswith(missing):
+            return abs(len(missing) - len(candidate)) <= 2
+        return cls._identifier_edit_distance_at_most_one(missing, candidate)
+
+    @staticmethod
+    def _symbol_kind_value(sym) -> str:
+        kind = getattr(sym, 'kind', '')
+        return str(getattr(kind, 'value', kind)).lower()
+
+    @staticmethod
+    def _same_source_file(left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+    @classmethod
+    def _find_clang_identifier_candidates(cls, clang_analysis, file_path: str,
+                                          usage_line: int) -> set:
+        if not clang_analysis or not getattr(clang_analysis, 'symbols', None):
+            return set()
+
+        candidates: set = set()
+        for name, syms in getattr(clang_analysis, 'symbols', {}).items():
+            for sym in syms:
+                kind = cls._symbol_kind_value(sym)
+                sym_file = getattr(sym, 'file', '')
+                sym_line = int(getattr(sym, 'line', 0) or 0)
+                same_file = cls._same_source_file(sym_file, file_path)
+
+                if kind in {'function', 'typedef', 'struct', 'union', 'enum',
+                            'enum_const', 'macro', 'global_var'}:
+                    if same_file and sym_line and sym_line > usage_line:
+                        continue
+                    candidates.add(name)
+                    break
+        return candidates
+
+    @classmethod
+    def _find_declared_identifier_candidates(cls, lines: List[str], usage_line: int,
+                                            clang_analysis=None,
+                                            file_path: str = "") -> set:
+        start_idx = cls._find_function_body_start(lines, usage_line)
+        if start_idx is None:
+            start_idx = 0
+        else:
+            # Include a few lines from the function signature so parameters can
+            # also be candidates for single-token typo repair.
+            start_idx = max(0, start_idx - 6)
+        end_idx = max(0, min(usage_line - 1, len(lines)))
+
+        type_tokens = (
+            r'void|int|char|short|long|float|double|signed|unsigned|size_t|'
+            r'SIZE_T|DWORD|WORD|BYTE|BOOL|HANDLE|HMODULE|HINSTANCE|HKEY|'
+            r'HINTERNET|HCRYPTPROV|LPVOID|PVOID|LPSTR|LPCSTR|LPWSTR|LPCWSTR|'
+            r'FARPROC|SOCKET|WCHAR|TCHAR|HDC|HWND|HMENU|HICON|HCURSOR|'
+            r'HBITMAP|HBRUSH|HPEN|HFONT|COLORREF|LRESULT|WPARAM|LPARAM|'
+            r'UINT|ULONG|USHORT|LONG|NTSTATUS|HRESULT|LPHOSTENT|HOSTENT|'
+            r'struct\s+[A-Za-z_]\w*'
+        )
+        normal_decl = re.compile(
+            rf'\b(?:{type_tokens})(?:\s+|\s*\*\s*)+(?:\*+\s*)?'
+            rf'([A-Za-z_]\w*)\s*(?:\[|=|;|,|\))'
+        )
+        func_ptr_decl = re.compile(
+            rf'\b(?:{type_tokens})\b.*?\(\s*'
+            rf'(?:WINAPI|CALLBACK|__stdcall|__cdecl)?\s*\*\s*'
+            rf'([A-Za-z_]\w*)\s*\)'
+        )
+
+        candidates: set = set()
+        for line in lines[start_idx:end_idx]:
+            code = line.split('//', 1)[0]
+            if code.lstrip().startswith('#'):
+                continue
+            for regex in (func_ptr_decl, normal_decl):
+                for match in regex.finditer(code):
+                    ident = match.group(1)
+                    if ident not in {'WINAPI', 'CALLBACK'}:
+                        candidates.add(ident)
+        candidates.update(cls._find_clang_identifier_candidates(
+            clang_analysis, file_path, usage_line
+        ))
+        return candidates
+
+    @classmethod
+    def _repair_identifier_typos(cls, lines: List[str],
+                                 plain_undeclared: Dict[str, List[int]],
+                                 clang_analysis=None,
+                                 file_path: str = "") -> int:
+        fixes = 0
+        for ident, usage_lns in list(plain_undeclared.items()):
+            if not usage_lns:
+                continue
+            candidates: set = set()
+            for ln in usage_lns:
+                for candidate in cls._find_declared_identifier_candidates(
+                    lines, ln, clang_analysis=clang_analysis, file_path=file_path
+                ):
+                    if cls._is_close_identifier_typo(ident, candidate):
+                        candidates.add(candidate)
+
+            if len(candidates) != 1:
+                continue
+
+            replacement = next(iter(candidates))
+            word_re = re.compile(r'\b' + re.escape(ident) + r'\b')
+            replaced = 0
+            for ln in sorted(set(usage_lns)):
+                idx = ln - 1
+                if 0 <= idx < len(lines):
+                    lines[idx], count = word_re.subn(replacement, lines[idx])
+                    replaced += count
+
+            if replaced:
+                plain_undeclared.pop(ident, None)
+                fixes += 1
+                logger.info(
+                    f"      \U0001f527 Pattern fix (identifier typo): "
+                    f"replaced '{ident}' with '{replacement}' on {replaced} use(s)"
+                )
+
+        return fixes
+
+    @classmethod
+    def _format_clang_symbol_declaration(cls, ident: str, sym,
+                                         file_path: str,
+                                         usage_line: int) -> Optional[str]:
+        kind = cls._symbol_kind_value(sym)
+        sym_file = getattr(sym, 'file', '')
+        same_file = cls._same_source_file(sym_file, file_path)
+        sym_line = int(getattr(sym, 'line', 0) or 0)
+
+        if same_file and sym_line and sym_line <= usage_line:
+            return None
+
+        if kind == 'function':
+            if getattr(sym, 'is_static', False) and not same_file:
+                return None
+
+            signature = (getattr(sym, 'signature', '') or '').strip()
+            if not signature or '(' not in signature:
+                ret_type = (getattr(sym, 'return_type', '') or '').strip()
+                params = getattr(sym, 'parameters', []) or []
+                if not ret_type:
+                    return None
+                param_text = ', '.join(
+                    f"{ptype} {pname}".strip()
+                    for ptype, pname in params
+                    if (ptype or pname)
+                ) or 'void'
+                signature = f"{ret_type} {ident}({param_text})"
+
+            signature = signature.rstrip(';')
+            signature = re.sub(r'\s*\{.*$', '', signature).strip()
+            if not same_file:
+                signature = re.sub(r'^\s*(?:static|inline)\s+', '', signature).strip()
+            return signature + ';'
+
+        if kind == 'global_var':
+            type_name = (getattr(sym, 'return_type', '') or '').strip()
+            if not type_name:
+                return None
+            prefix = 'static ' if same_file and getattr(sym, 'is_static', False) else 'extern '
+            return f"{prefix}{type_name} {ident};"
+
+        return None
+
+    @classmethod
+    def _apply_clang_symbol_declarations(cls, lines: List[str],
+                                         missing_idents: Dict[str, List[int]],
+                                         clang_analysis,
+                                         file_path: str) -> Tuple[set, int, int]:
+        if not clang_analysis or not getattr(clang_analysis, 'symbols', None):
+            return set(), 0, 0
+
+        declarations: List[str] = []
+        fixed: set = set()
+        current_code = '\n'.join(lines)
+
+        for ident, usage_lns in list(missing_idents.items()):
+            syms = getattr(clang_analysis, 'symbols', {}).get(ident, [])
+            if not syms:
+                continue
+            target_line = min(usage_lns) if usage_lns else 1
+
+            for sym in syms:
+                decl = cls._format_clang_symbol_declaration(
+                    ident, sym, file_path, target_line
+                )
+                if not decl:
+                    continue
+                if decl in current_code or decl in declarations:
+                    fixed.add(ident)
+                    break
+                declarations.append(decl)
+                fixed.add(ident)
+                break
+
+        if not declarations:
+            return fixed, 0, 0
+
+        insert_at = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('#include') or stripped.startswith('#pragma comment'):
+                insert_at = i + 1
+
+        block = ['/* Auto-fix: declarations from Clang symbol table */']
+        block.extend(declarations)
+        block.append('')
+        lines[insert_at:insert_at] = block
+        logger.info(
+            f"      \U0001f527 Pattern fix (clang symbols): "
+            f"added {len(declarations)} declaration(s)"
+        )
+        return fixed, len(block), insert_at
+
+    @classmethod
     def apply_generic_pattern_fixes(
         cls,
         source_code: str,
         errors: List[str],
         language: str = "c",
         file_path: str = "",
+        clang_analysis=None,
     ) -> Tuple[str, int, set]:
         """Apply pattern-based compilation-error fixes that work for any project.
 
@@ -771,6 +1087,38 @@ class AutoFixer:
             return source_code, 0, set()
 
         fixes = 0
+
+        # ── Pre-pass-0: remove orphaned duplicate parameter blocks after ); ──
+        # Caused by LLM strat_1 mutation copy-pasting typedef/function parameters
+        # twice. Pattern:
+        #   typedef ... (
+        #     param1,
+        #     param2
+        #   );
+        #   param1,          ← orphaned duplicate
+        #   param2           ← orphaned duplicate
+        #   );               ← extra );
+        # The orphaned block has no leading keyword (typedef/static/void/int/...)
+        # and is followed by ); on its own line.
+        _dedup_src, _dedup_n = cls._remove_orphaned_duplicate_param_blocks(source_code)
+        if _dedup_n:
+            source_code = _dedup_src
+            fixes += _dedup_n
+            logger.info(f"      \U0001f527 Pattern fix (orphaned-params): removed {_dedup_n} duplicate parameter block(s)")
+
+        # ── Pre-pass: strip MSVC SAL annotations (__in, __out, __inout, ...) ──
+        # These are undefined on GCC/Clang (no <sal.h>) and come from source or
+        # LLM output. Strip them before any other fix to avoid cascading errors.
+        _sal_pattern = re.compile(
+            r'\b__(?:in|out|inout)(?:_opt|_z|_part|_ecount(?:_opt)?\([^)]*\)|'
+            r'_bcount(?:_opt)?\([^)]*\)|_z_count\([^)]*\)|_full\([^)]*\))?\b\s*'
+        )
+        _sal_fixed, _sal_count = _sal_pattern.subn('', source_code)
+        if _sal_count:
+            source_code = _sal_fixed
+            fixes += _sal_count
+            logger.info(f"      \U0001f527 Pattern fix (SAL): stripped {_sal_count} SAL annotation(s) (__in/__out/__inout)")
+
         lines = source_code.split('\n')
 
         # ── 0. Fix C2143 "missing ';' before" errors ──
@@ -914,6 +1262,7 @@ class AutoFixer:
 
         # ── 1. Collect all C2065 undeclared identifiers ──
         undeclared: Dict[str, List[int]] = {}   # ident → [line_numbers]
+        identifier_not_found: Dict[str, List[int]] = {}
         # Also collect C2146 errors to detect cascading patterns
         c2146_lines: Dict[int, str] = {}   # line_num → ident (from "missing ';' before identifier 'X'")
         for err in errors:
@@ -932,6 +1281,28 @@ class AutoFixer:
                 line_num = int(m.group(1))
                 ident = m.group(2)
                 undeclared.setdefault(ident, []).append(line_num)
+
+            m3861 = re.search(
+                r'[\(:]\s*(\d+)\s*[\):].*C3861.*\'([^\']+)\'.*identifier not found',
+                err,
+            )
+            if m3861:
+                identifier_not_found.setdefault(m3861.group(2), []).append(int(m3861.group(1)))
+
+        if identifier_not_found and not undeclared:
+            clang_fixed_idents, _, _ = cls._apply_clang_symbol_declarations(
+                lines, identifier_not_found, clang_analysis, file_path
+            )
+            if clang_fixed_idents:
+                fixes += len(clang_fixed_idents)
+                for ident in clang_fixed_idents:
+                    identifier_not_found.pop(ident, None)
+            if identifier_not_found:
+                fixes += cls._repair_identifier_typos(
+                    lines, identifier_not_found,
+                    clang_analysis=clang_analysis,
+                    file_path=file_path,
+                )
 
         # ── 2. Separate VLA idents (have C2057/C2466/C2133) from plain undeclared ──
         # (Only if there are C2065 undeclared identifiers)
@@ -1027,6 +1398,34 @@ class AutoFixer:
             # Remove restored identifiers from plain_undeclared
             for ident in win32_case_restored:
                 plain_undeclared.pop(ident, None)
+
+            clang_missing = dict(plain_undeclared)
+            clang_missing.update(identifier_not_found)
+            clang_fixed_idents, inserted_count, insert_at = cls._apply_clang_symbol_declarations(
+                lines, clang_missing, clang_analysis, file_path
+            )
+            if clang_fixed_idents:
+                fixes += len(clang_fixed_idents)
+                for ident in clang_fixed_idents:
+                    plain_undeclared.pop(ident, None)
+                    identifier_not_found.pop(ident, None)
+                if inserted_count:
+                    for pool in (plain_undeclared, identifier_not_found):
+                        for other_id, usage_lines in list(pool.items()):
+                            pool[other_id] = [
+                                l + inserted_count if l > insert_at else l
+                                for l in usage_lines
+                            ]
+
+            typo_targets = dict(plain_undeclared)
+            typo_targets.update(identifier_not_found)
+            before_typo = set(typo_targets)
+            fixes += cls._repair_identifier_typos(
+                lines, typo_targets, clang_analysis=clang_analysis, file_path=file_path
+            )
+            for ident in before_typo - set(typo_targets):
+                plain_undeclared.pop(ident, None)
+                identifier_not_found.pop(ident, None)
 
             # Known API types / macros that need an #include rather than a declaration
             # Loaded from configs/win32_knowledge.json
@@ -1208,6 +1607,47 @@ class AutoFixer:
         # The LLM fixer (fix_compilation_errors) handles these via multi-turn
         # conversation with error context, few-shot examples, and RAG retrieval.
 
+        # ── 7. Fix C2653 "not a class or namespace name" — hallucinated namespace ──
+        # LLM mutations sometimes uncomment or introduce calls to non-existent
+        # namespaces (e.g. `logs::Write(...)`, `crypto::encrypt(...)`).
+        # Comment out lines that exclusively contain a call to a non-existent namespace.
+        c2653_namespaces: Dict[str, List[int]] = {}  # namespace → [line_numbers]
+        for err in errors:
+            m = re.search(r'[\(:]\s*(\d+)\s*[\):].*C2653.*\'([^\']+)\'.*not a class or namespace', err)
+            if m:
+                line_num = int(m.group(1))
+                ns_name = m.group(2)
+                c2653_namespaces.setdefault(ns_name, []).append(line_num)
+        
+        if c2653_namespaces:
+            # Check if the namespace is defined anywhere in the source
+            full_text = '\n'.join(lines)
+            for ns_name, ns_lines in c2653_namespaces.items():
+                # Is this namespace actually defined? (namespace X { ... } or class X { ... })
+                ns_defined = re.search(
+                    r'(?:namespace|class|struct)\s+' + re.escape(ns_name) + r'\s*[{;]',
+                    full_text
+                )
+                if ns_defined:
+                    continue  # Namespace exists, let LLM handle it
+                
+                # Namespace does NOT exist — comment out lines with ns::func() calls
+                for ln in ns_lines:
+                    idx = ln - 1
+                    if 0 <= idx < len(lines):
+                        line = lines[idx]
+                        stripped = line.lstrip()
+                        if stripped.startswith('//'):
+                            continue  # Already commented
+                        # Only comment out if the line is a simple statement with ns::
+                        # (don't break control structures)
+                        if re.search(r'\b' + re.escape(ns_name) + r'\s*::', line):
+                            indent = line[:len(line) - len(stripped)]
+                            lines[idx] = f"{indent}// {stripped}  // Auto-fix: namespace '{ns_name}' not found"
+                            fixes += 1
+                            logger.info(f"      🔧 Pattern fix (C2653): commented out line {ln} — "
+                                       f"namespace '{ns_name}' does not exist in project")
+
 
         # ── 12. Fix LNK2019/LNK2001 — detect arch mismatch and missing libs ──
         # Map loaded from configs/win32_knowledge.json
@@ -1310,10 +1750,14 @@ class AutoFixer:
         mode: str = "hybrid",
         fix_history_path: Optional[str] = None,
         compiler_type: str = 'auto',
+        preserve_function_names: Optional[set] = None,
+        min_line_ratio: float = 0.30,
+        max_deleted_functions: int = 1,
+        forbid_body_emptying: bool = True,
     ):
         """
         Initialize auto-fixer.
-        
+
         Args:
             llm_model: LLM model to use (for cloud)
             api_key: Optional API key for Mistral
@@ -1322,6 +1766,18 @@ class AutoFixer:
             cloud_file_size_limit: Files BELOW this use cloud, ABOVE use local
             mode: Operation mode ("hybrid", "local_only", "cloud_only")
             compiler_type: 'msvc', 'gcc', 'clang', or 'auto' (auto-detect from errors)
+            preserve_function_names: Optional whitelist of function names that
+                MUST survive the fix. If any of these is missing in the fixed
+                code, the fix is rejected. Used by mutation pipeline to lock
+                the original sample's functions.
+            min_line_ratio: Minimum allowed (fixed_lines / orig_lines).
+                Default 0.30 keeps backward compat; production runs should
+                tighten to 0.65–0.80 to block aggressive deletion.
+            max_deleted_functions: Hard cap on how many AST-level function
+                definitions may disappear between original and fix.
+            forbid_body_emptying: If True, reject fixes where >=2 surviving
+                functions have their bodies reduced to <30% of the original
+                body length (LLM "stub-out everything" failure mode).
         """
         self.llm_model = llm_model
         self.api_key = api_key
@@ -1329,6 +1785,14 @@ class AutoFixer:
         self.use_hybrid = use_hybrid
         self._fix_mode = mode  # store for tracking
         self.compiler_type = compiler_type
+
+        # ── AutoFixer SAFETY POLICY (whitelist + caps) ──
+        self.preserve_function_names: set = (
+            set(preserve_function_names) if preserve_function_names else set()
+        )
+        self.min_line_ratio = float(min_line_ratio)
+        self.max_deleted_functions = int(max_deleted_functions)
+        self.forbid_body_emptying = bool(forbid_body_emptying)
 
         # ── Fix History RAG ──
         self.fix_history_rag = None
@@ -1558,15 +2022,17 @@ class AutoFixer:
                     f"({fix_len} vs {orig_len} chars). Likely LLM duplicated code."
                 )
         
-        # Gate 2: LINE COUNT RATIO — reject massive line loss
+        # Gate 2: LINE COUNT RATIO — reject massive line loss.
+        # Threshold is configurable via AutoFixer(min_line_ratio=...).
         orig_lines = len(original_code.splitlines())
         fix_lines = len(fixed_code.splitlines())
         if orig_lines > 20:
             line_ratio = fix_lines / orig_lines if orig_lines > 0 else 0
-            if line_ratio < 0.30:
+            if line_ratio < self.min_line_ratio:
                 return False, (
                     f"Fix rejected: line count dropped to {line_ratio:.0%} "
-                    f"({fix_lines} vs {orig_lines} lines). Likely code was deleted."
+                    f"({fix_lines} vs {orig_lines} lines, min={self.min_line_ratio:.0%}). "
+                    f"Likely code was deleted."
                 )
         
         # Gate 3: INCLUDE PRESERVATION — all original #includes must survive
@@ -1641,6 +2107,8 @@ class AutoFixer:
         
         # Gate 6: AST-BASED SEMANTIC VALIDATION — uses tree-sitter to compare
         # original vs fixed AST for structural equivalence.
+        ast_orig_snap = None
+        ast_fix_snap = None
         if language.lower() in ('c', 'cpp', 'c++'):
             sv = get_semantic_validator() if get_semantic_validator else None
             if sv and sv.available:
@@ -1655,6 +2123,12 @@ class AutoFixer:
                         "AST diff: added_funcs=%s, sig_changes=%s",
                         sem_diff.added_functions, sem_diff.signature_changes,
                     )
+                # Cache snapshots so Gates 7/8 don't reparse.
+                try:
+                    ast_orig_snap = sv.extract_snapshot(original_code, language)
+                    ast_fix_snap = sv.extract_snapshot(fixed_code, language)
+                except Exception:
+                    ast_orig_snap = ast_fix_snap = None
             else:
                 # DEGRADED MODE: Regex fallback when tree-sitter unavailable.
                 # Use STRICTER thresholds to compensate for loss of AST analysis.
@@ -1680,6 +2154,87 @@ class AutoFixer:
                             f"({fix_lines} vs {orig_lines} lines). "
                             f"(Stricter threshold because AST validation is unavailable.)"
                         )
+
+        # Gate 7: WHITELIST PRESERVATION — every whitelisted function that was
+        # present in *this file/region* must still be present in the fixed code.
+        #
+        # ``preserve_function_names`` is built at project scope, while this
+        # validator is called on a single file or surgical region.  Comparing
+        # the full project whitelist against one file would reject every
+        # otherwise valid fix because functions from other files are naturally
+        # absent.  Scope the whitelist to functions that existed in the input
+        # being fixed, then require only those to survive.
+        if self.preserve_function_names:
+            if ast_orig_snap is not None:
+                orig_scope_funcs = ast_orig_snap.function_names
+            else:
+                orig_scope_funcs = set(_extract_function_signatures(original_code))
+            scoped_preserve = self.preserve_function_names & orig_scope_funcs
+
+            # Prefer AST snapshot if available; fall back to regex extraction.
+            if ast_fix_snap is not None:
+                fix_funcs = ast_fix_snap.function_names
+            else:
+                fix_funcs = set(_extract_function_signatures(fixed_code))
+            missing_whitelisted = scoped_preserve - fix_funcs
+            if missing_whitelisted:
+                return False, (
+                    f"Fix rejected: {len(missing_whitelisted)} whitelisted "
+                    f"function(s) deleted: "
+                    f"{', '.join(sorted(list(missing_whitelisted))[:5])}. "
+                    f"(AutoFixer.preserve_function_names policy)"
+                )
+
+        # Gate 8: HARD CAP ON DELETED FUNCTIONS + BODY-EMPTYING DETECTION.
+        # AST mode is required; falls back silently if unavailable so we don't
+        # double-penalize regex mode (Gate 6 already tightened it).
+        if ast_orig_snap is not None and ast_fix_snap is not None:
+            orig_func_names = ast_orig_snap.function_names
+            fix_func_names = ast_fix_snap.function_names
+            deleted = orig_func_names - fix_func_names
+            # 'main' is allowed to migrate (e.g., WinMain rewrites).
+            deleted.discard('main')
+            if len(deleted) > self.max_deleted_functions:
+                return False, (
+                    f"Fix rejected: {len(deleted)} function definitions removed "
+                    f"(cap={self.max_deleted_functions}): "
+                    f"{', '.join(sorted(list(deleted))[:5])}. "
+                    f"AutoFixer.max_deleted_functions policy."
+                )
+
+            # Body-emptying detection: count surviving functions whose body
+            # length collapsed to <30% of the original. Requires per-function
+            # body sizes — we read them from the FunctionInfo dataclass via
+            # introspection so we don't depend on a specific schema.
+            if self.forbid_body_emptying:
+                shrunk = []
+                surviving = orig_func_names & fix_func_names
+                for fname in surviving:
+                    o = ast_orig_snap.functions.get(fname)
+                    n = ast_fix_snap.functions.get(fname)
+                    if o is None or n is None:
+                        continue
+                    o_size = (
+                        getattr(o, 'body_size', None)
+                        or getattr(o, 'body_length', None)
+                        or getattr(o, 'size', None)
+                        or 0
+                    )
+                    n_size = (
+                        getattr(n, 'body_size', None)
+                        or getattr(n, 'body_length', None)
+                        or getattr(n, 'size', None)
+                        or 0
+                    )
+                    if o_size > 80 and n_size < 0.30 * o_size:
+                        shrunk.append(fname)
+                if len(shrunk) >= 2:
+                    return False, (
+                        f"Fix rejected: {len(shrunk)} function bodies emptied "
+                        f"to <30% of original: "
+                        f"{', '.join(sorted(shrunk)[:5])}. "
+                        f"AutoFixer.forbid_body_emptying policy."
+                    )
 
         # All gates passed
         return True, None
@@ -2086,9 +2641,16 @@ Return the fixed header code.
                         'is_header': False,
                     }
 
+                # Compute max_tokens: allow up to 3x the region size in chars, convert to ~tokens
+                # Rough estimate: 1 token ≈ 4 chars; cap at 4096 to prevent runaway responses
+                _region_chars = len(section_text)
+                _max_tok = min(4096, max(512, (_region_chars * 3) // 4))
+                logger.info(f"   Region {region_idx+1}: max_tokens={_max_tok} (region={_region_chars} chars)")
+
                 gen_params = {
                     'system_prompt': system_prompt,
                     'user_prompt': user_prompt,
+                    'max_tokens': _max_tok,
                 }
                 if not self.use_hybrid or not hasattr(self.llm_provider, 'choose_provider'):
                     try:
@@ -2543,7 +3105,7 @@ Return the fixed header code.
                 "- C2371 \"'X': redefinition; different basic types\": A type is defined twice. If it's an SDK type, remove the user-defined duplicate. If two state-machine context structs have the same name (e.g. both named `_Ctx`), rename the second one to `_Ctx2`.\n"
                 "- C2373/C2491 \"redefinition; different type modifiers\": A function redeclares a Win32 API. Remove the conflicting redeclaration but NEVER comment out #define macros.\n"
                 "- C2561 \"function must return a value\": Add `return 0;` or appropriate return statement.\n"
-                "- C2664 \"cannot convert argument\": Usually a wide/narrow string mismatch. Use the correct function variant (e.g. `strcpy` instead of `wcscpy`).\n"
+                "- C2664 \"cannot convert argument\": Match the argument expression to the existing callee declaration. Prefer changing the local literal/buffer/declaration around the call; do NOT rewrite the callee signature if it is declared in a header or project context.\n"
                 "- C2733 \"cannot overload extern 'C' linkage\": A function in the source file conflicts with an SDK declaration. Remove the conflicting definition.\n"
                 "- C3861 \"'X': identifier not found\": A Win32 API function needs a specific header (#include <wincrypt.h> for Crypt* functions, etc.).\n"
                 "- C2059/C2374/C2373 cascading after '}}': The function above likely closed too early. Move the premature '}}' to the correct end of the function."
@@ -2569,6 +3131,24 @@ Return the fixed header code.
                 "- \"conflicting types for 'X'\": A function is declared with different signatures. Fix the declaration to match the definition."
             )
 
+        # ── MSVC official docs + DuckDuckGo fallback context ──
+        msvc_docs_section = ""
+        if _is_msvc and enrich_errors_with_msvc_docs and extract_error_codes_from_errors:
+            try:
+                _codes = extract_error_codes_from_errors(errors)
+                if _codes:
+                    msvc_docs_section = enrich_errors_with_msvc_docs(_codes, max_codes=5)
+            except Exception as _e:
+                logger.debug(f"msvc_doc_fetcher enrichment failed: {_e}")
+
+        # ── Win32 signature validation (return type + unknown types) ──
+        w32_sig_section = ""
+        if _is_msvc and _w32_validate:
+            try:
+                w32_sig_section = _w32_validate(source_code)
+            except Exception as _e:
+                logger.debug(f"win32_signature_validator failed: {_e}")
+
         # ── Build initial user prompt ──
         initial_user_prompt = f"""The following {language} code has compilation errors:
 
@@ -2585,6 +3165,8 @@ COMPILATION ERRORS:
 {lnk_warning}
 {header_file_warning}
 {prev_fail_section}
+{w32_sig_section}
+{msvc_docs_section}
 {rag_few_shot_section}
 {rag_anti_section}
 YOUR TASK:
@@ -2628,15 +3210,21 @@ CRITICAL OUTPUT FORMAT:
                 'is_header': is_header_file,
             }
         
+        # Escalating temperature: retry attempts use higher temperature to avoid
+        # reproducing the same errors (same model + same temp = deterministic = same bugs)
+        _TEMPS = [0.3, 0.6, 0.9, 1.0]
+
         for attempt in range(max_attempts):
             try:
-                logger.info(f"Attempting to fix errors (attempt {attempt + 1}/{max_attempts}, turn {len(messages)//2})...")
+                _temp = _TEMPS[min(attempt, len(_TEMPS) - 1)]
+                logger.info(f"Attempting to fix errors (attempt {attempt + 1}/{max_attempts}, turn {len(messages)//2}, temp={_temp})...")
                 
                 # ── Call LLM ──
                 if has_chat and attempt > 0:
                     # Multi-turn: send full conversation history
                     response = self.llm_provider.generate_chat(
                         messages=messages,
+                        temperature=_temp,
                         **hybrid_params,
                     )
                 else:
@@ -2644,6 +3232,7 @@ CRITICAL OUTPUT FORMAT:
                     gen_params = {
                         'system_prompt': system_prompt,
                         'user_prompt': messages[-1]["content"],  # latest user message
+                        'temperature': _temp,
                     }
                     if not self.use_hybrid or not hasattr(self.llm_provider, 'choose_provider'):
                         try:

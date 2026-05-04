@@ -26,12 +26,17 @@ logger = structlog.get_logger(__name__)
 # Event signature: BuildValidatedEvent
 _SIG_BUILD_VALIDATED = frozenset({"compiled_artifact_id", "binary_sha256", "binary_size_bytes"})
 
+# Event signature: DecisionIssuedEvent (for retry_sandbox path)
+_SIG_DECISION_RETRY_SANDBOX = frozenset({"decision_id", "action", "confidence", "source"})
+
 
 class SandboxSubmitAgent(BaseAgent):
     """
     Submit a compiled binary artifact to the sandbox.
 
-    Self-activates on: BuildValidatedEvent (BUILD_READY → SANDBOX_SUBMITTING)
+    Self-activates on:
+      - BuildValidatedEvent   (BUILD_READY → SANDBOX_SUBMITTING)
+      - DecisionIssuedEvent   (DECISION_ISSUED → SANDBOX_SUBMITTING, action=retry_sandbox)
     """
 
     agent_name = "SandboxSubmitAgent"
@@ -41,32 +46,51 @@ class SandboxSubmitAgent(BaseAgent):
 
     activates_on = {
         _SIG_BUILD_VALIDATED: (JobStatus.BUILD_READY, JobStatus.SANDBOX_SUBMITTING),
+        _SIG_DECISION_RETRY_SANDBOX: (
+            JobStatus.DECISION_ISSUED,
+            JobStatus.SANDBOX_SUBMITTING,
+            lambda d: d.get("action") == "retry_sandbox",
+        ),
     }
 
     capabilities = {"stage": "sandbox_submit", "backend": "cape+virustotal"}
 
-    def __init__(self, ctx, cape_adapter=None, vt_adapter=None) -> None:
+    def __init__(self, ctx, cape_adapter=None, vt_adapter=None, cape_analysis_time_s: int = 120) -> None:
         super().__init__(ctx)
         self._cape = cape_adapter   # adapters.cape_adapter.CapeAdapter
         self._vt = vt_adapter       # adapters.virustotal_adapter.VirusTotalAdapter
-
-    def __init__(self, ctx, cape_adapter=None, vt_adapter=None) -> None:
-        super().__init__(ctx)
-        self._cape = cape_adapter   # adapters.cape_adapter.CapeAdapter
-        self._vt = vt_adapter       # adapters.virustotal_adapter.VirusTotalAdapter
+        self._cape_analysis_time_s = cape_analysis_time_s
         self._pending_submitted_events: dict = {}
 
     async def handle_event(self, data: dict, claimed_state) -> None:
         """Extract command data from event + state."""
         job_id = data["job_id"]
         log = logger.bind(job_id=job_id)
+
+        # When activated from DecisionIssuedEvent(action=retry_sandbox), compiled_artifact_id
+        # is not in the event — use the state's persisted value.
+        compiled_artifact_id = (
+            data.get("compiled_artifact_id")
+            or (claimed_state.compiled_artifact_id if claimed_state else "")
+            or ""
+        )
+
+        # Increment retry counters on retry_sandbox path
+        if data.get("action") == "retry_sandbox" and claimed_state and self._ctx.state_store:
+            claimed_state.sandbox_retry_count = (claimed_state.sandbox_retry_count or 0) + 1
+            claimed_state.retry_count = (claimed_state.retry_count or 0) + 1
+            await self._ctx.state_store.save(claimed_state)
+            log.info("retry_sandbox_counters_incremented",
+                     sandbox_retry_count=claimed_state.sandbox_retry_count,
+                     retry_count=claimed_state.retry_count)
+
         cmd_data = {
             "job_id": job_id,
             "sample_id": data.get("sample_id", ""),
             "correlation_id": data.get("correlation_id", ""),
-            "compiled_artifact_id": data.get("compiled_artifact_id", ""),
+            "compiled_artifact_id": compiled_artifact_id,
             "sandbox_backend": claimed_state.sandbox_backend or "cape" if claimed_state else "cape",
-            "retry_count": 0,
+            "retry_count": claimed_state.sandbox_retry_count if claimed_state else 0,
         }
         try:
             await self.handle(cmd_data)
@@ -121,7 +145,8 @@ class SandboxSubmitAgent(BaseAgent):
                     # Determine original filename for CAPE
                     raw_path = store.get_path_sync(compiled_artifact_id)
                     fname = Path(raw_path).stem + ".exe" if raw_path else "sample.exe"
-                    task_id = await adapter.submit_bytes(pe_bytes, filename=fname)
+                    task_id = await adapter.submit_bytes(pe_bytes, filename=fname,
+                                                          timeout_analysis=self._cape_analysis_time_s)
                     binary_abs_path = f"(encrypted:{fname})"
                     log.info("submitted_from_memory", filename=fname, size=len(pe_bytes))
                     del pe_bytes  # release memory immediately
@@ -149,7 +174,8 @@ class SandboxSubmitAgent(BaseAgent):
             log.info("submitting_to_sandbox", binary=binary_abs_path)
 
             # ── 2. Submit file to sandbox (CAPE or VT) ────────────────────
-            task_id = await adapter.submit_file(binary_abs_path)
+            task_id = await adapter.submit_file(binary_abs_path,
+                                                  timeout_analysis=self._cape_analysis_time_s)
             if task_id in (None, "", "None"):
                 # One recovery retry if the artifact disappeared mid-run (e.g., AV quarantine)
                 recovered = self._recover_binary_from_build_output(job_id)
@@ -157,7 +183,8 @@ class SandboxSubmitAgent(BaseAgent):
                     recovered_abs = str(recovered.resolve())
                     if recovered_abs != binary_abs_path:
                         log.warning("retry_submit_with_recovered_binary", recovered_path=recovered_abs)
-                        task_id = await adapter.submit_file(recovered_abs)
+                        task_id = await adapter.submit_file(recovered_abs,
+                                                            timeout_analysis=self._cape_analysis_time_s)
                         binary_abs_path = recovered_abs
 
         if task_id in (None, "", "None"):
@@ -179,6 +206,16 @@ class SandboxSubmitAgent(BaseAgent):
         # to prevent ExecMonitorAgent from receiving event before state is ready
         self._pending_submitted_events[job_id] = event
         log.info("sandbox_submit_event_deferred", task_id=task_id)
+
+        # ── 3b. Persist sandbox_task_id to state immediately ──────────────
+        # The coordinator may lose the race to save this (ExecMonitorAgent
+        # self-activates first), so we write it here as the authoritative source.
+        if self._ctx.state_store:
+            _state = await self._ctx.state_store.get(job_id)
+            if _state:
+                _state.sandbox_task_id = str(task_id)
+                await self._ctx.state_store.save(_state)
+                log.info("sandbox_task_id_persisted", task_id=task_id)
 
         # ── 4. Submit original binary for behavioral equivalence (best-effort) ──
         if self._ctx.state_store:
@@ -213,7 +250,8 @@ class SandboxSubmitAgent(BaseAgent):
                     log.warning("original_binary_not_found_skipping_equivalence_submit")
                     return
 
-            orig_task_id = await adapter.submit_file(str(orig_path.resolve()))
+            orig_task_id = await adapter.submit_file(str(orig_path.resolve()),
+                                                        timeout_analysis=self._cape_analysis_time_s)
             if orig_task_id in (None, "", "None"):
                 log.warning("original_sandbox_submit_returned_empty_task_id")
                 return

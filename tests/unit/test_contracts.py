@@ -51,5 +51,5 @@ def test_decision_issued_event_autonomy_fields_default():
         source="policy_override",
         confidence=0.9,
     )
-    assert ev.autonomous_dispatched is False
+    assert ev.autonomous_mutation_queued is False
     assert ev.next_mutation_strategy == ""

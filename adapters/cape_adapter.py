@@ -34,12 +34,14 @@ class CapeAdapter:
         api_url: str,
         api_token: str = "",
         http_timeout_s: int = 30,
+        http_basic_auth: str = "",
     ) -> None:
         from sandbox_analyzer import CapeApiClient
         self._client = CapeApiClient(
             api_url=api_url,
             api_token=api_token,
             timeout=http_timeout_s,
+            http_basic_auth=http_basic_auth,
         )
         self._loop_executor = None  # uses default ThreadPoolExecutor
 

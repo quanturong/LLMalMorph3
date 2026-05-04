@@ -5,14 +5,17 @@ Decision flow:
   1. PolicyEngine.evaluate_pre_llm()  → if hard rule fires, use it (no LLM)
   2. If no hard rule: call LLM with DecisionLLMOutput schema
   3. PolicyEngine.apply_post_llm()    → validate + possibly override LLM result
-  4. Emit DecisionIssuedEvent with final action
+  4. _apply_local_mutation_policy()   → may promote to retry_with_mutation (research loop)
+  5. Emit DecisionIssuedEvent with final action
 
-Allowed actions (whitelist from contracts.decisions.DecisionAction):
+LLM advisory allowed actions (whitelist — LLM never picks retry_with_mutation):
   - continue_to_report
   - retry_sandbox
   - escalate_to_analyst
   - close_no_behavior
   - close_failed
+
+Policy layer may emit retry_with_mutation after step 4 regardless of LLM output.
 
 Input command:  DecideCommand
 Output event:   DecisionIssuedEvent
@@ -36,7 +39,6 @@ from contracts.decisions import (
     DecisionSource,
 )
 from contracts.messages import DecisionIssuedEvent
-from contracts.messages import BuildValidateCommand
 from llm.provider import LLMRequest
 from workflows.policy import PolicyEngine
 from contracts.job import JobState, JobStatus
@@ -223,14 +225,21 @@ class DecisionAgent(BaseAgent):
                 llm_raw_output=getattr(final_decision, "llm_raw_output", None),
             )
 
-        autonomous_dispatched = False
+        autonomous_mutation_queued = False
         next_mutation_strategy = ""
+        feedback_ctx = None
         if final_decision.action == DecisionAction.RETRY_WITH_MUTATION:
             next_mutation_strategy = self._pick_next_mutation_strategy(job_state)
-            autonomous_dispatched = await self._try_autonomous_build_dispatch(
+            # Build feedback context first so it can be forwarded to MutationAgent via DecisionIssuedEvent
+            feedback_ctx = self._build_feedback_context(
+                analysis_result=analysis_result,
+                job_state=job_state,
+            )
+            autonomous_mutation_queued = await self._try_autonomous_mutation_dispatch(
                 cmd_data=data,
                 job_state=job_state,
                 mutation_strategy=next_mutation_strategy,
+                feedback_context=feedback_ctx,
             )
 
         log.info("decision_final",
@@ -241,8 +250,9 @@ class DecisionAgent(BaseAgent):
         await self._persist_and_emit(
             job_id, data, final_decision,
             llm_used=llm_recommendation is not None,
-            autonomous_dispatched=autonomous_dispatched,
+            autonomous_mutation_queued=autonomous_mutation_queued,
             next_mutation_strategy=next_mutation_strategy,
+            feedback_context=feedback_ctx,
         )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -267,7 +277,6 @@ class DecisionAgent(BaseAgent):
                     "Given analysis context, recommend ONE action from: "
                     "continue_to_report, retry_sandbox, escalate_to_analyst, "
                     "close_no_behavior, close_failed. "
-                    "Do NOT recommend evasion or anti-detection techniques. "
                     "Respond ONLY as valid JSON."
                 ),
                 user_prompt=prompt,
@@ -292,8 +301,9 @@ class DecisionAgent(BaseAgent):
         cmd_data: dict,
         decision: DecisionResult,
         llm_used: bool,
-        autonomous_dispatched: bool = False,
+        autonomous_mutation_queued: bool = False,
         next_mutation_strategy: str = "",
+        feedback_context: dict | None = None,
     ) -> None:
         decision_dict = decision.model_dump(mode="json")
         decision_dict["created_at"] = datetime.now(tz=timezone.utc).isoformat()
@@ -315,8 +325,9 @@ class DecisionAgent(BaseAgent):
             action=decision.action.value,
             source=decision.source.value if hasattr(decision.source, "value") else str(decision.source),
             confidence=float(decision.confidence),
-            autonomous_dispatched=autonomous_dispatched,
+            autonomous_mutation_queued=autonomous_mutation_queued,
             next_mutation_strategy=next_mutation_strategy,
+            feedback_context=feedback_context,
         )
         self._pending_decision_events[job_id] = event
         # event will be published by handle_event() after transition_and_save(DECISION_ISSUED)
@@ -379,42 +390,100 @@ class DecisionAgent(BaseAgent):
         idx = job_state.mutation_cycle_count % len(strategies)
         return str(strategies[idx]).strip() or "variant_source_generator"
 
-    async def _try_autonomous_build_dispatch(
+    async def _try_autonomous_mutation_dispatch(
         self,
         cmd_data: dict,
         job_state: JobState,
         mutation_strategy: str,
+        feedback_context: dict | None = None,
     ) -> bool:
+        """Signal that autonomous mutation should proceed.
+
+        The actual mutation is driven by MutationAgent self-activating on the
+        DecisionIssuedEvent (action=retry_with_mutation).  This method only
+        performs pre-mutation bookkeeping (recording the original analysis
+        reference) and returns True so the event's autonomous_mutation_queued flag
+        is set correctly.  No command is published here — the event itself is
+        the trigger.
+        """
         if not self._enable_autonomous_requests:
             return False
         if not job_state.source_artifact_id or not job_state.project_name or not job_state.language:
             return False
 
         log = logger.bind(job_id=cmd_data["job_id"])
-        
+
         # Store original analysis reference before mutation (for comparison)
         if not job_state.is_mutated_sample and job_state.analysis_result_id:
             job_state.is_mutated_sample = True
             job_state.original_job_id = job_state.job_id
             job_state.original_analysis_result_id = job_state.analysis_result_id
-            
-            if self._ctx.state_store:
-                await self._ctx.state_store.put(job_state)
-                log.info("stored_original_reference", 
-                        original_analysis_id=job_state.original_analysis_result_id)
 
-        cmd = BuildValidateCommand(
-            job_id=cmd_data["job_id"],
-            sample_id=cmd_data["sample_id"],
-            correlation_id=cmd_data["correlation_id"],
-            source_artifact_id=job_state.source_artifact_id,
-            project_name=job_state.project_name,
-            language=job_state.language,
-            mutation_strategy=mutation_strategy,
-            retry_count=job_state.build_retry_count + 1,
-        )
-        await self._ctx.broker.publish(Topic.CMD_BUILD_VALIDATE, cmd)
+            if self._ctx.state_store:
+                await self._ctx.state_store.save(job_state)
+                log.info("stored_original_reference",
+                         original_analysis_id=job_state.original_analysis_result_id)
+
+        # MutationAgent will self-activate on the DecisionIssuedEvent
+        # (action=retry_with_mutation) — no explicit command dispatch needed.
+        log.info("autonomous_mutation_queued",
+                 strategy=mutation_strategy,
+                 cycle=job_state.mutation_cycle_count)
         return True
+
+    def _build_feedback_context(
+        self,
+        analysis_result: dict | None,
+        job_state: JobState,
+    ) -> dict:
+        """Build feedback context from analysis/VT data to guide next mutation.
+
+        The returned dict tells MutationAgent which AV engines detected the
+        variant and what detection names they used, so the LLM can focus on
+        evading those specific signatures.
+        """
+        ctx: dict = {
+            "cycle": job_state.mutation_cycle_count,
+            "previous_strategies": job_state.requested_strategies[:job_state.mutation_cycle_count + 1],
+        }
+
+        # VT detection delta from JobState
+        if job_state.vt_variant_malicious is not None:
+            ctx["vt_variant_detections"] = job_state.vt_variant_malicious
+            ctx["vt_original_detections"] = job_state.vt_original_malicious
+            ctx["vt_delta"] = job_state.vt_detection_delta
+
+        # Extract detection details from analysis result
+        if analysis_result:
+            iocs = analysis_result.get("iocs", [])
+            if iocs:
+                ctx["detected_iocs"] = [
+                    {"type": ioc.get("type", ""), "value": str(ioc.get("value", ""))[:100]}
+                    for ioc in iocs[:20]
+                ]
+            # Behavior categories indicate what triggered detection
+            categories = analysis_result.get("behavior_categories", [])
+            if categories:
+                ctx["behavior_categories"] = categories
+            threat_score = analysis_result.get("threat_score", 0)
+            if threat_score:
+                ctx["threat_score"] = threat_score
+
+            # Suggest focus areas based on detected behaviors
+            suggestions = []
+            cat_set = {c.lower() for c in categories} if categories else set()
+            if cat_set & {"stealer", "exfiltration", "network"}:
+                suggestions.append("Focus on obfuscating network-related strings and API calls")
+            if cat_set & {"persistence", "registry"}:
+                suggestions.append("Focus on obfuscating registry key paths and persistence mechanisms")
+            if cat_set & {"injection", "process_manipulation"}:
+                suggestions.append("Focus on obfuscating process injection API calls")
+            if cat_set & {"file_operations", "dropper"}:
+                suggestions.append("Focus on obfuscating file paths and file operation strings")
+            if suggestions:
+                ctx["mutation_suggestions"] = suggestions
+
+        return ctx
 
 
 def _summarize_analysis(analysis: dict) -> dict:

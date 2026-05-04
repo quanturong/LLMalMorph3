@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import multiprocessing
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import structlog
@@ -24,9 +27,13 @@ import structlog
 _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+_AUTOMATION = _SRC / "automation"
+if str(_AUTOMATION) not in sys.path:
+    sys.path.insert(0, str(_AUTOMATION))
 
 from project_compiler import ProjectCompiler  # type: ignore
 from project_detector import ProjectDetector  # type: ignore
+from vendor_classifier import classify_source_file  # type: ignore
 
 from broker.topics import Topic
 from contracts.job import JobStatus
@@ -41,6 +48,18 @@ _MAX_FIX_ATTEMPTS = 5  # Increased from 3 for better success rate
 _PERMISSIVE_RETRY_ATTEMPTS = 2  # Separate permissive mode retries
 _MAX_SURGICAL_FIX_ATTEMPTS = 3  # For large files
 _VSG_STRATEGY_NAMES = {"variant_source_generator", "vsg", "mutation_vsg"}
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        logger.warning("invalid_int_env", name=name, value=os.environ.get(name), default=default)
+        return default
+
+
+_AUTOFIX_LLM_TIMEOUT_S = _int_env("AUTOFIX_LLM_TIMEOUT_S", 180)
+_BUILD_VALIDATION_TIMEOUT_S = _int_env("BUILD_VALIDATION_TIMEOUT_S", 1800)
 
 # Malware-specific compilation patterns
 _MALWARE_COMPILE_FLAGS = [
@@ -57,14 +76,19 @@ _MALWARE_COMPILE_FLAGS = [
 def _resolve_fixer_model() -> str:
     """Resolve the LLM model for auto-fixer from environment.
 
-    Prefers CLOUD_URL model (e.g. qwen2.5:32b on RunPod) over deepseek-chat.
+    Prefers the configured cloud/fixer model over hard-coded legacy defaults.
     Returns a model name suitable for get_llm_provider().
     """
     cloud_url = os.environ.get("CLOUD_URL", "")
     if cloud_url:
         # CLOUD_URL is set -> use a generic model name so get_llm_provider
         # routes through OpenAICompatibleProvider instead of DeepSeek.
-        return os.environ.get("FIXER_MODEL", "qwen2.5:32b")
+        return (
+            os.environ.get("FIXER_MODEL")
+            or os.environ.get("LLM_CLOUD_MODEL")
+            or os.environ.get("CLOUD_MODEL")
+            or "qwen3-coder:30b"
+        )
     return "deepseek-chat"
 
 # Event signature: VariantGeneratedEvent
@@ -91,11 +115,12 @@ class BuildValidationAgent(BaseAgent):
     capabilities = {"stage": "build_validation", "compiler": "msvc", "arch": "x86",
                      "languages": ["c", "cpp", "python", "javascript"]}
 
-    def __init__(self, ctx) -> None:
+    def __init__(self, ctx, fixer_model: str = "") -> None:
         super().__init__(ctx)
         # Stores BuildValidatedEvent keyed by job_id until state transitions to BUILD_READY.
         # Deferred so SandboxSubmitAgent sees BUILD_READY before consuming the event.
         self._pending_validated_events: dict = {}
+        self._fixer_model = fixer_model.strip()
 
     async def handle_event(self, data: dict, claimed_state) -> None:
         """Build command data from event + state."""
@@ -146,6 +171,12 @@ class BuildValidationAgent(BaseAgent):
                 await self._emit_build_failed(job_id, sample_id, correlation_id, error_msg)
                 return
 
+            # Preserve the original project root. For variant artifacts, the
+            # materialization step below rewrites source_payload["source_path"]
+            # to a temporary build tree.
+            original_source_path = str(source_payload.get("source_path", "") or "")
+            source_payload["_original_source_path"] = original_source_path
+
             # Check if this is a variant artifact with pre-assembled files
             variant_files = source_payload.get("variant_files")
             if variant_files:
@@ -182,6 +213,50 @@ class BuildValidationAgent(BaseAgent):
                 mutation_strategy=mutation_strategy,
                 log=log,
             )
+
+            # ── 1b. Load mutation data for LLM context + final rollback ───────
+            # Build a compact list of {original_name, original_body, mutated_body,
+            # source_file} for functions that were actually changed. Passed into
+            # the build subprocess for mutation-aware LLM prompts; rollback is
+            # only used after all LLM tiers have failed.
+            mutation_data: list = []
+            _mut_aid = source_payload.get("mutation_artifact_id", "")
+            if _mut_aid:
+                try:
+                    _mut_payload = await self._load_artifact(job_id, _mut_aid, log)
+                    if _mut_payload:
+                        _MAX_BODY_BYTES = 80_000  # skip pathologically large bodies
+                        _mut_source_files = [
+                            str(_mf.get("source_file", "") or "")
+                            for _mf in (_mut_payload.get("mutated_functions") or [])
+                            if _mf.get("source_file")
+                        ]
+                        _mut_root = _infer_mutation_source_root(
+                            _mut_source_files,
+                            original_source_path,
+                        )
+                        for _mf in (_mut_payload.get("mutated_functions") or []):
+                            _ob = _mf.get("original_body", "")
+                            _mb = _mf.get("mutated_body", "")
+                            _sf = _mf.get("source_file", "")
+                            _fn = _mf.get("original_name", "")
+                            if _ob and _mb and _sf and _ob != _mb:
+                                if len(_ob) + len(_mb) <= _MAX_BODY_BYTES:
+                                    _rel = _relative_source_path(_sf, _mut_root)
+                                    mutation_data.append({
+                                        "original_name": _fn,
+                                        "original_body": _ob,
+                                        "mutated_body": _mb,
+                                        "source_file": _sf,
+                                        "source_relpath": _rel,
+                                        "build_file": os.path.normpath(
+                                            os.path.join(build_source_path, _rel)
+                                        ),
+                                    })
+                    if mutation_data:
+                        log.info("mutation_data_loaded_for_rollback", count=len(mutation_data))
+                except Exception as _mde:
+                    log.warning("mutation_data_load_failed", error=str(_mde))
 
             # ── 2. Detect target project + compile ───────────────────────────
             loop = asyncio.get_event_loop()
@@ -229,18 +304,82 @@ class BuildValidationAgent(BaseAgent):
             else:
                 # Enhanced compilation with advanced retry logic (C/C++)
                 t0 = loop.time()
-                compile_result, fix_stats = await self._compile_with_advanced_retry(
-                    compiler=compiler,
-                    project=project_obj,
-                    output_dir=output_dir,
-                    output_name=output_name,
-                    job_id=job_id,
-                    sample_id=sample_id,
-                    log=log,
-                )
+                try:
+                    compile_result, fix_stats = await loop.run_in_executor(
+                        None,
+                        lambda: _run_advanced_compile_in_process(
+                            project=project_obj,
+                            compiler_name=best_compiler,
+                            output_dir=output_dir,
+                            output_name=output_name,
+                            job_id=job_id,
+                            sample_id=sample_id,
+                            fixer_model=self._fixer_model,
+                            timeout_s=_BUILD_VALIDATION_TIMEOUT_S,
+                            mutation_data=mutation_data,
+                            original_source_path=original_source_path,
+                        ),
+                    )
+                except TimeoutError:
+                    error_msg = (
+                        f"Build validation timed out after {_BUILD_VALIDATION_TIMEOUT_S}s"
+                    )
+                    log.warning(
+                        "build_validation_timeout",
+                        timeout_s=_BUILD_VALIDATION_TIMEOUT_S,
+                    )
+                    await self._emit_build_failed(job_id, sample_id, correlation_id, error_msg)
+                    return
                 compilation_time_s = loop.time() - t0
                 auto_fix_attempts = fix_stats.get("total_attempts", 0)
                 fix_stats["compilation_time_s"] = round(compilation_time_s, 3)
+
+                # ── 3b. Per-function rollback if all tiers failed ─────────────
+                # When AutoFixer is exhausted and the same file keeps failing
+                # (e.g. LLM changed arg types or stripped comment markers),
+                # restore original function bodies and retry once.
+                if not (compile_result and compile_result.success):
+                    rolled_back = await self._try_rollback_mutated_functions(
+                        job_id=job_id,
+                        source_payload=source_payload,
+                        build_source_path=build_source_path,
+                        log=log,
+                    )
+                    if rolled_back > 0:
+                        log.info("rollback_retry_start", rolled_back=rolled_back)
+                        _fixer_model = self._fixer_model or _resolve_fixer_model()
+                        try:
+                            rb_result = await loop.run_in_executor(
+                                None,
+                                lambda: _run_compile_project_in_process(
+                                    project=project_obj,
+                                    compiler_name=best_compiler,
+                                    output_dir=output_dir,
+                                    output_name=f"{output_name}_rb",
+                                    timeout_s=_BUILD_VALIDATION_TIMEOUT_S,
+                                    compile_kwargs={
+                                        "max_fix_attempts": 2,
+                                        "auto_fix": True,
+                                        "llm_model": _fixer_model,
+                                        "preserve_function_names": set(),
+                                        "extra_fix_context": _build_mutation_fix_context(
+                                            build_source_path,
+                                            mutation_data,
+                                        ),
+                                    },
+                                ),
+                            )
+                            fix_stats["rollback_triggered"] = True
+                            fix_stats["rollback_count"] = rolled_back
+                            auto_fix_attempts += getattr(rb_result, "auto_fix_attempts", 0)
+                            fix_stats["total_attempts"] += getattr(rb_result, "auto_fix_attempts", 0)
+                            if rb_result and rb_result.success:
+                                compile_result = rb_result
+                                log.info("compile_success_after_rollback", rolled_back=rolled_back)
+                            else:
+                                log.warning("rollback_compile_still_failed")
+                        except Exception as _rb_exc:
+                            log.warning("rollback_compile_exception", error=str(_rb_exc))
 
             # ── 4. Emit result event ──────────────────────────────────────────
             if compile_result and compile_result.success:
@@ -569,7 +708,7 @@ class BuildValidationAgent(BaseAgent):
                     return found[0]
         return None
 
-    async def _compile_with_advanced_retry(
+    def _compile_with_advanced_retry(
         self,
         compiler: ProjectCompiler,
         project,
@@ -578,15 +717,21 @@ class BuildValidationAgent(BaseAgent):
         job_id: str,
         sample_id: str,
         log,
+        fixer_model: str = "",
+        mutation_data: list = None,
+        original_source_path: str = "",
     ) -> tuple[Optional[object], dict]:
         """
         Advanced compilation with three-tier retry strategy:
         1. Standard compilation with auto-fix
-        2. Permissive mode retry  
+        2. Permissive mode retry
         3. Surgical fix for large files
+        4. Final targeted rollback after all LLM tiers fail
         
         Returns (compile_result, fix_stats)
         """
+        os.environ.setdefault("AUTOFIX_LLM_TIMEOUT_S", str(_AUTOFIX_LLM_TIMEOUT_S))
+
         fix_stats = {
             "total_attempts": 0,
             "standard_attempts": 0,
@@ -606,9 +751,77 @@ class BuildValidationAgent(BaseAgent):
             log.info("compiler_switched_x86", reason="x86_inline_asm_detected")
             compiler = ProjectCompiler(compiler="auto", msvc_arch="x86")
 
+        # ── Build the AutoFixer "preserve" whitelist from the ORIGINAL source.
+        # Any function defined in the input project must survive the autofixer;
+        # this stops the LLM from "fixing" a build error by deleting the
+        # offending function. Read once, reuse for all retry tiers.
+        preserve_funcs: set = set()
+        try:
+            from src.automation.semantic_validator import get_semantic_validator
+            sv = get_semantic_validator()
+            if sv and sv.available:
+                _vendor_whitelist_skipped = 0
+                for sf in getattr(project, 'source_files', []) or []:
+                    _classification = classify_source_file(sf, read_content=False)
+                    if _classification.is_vendor:
+                        _vendor_whitelist_skipped += 1
+                        continue
+                    try:
+                        with open(sf, 'r', encoding='utf-8', errors='ignore') as _fh:
+                            _src = _fh.read()
+                    except OSError:
+                        continue
+                    _ext = os.path.splitext(sf)[1].lower()
+                    _lang = 'cpp' if _ext in ('.cpp', '.cc', '.cxx', '.hpp') else 'c'
+                    preserve_funcs.update(sv.extract_function_names(_src, _lang))
+                # Defensive: never whitelist 'main' (legitimate WinMain/main rewrites).
+                preserve_funcs.discard('main')
+                if preserve_funcs:
+                    log.info(
+                        "autofix_whitelist_built",
+                        n_functions=len(preserve_funcs),
+                        vendor_files_skipped=_vendor_whitelist_skipped,
+                    )
+                elif _vendor_whitelist_skipped:
+                    log.info(
+                        "autofix_whitelist_empty_after_vendor_filter",
+                        vendor_files_skipped=_vendor_whitelist_skipped,
+                    )
+        except Exception as e:  # noqa: BLE001 — best-effort, never fail build
+            log.warning("autofix_whitelist_build_failed", error=str(e))
+
+        # Stricter line-loss cap for production runs (was 0.30 default).
+        _autofix_min_line_ratio = float(
+            os.environ.get("AUTOFIX_MIN_LINE_RATIO", "0.65")
+        )
+        _autofix_max_deleted = int(
+            os.environ.get("AUTOFIX_MAX_DELETED_FUNCTIONS", "1")
+        )
+
+        # ── Pre-fix: deterministic missing-header patcher ────────────────────
+        # Scan for C3861 "identifier not found" caused by dead API injection
+        # (strat_2) referencing APIs whose headers aren't included.  Fix by
+        # injecting #include + #pragma comment(lib, ...) into the affected
+        # source files — zero LLM calls, zero retries wasted.
+        try:
+            patched = self._patch_missing_headers_deterministic(project, log)
+            if patched:
+                log.info("prefix_header_patch_applied", files_patched=patched)
+                fix_stats["error_categories"].append("missing_headers_autopatched")
+        except Exception as _ph_exc:
+            log.warning("prefix_header_patch_failed", error=str(_ph_exc))
+
+        _fixer_model = (fixer_model or _resolve_fixer_model()).strip()
+        log.info("autofix_model_selected", model=_fixer_model)
+        _mutation_fix_context = _build_mutation_fix_context(
+            getattr(project, "root_dir", ""),
+            mutation_data or [],
+        )
+        if _mutation_fix_context:
+            log.info("mutation_fix_context_enabled", functions=len(mutation_data or []))
+
         # Tier 1: Standard compilation with auto-fix
         log.info("compile_attempt_standard", attempt=1)
-        _fixer_model = _resolve_fixer_model()
         try:
             result = compiler.compile_project(
                 project=project,
@@ -617,6 +830,10 @@ class BuildValidationAgent(BaseAgent):
                 max_fix_attempts=_MAX_FIX_ATTEMPTS,
                 auto_fix=True,
                 llm_model=_fixer_model,
+                preserve_function_names=preserve_funcs,
+                autofix_min_line_ratio=_autofix_min_line_ratio,
+                autofix_max_deleted_functions=_autofix_max_deleted,
+                extra_fix_context=_mutation_fix_context,
             )
             fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
             fix_stats["standard_attempts"] += getattr(result, "auto_fix_attempts", 0)
@@ -646,6 +863,10 @@ class BuildValidationAgent(BaseAgent):
                     auto_fix=True,
                     permissive_mode=True,
                     llm_model=_fixer_model,
+                    preserve_function_names=preserve_funcs,
+                    autofix_min_line_ratio=_autofix_min_line_ratio,
+                    autofix_max_deleted_functions=_autofix_max_deleted,
+                    extra_fix_context=_mutation_fix_context,
                 )
                 fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
                 fix_stats["permissive_attempts"] += getattr(result, "auto_fix_attempts", 0)
@@ -677,6 +898,10 @@ class BuildValidationAgent(BaseAgent):
                 auto_fix=True,
                 llm_fixer_max_code_length=1,  # Force surgical mode on all files
                 llm_model=_fixer_model,
+                preserve_function_names=preserve_funcs,
+                autofix_min_line_ratio=_autofix_min_line_ratio,
+                autofix_max_deleted_functions=_autofix_max_deleted,
+                extra_fix_context=_mutation_fix_context,
             )
             fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
             fix_stats["surgical_attempts"] += getattr(result, "auto_fix_attempts", 0)
@@ -691,11 +916,54 @@ class BuildValidationAgent(BaseAgent):
             log.warning("compile_exception_surgical", error=str(e))
             fix_stats["error_categories"].append("exception_surgical")
 
-        # Final attempt: Return last result or None
+        # ── Targeted rollback: all LLM tiers exhausted ───────────────────────
+        # Roll back only the mutated functions whose files still have errors.
+        # More surgical than full rollback — other mutations survive.
+        if mutation_data:
+            try:
+                _rb_probe = last_result or compiler.compile_project(
+                    project=project,
+                    output_dir=output_dir + "_rbprobe",
+                    output_name=output_name + "_rbprobe",
+                    max_fix_attempts=0,
+                    auto_fix=False,
+                )
+                error_files = _extract_error_files(_rb_probe) if _rb_probe else set()
+                if error_files:
+                    rolled = _apply_targeted_rollback(
+                        project.root_dir,
+                        original_source_path,
+                        mutation_data,
+                        error_files,
+                        log,
+                    )
+                    if rolled > 0:
+                        fix_stats["targeted_rollback_count"] = rolled
+                        log.info(
+                            "targeted_rollback_post_llm",
+                            count=rolled,
+                            error_files=len(error_files),
+                        )
+                        rb_result = compiler.compile_project(
+                            project=project,
+                            output_dir=output_dir + "_rb",
+                            output_name=output_name + "_rb",
+                            max_fix_attempts=0,
+                            auto_fix=False,
+                        )
+                        if rb_result and rb_result.success:
+                            fix_stats["targeted_rollback_success"] = True
+                            log.info("compile_success_targeted_rollback")
+                            return rb_result, fix_stats
+                        last_result = rb_result
+            except Exception as _rb_exc:
+                log.warning("targeted_rollback_error", error=str(_rb_exc))
+
+        # Final attempt: Return last result (never None — None produces misleading 'Compiler not available' message)
         if last_result and last_result.errors:
             fix_stats["final_error_count"] = last_result.errors.count("error")
         log.warning("compile_failed_all_tiers", fix_stats=fix_stats)
-        return None, fix_stats
+        return last_result, fix_stats
 
     async def _prepare_malware_compilation(self, project, log):
         """
@@ -918,6 +1186,113 @@ class BuildValidationAgent(BaseAgent):
             
         return "compilation_error"
 
+    # ── Known-API → (header_to_include, pragma_lib_or_None) mapping ──────────
+    # Only APIs that strat_2 / strat_5 dead-code injection might use.
+    # All entries here are deterministically fixable: just add the #include.
+    _MISSING_HEADER_MAP: dict[str, tuple[str, str | None]] = {
+        # WinInet (strat_2 legacy pool — prompt updated but old runs may exist)
+        "InternetOpenA":        ("<wininet.h>",  "wininet.lib"),
+        "InternetOpenW":        ("<wininet.h>",  "wininet.lib"),
+        "InternetConnectA":     ("<wininet.h>",  "wininet.lib"),
+        "InternetConnectW":     ("<wininet.h>",  "wininet.lib"),
+        "HttpOpenRequestA":     ("<wininet.h>",  "wininet.lib"),
+        "HttpSendRequestA":     ("<wininet.h>",  "wininet.lib"),
+        "InternetReadFile":     ("<wininet.h>",  "wininet.lib"),
+        "InternetCloseHandle":  ("<wininet.h>",  "wininet.lib"),
+        "InternetOpenUrlA":     ("<wininet.h>",  "wininet.lib"),
+        "InternetOpenUrlW":     ("<wininet.h>",  "wininet.lib"),
+        # Urlmon
+        "URLDownloadToFileA":   ("<urlmon.h>",   "urlmon.lib"),
+        "URLDownloadToFileW":   ("<urlmon.h>",   "urlmon.lib"),
+        # TlHelp32 (if not already included)
+        "CreateToolhelp32Snapshot": ("<tlhelp32.h>", None),
+        "Process32First":       ("<tlhelp32.h>", None),
+        "Process32Next":        ("<tlhelp32.h>", None),
+        "Thread32First":        ("<tlhelp32.h>", None),
+        "Thread32Next":         ("<tlhelp32.h>", None),
+        # ShellAPI (usually pulled by shlobj.h but not always)
+        "ShellExecuteA":        ("<shellapi.h>", "shell32.lib"),
+        "ShellExecuteW":        ("<shellapi.h>", "shell32.lib"),
+        # Wintrust
+        "WinVerifyTrust":       ("<wintrust.h>", "wintrust.lib"),
+        # Psapi
+        "EnumProcesses":        ("<psapi.h>",    "psapi.lib"),
+        "GetModuleFileNameExA": ("<psapi.h>",    "psapi.lib"),
+        # Ntdll / winternl
+        "NtQueryInformationProcess": ("<winternl.h>", None),
+    }
+
+    def _patch_missing_headers_deterministic(self, project, log) -> int:
+        """
+        Scan project source files for C3861 'identifier not found' symbols that
+        can be resolved by adding a known #include.  Injects the include (and
+        optional #pragma comment lib) at the top of the affected file, just
+        after the last existing #include line, without touching any other code.
+
+        Returns the number of files that were patched.
+        """
+        import re as _re
+
+        source_files: list[str] = getattr(project, "source_files", []) or []
+        if not source_files:
+            return 0
+
+        patched_count = 0
+        for src_path in source_files:
+            try:
+                content = open(src_path, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+
+            # Find all identifiers in this file that are in the missing-header map
+            needed: dict[str, tuple[str, str | None]] = {}
+            for api, (hdr, lib) in self._MISSING_HEADER_MAP.items():
+                if _re.search(r'\b' + _re.escape(api) + r'\b', content):
+                    # Only add if the header is not already present
+                    if hdr.strip("<>") not in content and hdr.strip('"') not in content:
+                        needed[hdr] = (hdr, lib)
+
+            if not needed:
+                continue
+
+            # Build the inject block: #include lines + #pragma comment(lib, ...) lines
+            inject_lines: list[str] = []
+            for hdr, lib in sorted(needed.values(), key=lambda x: x[0]):
+                inject_lines.append(f"#include {hdr}")
+                if lib and f'"{lib}"' not in content:
+                    inject_lines.append(f'#pragma comment(lib, "{lib}")')
+            inject_block = "\n".join(inject_lines) + "\n"
+
+            # Insert after the last #include / #pragma comment line in the file
+            # (preserves existing header order, avoids forward-declaration issues)
+            last_include_end = 0
+            for m in _re.finditer(
+                r'^[ \t]*(?:#include\s+[<"][^>"]+[>"]|#pragma\s+comment\s*\(\s*lib\b[^\)]*\))',
+                content,
+                _re.MULTILINE,
+            ):
+                last_include_end = m.end()
+
+            if last_include_end:
+                new_content = content[:last_include_end] + "\n" + inject_block + content[last_include_end:]
+            else:
+                # Fallback: prepend
+                new_content = inject_block + content
+
+            try:
+                open(src_path, "w", encoding="utf-8").write(new_content)
+                log.info(
+                    "missing_header_patched",
+                    file=os.path.basename(src_path),
+                    headers=[h for h, _ in needed.values()],
+                )
+                patched_count += 1
+            except OSError as write_err:
+                log.warning("missing_header_patch_write_failed",
+                            file=src_path, error=str(write_err))
+
+        return patched_count
+
     def _format_detailed_error(self, error_message: str, fix_stats: dict, error_category: str) -> str:
         """Format detailed error report with fix statistics."""
         total_attempts = fix_stats.get("total_attempts", 0)
@@ -954,6 +1329,104 @@ class BuildValidationAgent(BaseAgent):
         )
         await self._ctx.broker.publish(Topic.EVENTS_ALL, event)
 
+    async def _try_rollback_mutated_functions(
+        self,
+        job_id: str,
+        source_payload: dict,
+        build_source_path: str,
+        log,
+    ) -> int:
+        """Restore original function bodies in build_source_path for all mutated functions.
+
+        Called when all AutoFixer tiers fail. Replaces each mutated_body with
+        original_body in the on-disk materialized source so a final compile
+        attempt can succeed using the original (known-good) function code.
+
+        Returns the number of functions successfully rolled back.
+        """
+        mutation_artifact_id = source_payload.get("mutation_artifact_id", "")
+        if not mutation_artifact_id:
+            log.debug("rollback_skipped_no_artifact_id")
+            return 0
+        if not build_source_path or not os.path.isdir(build_source_path):
+            log.debug("rollback_skipped_no_build_dir", path=build_source_path)
+            return 0
+
+        try:
+            mutation_payload = await self._load_artifact(job_id, mutation_artifact_id, log)
+        except Exception as e:
+            log.warning("rollback_artifact_load_failed", error=str(e))
+            return 0
+
+        if not mutation_payload:
+            log.warning("rollback_mutation_payload_missing", artifact_id=mutation_artifact_id)
+            return 0
+
+        mutated_functions = mutation_payload.get("mutated_functions", [])
+        if not mutated_functions:
+            return 0
+
+        original_source_path = (
+            source_payload.get("_original_source_path")
+            or source_payload.get("source_path", "")
+        )
+        _mut_source_files = [
+            str(mf.get("source_file", "") or "")
+            for mf in mutated_functions
+            if mf.get("source_file")
+        ]
+        _mut_root = _infer_mutation_source_root(_mut_source_files, original_source_path)
+        rolled_back = 0
+        modified_files: dict = {}  # rel_path -> current content (str)
+
+        for mf in mutated_functions:
+            original_body = mf.get("original_body", "")
+            mutated_body = mf.get("mutated_body", "")
+            source_file = mf.get("source_file", "")
+            func_name = mf.get("original_name", "unknown")
+
+            if not original_body or not mutated_body or not source_file:
+                continue
+            if original_body == mutated_body:
+                continue  # not actually mutated, skip
+
+            # Compute relative path of the source file vs the original project root.
+            rel_path = _relative_source_path(source_file, _mut_root)
+
+            # Load file content from the materialized build directory (once per file)
+            if rel_path not in modified_files:
+                build_file = os.path.join(build_source_path, rel_path)
+                if not os.path.exists(build_file):
+                    log.warning("rollback_file_not_found", file=build_file, func=func_name)
+                    continue
+                try:
+                    with open(build_file, "r", encoding="utf-8", errors="ignore") as fh:
+                        modified_files[rel_path] = fh.read()
+                except OSError as e:
+                    log.warning("rollback_file_read_failed", file=build_file, error=str(e))
+                    continue
+
+            content = modified_files[rel_path]
+            if mutated_body in content:
+                modified_files[rel_path] = content.replace(mutated_body, original_body, 1)
+                rolled_back += 1
+                log.info("rollback_function_restored", func=func_name, file=rel_path)
+            else:
+                log.warning("rollback_body_not_found_in_file", func=func_name, file=rel_path)
+
+        # Write modified files back to disk
+        for rel_path, content in modified_files.items():
+            build_file = os.path.join(build_source_path, rel_path)
+            try:
+                with open(build_file, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+            except OSError as e:
+                log.warning("rollback_file_write_failed", file=build_file, error=str(e))
+
+        if rolled_back > 0:
+            log.info("rollback_complete", total_rolled_back=rolled_back)
+        return rolled_back
+
 
 def _sha256_file(path: str) -> str:
     h = hashlib.sha256()
@@ -961,3 +1434,380 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _compile_result_to_payload(result) -> Optional[dict]:
+    if result is None:
+        return None
+    payload = result.to_dict() if hasattr(result, "to_dict") else {}
+    for attr in (
+        "success",
+        "executable_path",
+        "output",
+        "errors",
+        "warnings",
+        "compile_time",
+        "executable_size",
+        "auto_fix_attempts",
+    ):
+        payload[attr] = getattr(result, attr, payload.get(attr, None))
+    # Keep IPC bounded if a compiler emits a very large transcript.
+    for attr in ("output", "errors", "warnings"):
+        value = payload.get(attr)
+        if isinstance(value, str) and len(value) > 200_000:
+            payload[attr] = value[:200_000] + "\n...[truncated by build worker IPC]..."
+    return payload
+
+
+def _payload_to_compile_result(payload: Optional[dict]):
+    if payload is None:
+        return None
+    return SimpleNamespace(**payload)
+
+
+def _kill_process_tree(pid: int) -> None:
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                timeout=15,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+            logger.warning("taskkill_failed", pid=pid, error=str(exc))
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+
+
+def _run_build_worker_process(target, args: tuple, timeout_s: int) -> dict:
+    import json as _json
+    import tempfile
+
+    ctx = multiprocessing.get_context("spawn")
+    fd, result_path = tempfile.mkstemp(prefix="build_worker_", suffix=".json")
+    try:
+        os.close(fd)
+        proc = ctx.Process(target=target, args=(result_path, *args), daemon=False)
+        proc.start()
+        proc.join(timeout_s)
+
+        if proc.is_alive():
+            _kill_process_tree(proc.pid)
+            proc.join(2)
+            raise TimeoutError(f"Build worker timed out after {timeout_s}s")
+
+        if not os.path.exists(result_path) or os.path.getsize(result_path) == 0:
+            raise RuntimeError(
+                f"Build worker exited with code {proc.exitcode} without returning a result"
+            )
+        with open(result_path, "r", encoding="utf-8") as fh:
+            payload = _json.load(fh)
+    finally:
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass
+
+    if not payload.get("ok"):
+        error = payload.get("error", "unknown worker error")
+        traceback_text = payload.get("traceback", "")
+        if traceback_text:
+            error = f"{error}\n{traceback_text}"
+        raise RuntimeError(error)
+
+    return payload
+
+
+def _write_worker_payload(result_path: str, payload: dict) -> None:
+    import json as _json
+
+    with open(result_path, "w", encoding="utf-8") as fh:
+        _json.dump(payload, fh)
+
+
+# ── Final targeted rollback helpers ──────────────────────────────────────────
+
+def _path_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+
+def _relative_source_path(source_file: str, source_root: str = "") -> str:
+    """Return a stable relative path for a mutation source file."""
+    if not source_file:
+        return ""
+    try:
+        if source_root:
+            return os.path.normpath(os.path.relpath(source_file, source_root))
+    except ValueError:
+        pass
+    return os.path.basename(source_file)
+
+
+def _infer_mutation_source_root(source_files: list[str], preferred_root: str = "") -> str:
+    """Infer the original source root for mutation artifacts."""
+    preferred_root = str(preferred_root or "")
+    if preferred_root and os.path.isdir(preferred_root):
+        preferred_key = _path_key(preferred_root)
+        if any(_path_key(sf).startswith(preferred_key + os.sep) for sf in source_files):
+            return preferred_root
+
+    dirs = [os.path.dirname(sf) for sf in source_files if sf]
+    if not dirs:
+        return preferred_root
+    try:
+        return os.path.commonpath(dirs)
+    except ValueError:
+        return preferred_root or dirs[0]
+
+
+def _build_mutation_fix_context(
+    build_source_path: str,
+    mutation_data: list,
+    max_chars: int = 6000,
+) -> str:
+    """Build compact, generic context so AutoFixer repairs generated edits in place."""
+    if not mutation_data:
+        return ""
+
+    by_file: dict[str, list[str]] = {}
+    for mf in mutation_data:
+        rel = mf.get("source_relpath") or _relative_source_path(mf.get("source_file", ""))
+        name = mf.get("original_name") or "unknown"
+        by_file.setdefault(rel, []).append(str(name))
+
+    lines = [
+        "MUTATION REPAIR CONTEXT:",
+        "- This source tree is a generated variant; repair compile errors with the smallest local edit that preserves generated changes.",
+        "- Do not delete functions, includes, macros, typedefs, or unrelated code to make errors disappear.",
+        "- Prefer fixing declarations, local variable types, call arguments, and missing prototypes around the reported line.",
+        "- Preserve existing public function signatures unless the compiler error explicitly identifies that declaration as wrong.",
+        "- Mutated functions by file:",
+    ]
+    for rel, names in sorted(by_file.items()):
+        joined = ", ".join(names[:12])
+        if len(names) > 12:
+            joined += f", ... (+{len(names) - 12})"
+        lines.append(f"  - {rel}: {joined}")
+
+    context = "\n".join(lines)
+    if len(context) > max_chars:
+        context = context[:max_chars] + "\n...[mutation context truncated]..."
+    return context
+
+
+def _extract_error_files(compile_result) -> set:
+    """Return a set of normalised absolute file paths that have compile errors."""
+    files: set = set()
+    errors = getattr(compile_result, "errors", "") or ""
+    if isinstance(errors, list):
+        errors = "\n".join(str(e) for e in errors)
+    # GCC:  /abs/path/file.cpp:123:45: error:
+    # MSVC: C:\path\file.cpp(123): error C2065:
+    for pattern in [
+        r'([A-Za-z]:[/\\][^\n:()"]+\.(?:c|cpp|cc|cxx|h|hpp))[:(]\d+',
+        r'(/[^\n:()"]+\.(?:c|cpp|cc|cxx|h|hpp))[:(]\d+',
+    ]:
+        for m in re.finditer(pattern, errors, re.IGNORECASE):
+            files.add(os.path.normpath(m.group(1)))
+    return files
+
+
+def _apply_targeted_rollback(
+    build_source_path: str,
+    original_source_path: str,
+    mutation_data: list,
+    error_files: set,
+    log,
+) -> int:
+    """Replace mutated function bodies with originals for files that have compile errors.
+
+    Modifies source files in-place.  Maps each mutation's *source_file* (which
+    is the path inside the original samples dir) to its materialized build path
+    using the same relpath logic as ``_try_rollback_mutated_functions``.  Only
+    touches functions whose materialized build file is found in *error_files*.
+    Returns the number of functions rolled back.
+    """
+    if not mutation_data or not error_files:
+        return 0
+
+    rolled_back = 0
+    error_file_keys = {_path_key(path) for path in error_files}
+    # Buffer per build file so we do a single read + write per file
+    file_contents: dict = {}  # normpath(build_file) -> content
+
+    for mf in mutation_data:
+        source_file = mf.get("source_file", "")
+        original_body = mf.get("original_body", "")
+        mutated_body = mf.get("mutated_body", "")
+        func_name = mf.get("original_name", "?")
+
+        if not (source_file and original_body and mutated_body):
+            continue
+        if original_body == mutated_body:
+            continue
+
+        # Map original samples path → materialized build path
+        build_file = mf.get("build_file", "")
+        if build_file:
+            build_file = os.path.normpath(build_file)
+        else:
+            rel = mf.get("source_relpath") or _relative_source_path(
+                source_file,
+                original_source_path,
+            )
+            build_file = os.path.normpath(os.path.join(build_source_path, rel))
+
+        if _path_key(build_file) not in error_file_keys:
+            continue
+
+        if build_file not in file_contents:
+            try:
+                with open(build_file, "r", encoding="utf-8", errors="ignore") as fh:
+                    file_contents[build_file] = fh.read()
+            except OSError as exc:
+                log.warning("targeted_rollback_read_failed", file=build_file, error=str(exc))
+                continue
+
+        content = file_contents[build_file]
+        if mutated_body in content:
+            file_contents[build_file] = content.replace(mutated_body, original_body, 1)
+            rolled_back += 1
+            log.info(
+                "targeted_rollback_applied",
+                func=func_name,
+                file=os.path.basename(build_file),
+            )
+        else:
+            log.debug("targeted_rollback_body_not_found", func=func_name)
+
+    for path, content in file_contents.items():
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        except OSError as exc:
+            log.warning("targeted_rollback_write_failed", file=path, error=str(exc))
+
+    return rolled_back
+
+
+def _advanced_compile_worker_main(
+    result_path: str,
+    project,
+    compiler_name: str,
+    output_dir: str,
+    output_name: str,
+    job_id: str,
+    sample_id: str,
+    fixer_model: str = "",
+    mutation_data: list = None,
+    original_source_path: str = "",
+) -> None:
+    try:
+        worker_log = logger.bind(job_id=job_id, worker="advanced_compile_process")
+        compiler = ProjectCompiler(compiler=compiler_name, msvc_arch="x86")
+        helper = object.__new__(BuildValidationAgent)
+        result, fix_stats = BuildValidationAgent._compile_with_advanced_retry(
+            helper,
+            compiler=compiler,
+            project=project,
+            output_dir=output_dir,
+            output_name=output_name,
+            job_id=job_id,
+            sample_id=sample_id,
+            log=worker_log,
+            fixer_model=fixer_model,
+            mutation_data=mutation_data,
+            original_source_path=original_source_path,
+        )
+        _write_worker_payload(
+            result_path,
+            {
+                "ok": True,
+                "result": _compile_result_to_payload(result),
+                "fix_stats": fix_stats,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - process boundary must report all failures
+        import traceback
+
+        _write_worker_payload(
+            result_path,
+            {
+                "ok": False,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+
+
+def _compile_project_worker_main(
+    result_path: str,
+    project,
+    compiler_name: str,
+    output_dir: str,
+    output_name: str,
+    compile_kwargs: dict,
+) -> None:
+    try:
+        compiler = ProjectCompiler(compiler=compiler_name, msvc_arch="x86")
+        result = compiler.compile_project(
+            project=project,
+            output_dir=output_dir,
+            output_name=output_name,
+            **compile_kwargs,
+        )
+        _write_worker_payload(
+            result_path,
+            {"ok": True, "result": _compile_result_to_payload(result)},
+        )
+    except Exception as exc:  # noqa: BLE001 - process boundary must report all failures
+        import traceback
+
+        _write_worker_payload(
+            result_path,
+            {
+                "ok": False,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+
+
+def _run_advanced_compile_in_process(
+    project,
+    compiler_name: str,
+    output_dir: str,
+    output_name: str,
+    job_id: str,
+    sample_id: str,
+    fixer_model: str,
+    timeout_s: int,
+    mutation_data: list = None,
+    original_source_path: str = "",
+):
+    payload = _run_build_worker_process(
+        _advanced_compile_worker_main,
+        (project, compiler_name, output_dir, output_name, job_id, sample_id, fixer_model,
+         mutation_data or [], original_source_path),
+        timeout_s,
+    )
+    return _payload_to_compile_result(payload.get("result")), payload.get("fix_stats", {})
+
+
+def _run_compile_project_in_process(
+    project,
+    compiler_name: str,
+    output_dir: str,
+    output_name: str,
+    timeout_s: int,
+    compile_kwargs: dict,
+):
+    payload = _run_build_worker_process(
+        _compile_project_worker_main,
+        (project, compiler_name, output_dir, output_name, compile_kwargs),
+        timeout_s,
+    )
+    return _payload_to_compile_result(payload.get("result"))

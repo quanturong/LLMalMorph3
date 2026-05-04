@@ -33,6 +33,13 @@ def load_default_policy() -> PolicyConfig:
     disable_close = os.getenv("DECISION_DISABLE_CLOSE_NO_BEHAVIOR", "0").strip().lower() in {
         "1", "true", "yes", "on"
     }
+    disable_high_score_escalation = (
+        os.getenv("DECISION_DISABLE_HIGH_SCORE_ESCALATION", "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    escalation_score_threshold = float(
+        os.getenv("DECISION_ESCALATION_SCORE_THRESHOLD", "8.0")
+    )
     hard_rules: List[PolicyRule] = [
         PolicyRule(
             rule_id="hard_001",
@@ -70,13 +77,15 @@ def load_default_policy() -> PolicyConfig:
 
     if disable_close:
         hard_rules = [rule for rule in hard_rules if rule.rule_id != "hard_003"]
+    if disable_high_score_escalation:
+        hard_rules = [rule for rule in hard_rules if rule.rule_id != "hard_004"]
 
     return PolicyConfig(
         max_sandbox_retries=3,
         max_build_retries=5,
         max_total_job_retries=10,
         min_score_for_analysis=0.1,
-        escalation_score_threshold=8.0,
+        escalation_score_threshold=escalation_score_threshold,
         allowed_actions={
             JobStatus.DECISION_ISSUED.value: list(DecisionAction),
         },
@@ -145,12 +154,31 @@ class PolicyEngine:
             return override
 
         # Check allowed actions for current state
+        # Convert LLM string literal to DecisionAction enum
+        try:
+            recommended = DecisionAction(llm_output.recommended_action)
+        except ValueError:
+            logger.warning(
+                "LLM recommended unknown action '%s'. Falling back to ESCALATE_TO_ANALYST.",
+                llm_output.recommended_action,
+            )
+            return DecisionResult(
+                job_id=job_state.job_id,
+                sample_id=job_state.sample_id,
+                action=DecisionAction.ESCALATE_TO_ANALYST,
+                rationale=f"LLM recommended unknown action '{llm_output.recommended_action}'.",
+                confidence=1.0,
+                source=DecisionSource.POLICY_OVERRIDE,
+                llm_raw_output=llm_output.model_dump(),
+            )
+
+        # Check allowed actions for current state
         allowed = self.config.get_allowed_actions(job_state.current_status.value)
-        if llm_output.recommended_action not in allowed:
+        if recommended not in allowed:
             logger.warning(
                 "LLM recommended %s which is not in allowed actions for state %s. "
                 "Falling back to ESCALATE_TO_ANALYST.",
-                llm_output.recommended_action.value,
+                recommended.value,
                 job_state.current_status.value,
             )
             return DecisionResult(
@@ -158,7 +186,7 @@ class PolicyEngine:
                 sample_id=job_state.sample_id,
                 action=DecisionAction.ESCALATE_TO_ANALYST,
                 rationale=(
-                    f"LLM recommended '{llm_output.recommended_action.value}' "
+                    f"LLM recommended '{recommended.value}' "
                     f"which is not allowed in state '{job_state.current_status.value}'."
                 ),
                 confidence=1.0,
@@ -170,7 +198,7 @@ class PolicyEngine:
         return DecisionResult(
             job_id=job_state.job_id,
             sample_id=job_state.sample_id,
-            action=llm_output.recommended_action,
+            action=recommended,
             rationale=llm_output.rationale,
             confidence=llm_output.confidence,
             source=DecisionSource.LLM_ADVISORY,

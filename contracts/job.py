@@ -85,8 +85,11 @@ class JobEnvelope(BaseModel):
 
     # Pipeline parameters
     requested_strategies: List[str] = Field(default_factory=list)
+    strategy_mode: str = "single"      # "single" | "stack" (apply all requested strategies sequentially)
+    max_generations: int = 1           # multi-generation evolution: how many mutation→build→test cycles
     num_functions: int = 3
     target_functions: List[str] = Field(default_factory=list)  # force specific functions by name
+    llm_retry_attempts: int = 5       # per-function LLM retry attempts
     sandbox_backend: str = "cape"      # "cape" | "virustotal" | "inetsim"
     sandbox_timeout_s: int = 300
 
@@ -127,8 +130,12 @@ class JobState(BaseModel):
     project_name: str = ""
     language: str = ""
     requested_strategies: List[str] = Field(default_factory=list)
+    strategy_mode: str = "single"      # "single" | "stack"
+    max_generations: int = 1           # multi-generation evolution: total mutation cycles
+    current_generation: int = 1        # which generation we are on now
     num_functions: int = 3
     target_functions: List[str] = Field(default_factory=list)
+    llm_retry_attempts: int = 5       # per-function LLM retry attempts (from config)
 
     # Retry tracking
     retry_count: int = 0
@@ -160,6 +167,13 @@ class JobState(BaseModel):
     original_job_id: Optional[str] = None          # Reference to original sample job
     original_analysis_result_id: Optional[str] = None  # Original sample analysis
     comparison_result_id: Optional[str] = None     # Comparison analysis result
+
+    # VirusTotal data (populated by ReportingAgent VT submission)
+    vt_comparison_artifact_id: Optional[str] = None
+    vt_original_malicious: Optional[int] = None
+    vt_variant_malicious: Optional[int] = None
+    vt_detection_delta: Optional[int] = None
+    vt_direction: Optional[str] = None
 
     # Build fix statistics (populated by BuildValidationAgent)
     fix_stats: Optional[Dict[str, Any]] = None

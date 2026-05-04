@@ -105,11 +105,7 @@ def get_only_func_name(input_string):
 def get_node_text(source_code, node):
     lines = source_code.splitlines()
     start_line, start_char = node.start_point
-    print('IN GET NODE TEXT FUNCTION:')
-    print(node.start_point)
     end_line, end_char = node.end_point
-    print(start_line, end_line)
-    print(node.end_point)
     if start_line == end_line:
         return lines[start_line][start_char:end_char]
     else:
@@ -200,7 +196,6 @@ def extract_functions_globals_headers(source_code, tree):
     root_node = tree.root_node
 
     def visit(node):
-        print('NODE TYPE:', node.type)
         if node.type == "function_definition":
             # print('------Function Definition Node: ------')
             # print(node)
@@ -293,12 +288,10 @@ def extract_functions_globals_headers(source_code, tree):
                 "reference_declarator",
             ):
                 # remove * symbol from the name
-                print('HERE!', func_name)
                 func_name = get_only_func_name(func_name)
 
             start_line = node.start_point[0] + 1 + offset
             end_line = node.end_point[0] + 1
-            print('FUNCTION NAME:', func_name)
             functions.append(
                 {
                     "name_with_params": func_name,
@@ -361,7 +354,6 @@ def extract_functions_globals_headers(source_code, tree):
             # print("Inside struct node")
             # print('STRUCT NODE:', node)
             structure_body = get_node_text(source_code, node)
-            print('STRUCTURE BODY:', structure_body)
             if structure_body[-1] != ";":
                 structure_body += ";"
 

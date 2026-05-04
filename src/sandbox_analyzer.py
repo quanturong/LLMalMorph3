@@ -172,13 +172,20 @@ class CapeApiClient:
         GET  /apiv2/tasks/delete/{id}/      - delete task (cleanup)
     """
     
-    def __init__(self, api_url: str, api_token: str = '', timeout: int = 30):
+    def __init__(self, api_url: str, api_token: str = '', timeout: int = 30,
+                 http_basic_auth: str = ''):
         self.api_url = api_url.rstrip('/')
         self.api_token = api_token
         self.timeout = timeout
         self.session = requests.Session()
         if api_token:
             self.session.headers['Authorization'] = f'Token {api_token}'
+        # HTTP Basic Auth — used when CAPE sits behind Nginx with basic auth.
+        # Format: "username:password"
+        if http_basic_auth and ':' in http_basic_auth:
+            _user, _pwd = http_basic_auth.split(':', 1)
+            from requests.auth import HTTPBasicAuth
+            self.session.auth = HTTPBasicAuth(_user, _pwd)
     
     def _url(self, path: str) -> str:
         return f'{self.api_url}{path}'

@@ -121,6 +121,8 @@ class SamplePrepAgent(BaseAgent):
                     "start_line": fn.get("start_line", 0),
                     "end_line": fn.get("end_line", 0),
                     "body": fn.get("body", ""),
+                    "return_type": fn.get("return_type", ""),
+                    "name_with_params": fn.get("name_with_params", ""),
                 }
                 for fn in getattr(parse_result, "all_functions", [])
             ],

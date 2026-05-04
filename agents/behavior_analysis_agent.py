@@ -13,9 +13,11 @@ Output event:   BehaviorAnalyzedEvent
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
+from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -285,6 +287,7 @@ class BehaviorAnalysisAgent(BaseAgent):
                 [{"type": i.type.value, "value": i.value} for i in rule_iocs[:20]]
             )
             prompt = prompt_template.replace("{{report_json}}", report_excerpt)
+            prompt = prompt.replace("{{behavioral_data_json}}", report_excerpt)
             prompt = prompt.replace("{{rule_based_iocs_json}}", rule_ioc_json)
 
             request = LLMRequest(
@@ -472,6 +475,8 @@ def _extract_iocs_rule_based(report: dict) -> List[IOCEntry]:
     text_blob = " ".join(_flat_strings(report))
 
     def _add(ioc_type: IOCType, value: str, confidence: float = 0.8):
+        if not value or not value.strip():
+            return
         key = (ioc_type, value)
         if key not in seen:
             seen.add(key)
@@ -678,7 +683,72 @@ def _sequence_similarity(seq_a: List[str], seq_b: List[str]) -> float:
         return 1.0
     if not seq_a or not seq_b:
         return 0.0
-    return SequenceMatcher(a=seq_a, b=seq_b, autojunk=False).ratio()
+
+    sample_threshold = int(os.environ.get("BEHAVIOR_EQ_SEQUENCE_SAMPLE_THRESHOLD", "50000"))
+    if max(len(seq_a), len(seq_b)) <= sample_threshold:
+        return SequenceMatcher(a=seq_a, b=seq_b, autojunk=True).ratio()
+
+    # CAPE reports can contain 100k+ API calls. difflib.SequenceMatcher is
+    # quadratic-ish on large traces and can stall the behavior stage. Only for
+    # those oversized traces, build a deterministic representative trace
+    # without hard-coded API names:
+    # - keep beginning/end context
+    # - keep evenly spaced middle points
+    # - keep local transition points after repeat compression
+    # - keep rare events based on this pair of traces' own frequency profile
+    max_seq = int(os.environ.get("BEHAVIOR_EQ_MAX_API_SEQUENCE", "5000"))
+    edge_budget = max(10, max_seq // 10)
+    rare_budget = max(10, max_seq // 5)
+    combined_freq = Counter(seq_a)
+    combined_freq.update(seq_b)
+
+    def _sample(seq: List[str]) -> List[str]:
+        if len(seq) <= max_seq:
+            return seq
+
+        selected: set[int] = set()
+
+        # 1. Preserve startup and shutdown behavior.
+        selected.update(range(min(edge_budget, len(seq))))
+        selected.update(range(max(0, len(seq) - edge_budget), len(seq)))
+
+        # 2. Uniform coverage through the whole trace.
+        uniform_budget = max_seq - len(selected)
+        if uniform_budget > 0:
+            step = len(seq) / uniform_budget
+            selected.update(int(i * step) for i in range(uniform_budget))
+
+        # 3. Preserve transition boundaries and collapse long repeated runs.
+        previous = None
+        run_len = 0
+        for idx, name in enumerate(seq):
+            if name != previous:
+                selected.add(idx)
+                if idx > 0:
+                    selected.add(idx - 1)
+                previous = name
+                run_len = 1
+            else:
+                run_len += 1
+                # Keep sparse landmarks in very long repeated runs.
+                if run_len in (8, 64, 512):
+                    selected.add(idx)
+
+        # 4. Preserve rare events, derived from the current trace pair only.
+        rare_indices = sorted(
+            range(len(seq)),
+            key=lambda i: (combined_freq.get(seq[i], 0), i),
+        )[:rare_budget]
+        selected.update(rare_indices)
+
+        if len(selected) > max_seq:
+            ordered = sorted(selected)
+            step = len(ordered) / max_seq
+            selected = {ordered[int(i * step)] for i in range(max_seq)}
+
+        return [seq[i] for i in sorted(selected)]
+
+    return SequenceMatcher(a=_sample(seq_a), b=_sample(seq_b), autojunk=True).ratio()
 
 
 def _compute_behavioral_equivalence(

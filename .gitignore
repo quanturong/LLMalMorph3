@@ -126,6 +126,12 @@ temp/
 tmp/
 *.tmp
 
+# Claude / AI assistant workspace files
+.claude/
+
+# Binary documents
+*.pdf
+
 # ============================================
 # OPTIONAL: Documentation and Reports
 # ============================================

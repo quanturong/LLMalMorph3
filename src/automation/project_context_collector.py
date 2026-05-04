@@ -289,8 +289,11 @@ class ProjectContextCollector:
     def _enhance_with_parse_result(cls, parse_result, context: ProjectContext):
         """Enhance context with parse result data"""
         try:
+            allowed_files = set(context.source_files) | set(context.header_files)
             # Use parsed function information if available
             for file_path, file_info in parse_result.file_results.items():
+                if allowed_files and file_path not in allowed_files:
+                    continue
                 for func in file_info.get('functions', []):
                     func_name = func.get('name_only', '')
                     if func_name and func_name not in context.functions:

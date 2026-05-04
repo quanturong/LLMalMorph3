@@ -30,10 +30,18 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from utility_prompt_library import strategy_prompt_dict, get_strategy_prompt  # type: ignore
+from automation.vendor_classifier import classify_source_file  # type: ignore
+
+# AST-based mutation validation (tree-sitter)
+try:
+    from automation.mutation_validator import MutationValidator
+    _mutation_validator = MutationValidator()
+except Exception:
+    _mutation_validator = None  # type: ignore
 
 from broker.topics import Topic
 from contracts.job import JobStatus
-from contracts.messages import MutationCompletedEvent
+from contracts.messages import MutationCompletedEvent, ErrorEvent
 from llm.provider import LLMRequest
 
 from .base_agent import BaseAgent
@@ -126,11 +134,15 @@ class MutationAgent(BaseAgent):
         elif strategy == "strat_all":
             multiplier, lo, hi = 4.0, 4096, 16384
         elif strategy == "strat_2":
+            multiplier, lo, hi = 3.5, 4096, 16384
+        elif strategy == "strat_3":
             multiplier, lo, hi = 2.5, 4096, 10240
-        elif strategy in ("strat_3", "strat_5"):
-            multiplier, lo, hi = 2.5, 4096, 10240
+        elif strategy == "strat_5":
+            multiplier, lo, hi = 3.5, 4096, 16384
         elif strategy == "strat_4":
             multiplier, lo, hi = 3.5, 4096, 16384
+        elif strategy == "strat_6":
+            multiplier, lo, hi = 3.0, 4096, 16384
         else:
             multiplier, lo, hi = 2.0, 2048, 10240
 
@@ -195,7 +207,13 @@ class MutationAgent(BaseAgent):
             "project_name": data.get("project_name", "")
                             or (claimed_state.project_name if claimed_state else ""),
         }
-        await self.handle(cmd_data)
+        mutation_ok = await self.handle(cmd_data)
+        if not mutation_ok:
+            logger.warning(
+                "mutation_handle_failed_no_ready_transition",
+                job_id=data["job_id"],
+            )
+            return
         # Transition to MUTATION_READY after successful processing
         if self._ctx.state_store:
             state = await self._ctx.state_store.get(data["job_id"])
@@ -209,7 +227,7 @@ class MutationAgent(BaseAgent):
             return str(state.requested_strategies[idx]).strip() or "strat_1"
         return "strat_1"
 
-    async def handle(self, data: dict) -> None:
+    async def handle(self, data: dict) -> bool:
         job_id = data["job_id"]
         source_artifact_id = data["source_artifact_id"]
         language = data.get("language", "c")
@@ -260,9 +278,31 @@ class MutationAgent(BaseAgent):
             "globals": _globals_list,
             "void_funcs": _void_funcs,
         }
+        self._project_call_arg_widths = self._build_project_call_arg_widths(functions)
 
         # ── 1a. Filter out functions containing inline assembly ────────────
         # LLM cannot safely mutate inline assembly (register/opcode sensitivity)
+        functions, skipped_vendor = self._filter_vendor_functions(functions)
+        if skipped_vendor:
+            skipped_files = sorted({item["file"] for item in skipped_vendor})
+            log.info(
+                "skipped_vendor_functions",
+                count=len(skipped_vendor),
+                files=len(skipped_files),
+                file_names=[Path(p).name for p in skipped_files],
+                examples=[
+                    {
+                        "name": item["name"],
+                        "file": Path(item["file"]).name,
+                        "reasons": item["reasons"],
+                    }
+                    for item in skipped_vendor[:8]
+                ],
+            )
+        if not functions:
+            log.warning("all_functions_are_vendor", total=len(source_payload.get("functions", [])))
+            raise ValueError("All functions are in frozen vendor files - nothing safe to mutate")
+
         safe_functions = []
         skipped_asm = []
         for func in functions:
@@ -283,8 +323,12 @@ class MutationAgent(BaseAgent):
         # the LLM's max_tokens ceiling we'll always get truncated / validation-
         # failed results, so skip them upfront and save API calls.
         _MAX_BODY_CHARS = {
-            "strat_all": 12000,   # 12K chars → ~14K tokens output, fits 16384
-            "strat_2":   25000,   # error hardening adds ~30-50% overhead
+            "strat_all": 12000,   # 12K → ~14K tokens, fits 16384
+            "strat_5":   12000,   # string elimination ~3.5x expansion
+            "strat_2":   12000,   # CFG flattening + string elimination ~3.5x
+            "strat_3":   12000,   # dynamic API + string elimination ~3.5x
+            "strat_6":   15000,   # anti-behavioral + string elimination ~3x
+            "strat_4":   15000,   # splitting + string obfuscation ~3x
         }
         _limit = _MAX_BODY_CHARS.get(strategy, 25000)
         oversized = [f for f in functions if len(f.get("body", "")) > _limit]
@@ -305,7 +349,17 @@ class MutationAgent(BaseAgent):
         effective_strategy = strategy
         if not effective_strategy or effective_strategy not in strategy_prompt_dict:
             effective_strategy = (requested_strategies or ["strat_1"])[0]
-        strategy_prompt = get_strategy_prompt(effective_strategy, language)
+        enrich_from_web = data.get("enrich_from_web", True)
+        _enrichment_meta: dict = {}
+        strategy_prompt = get_strategy_prompt(
+            effective_strategy, language,
+            enrich_from_web=enrich_from_web,
+            enrichment_meta_out=_enrichment_meta,
+        )
+        log.info("web_enrichment_status",
+                 applied=_enrichment_meta.get("applied", False),
+                 source=_enrichment_meta.get("source", "disabled"),
+                 techniques=_enrichment_meta.get("techniques_found", 0))
 
         # Check for forced target functions (bypass LLM selection)
         target_functions = data.get("target_functions", [])
@@ -417,6 +471,28 @@ class MutationAgent(BaseAgent):
                 failed_count += 1
                 log.warning("mutation_failed", name=func_name)
 
+        # ── 3b. Fail-fast: if zero functions mutated, emit error, don't continue ──
+        if len(mutated_functions) == 0:
+            log.error("mutation_zero_success",
+                      total_selected=len(selected), total_failed=failed_count)
+            error_event = ErrorEvent(
+                job_id=job_id,
+                sample_id=data["sample_id"],
+                correlation_id=data["correlation_id"],
+                error_code="MUTATION_ZERO_SUCCESS",
+                error_message=(
+                    f"All {failed_count} selected functions failed mutation "
+                    f"(strategy={effective_strategy}, language={language}). "
+                    f"No variant code was produced."
+                ),
+                agent="MutationAgent",
+                stage="mutation",
+                is_retryable=True,
+                retry_count=data.get("retry_count", 0),
+            )
+            await self._ctx.broker.publish(Topic.EVENTS_ALL, error_event)
+            return False
+
         # ── 4. Store mutation artifact ──────────────────────────────────────
         mutation_payload = {
             "project_name": source_payload.get("project_name", ""),
@@ -433,6 +509,14 @@ class MutationAgent(BaseAgent):
                 "total_mutated": len(mutated_functions),
                 "total_failed": failed_count,
                 "success_rate": len(mutated_functions) / len(selected) * 100 if selected else 0,
+                "total_vendor_skipped": len(skipped_vendor),
+            },
+            "vendor_skipped_functions": skipped_vendor,
+            "web_enrichment": {
+                "applied": _enrichment_meta.get("applied", False),
+                "source": _enrichment_meta.get("source", "disabled"),
+                "techniques_found": _enrichment_meta.get("techniques_found", 0),
+                "snippets_found": _enrichment_meta.get("snippets_found", 0),
             },
         }
 
@@ -462,10 +546,138 @@ class MutationAgent(BaseAgent):
         log.info("mutation_completed",
                  mutated=len(mutated_functions), failed=failed_count,
                  artifact_id=mutation_artifact_id)
+        return True
 
     # ──────────────────────────────────────────────────────────────────────
     # LLM-based function selection
     # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _filter_vendor_functions(functions: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Remove functions that belong to frozen vendor/third-party files."""
+        counts_by_file: dict[str, int] = {}
+        for func in functions:
+            fpath = str(func.get("file", "") or "")
+            if fpath:
+                counts_by_file[fpath] = counts_by_file.get(fpath, 0) + 1
+
+        kept: list[dict] = []
+        skipped: list[dict] = []
+        classification_cache: dict[str, object] = {}
+
+        for func in functions:
+            fpath = str(func.get("file", "") or "")
+            classification = None
+            if fpath:
+                if fpath not in classification_cache:
+                    try:
+                        classification_cache[fpath] = classify_source_file(
+                            fpath,
+                            function_count=counts_by_file.get(fpath),
+                            read_content=False,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "vendor_classification_failed",
+                            file=fpath,
+                            error=str(exc),
+                            error_type=type(exc).__name__,
+                        )
+                        classification_cache[fpath] = None
+                classification = classification_cache.get(fpath)
+
+            if classification and getattr(classification, "is_vendor", False):
+                skipped.append({
+                    "name": func.get("name", ""),
+                    "file": fpath,
+                    "score": getattr(classification, "score", 0),
+                    "reasons": list(getattr(classification, "reasons", ())),
+                    "size_bytes": getattr(classification, "size_bytes", 0),
+                })
+            else:
+                kept.append(func)
+
+        return kept, skipped
+
+    @classmethod
+    def _build_project_call_arg_widths(cls, functions: list[dict]) -> dict[str, list[str]]:
+        """Build call-name -> expected parameter character widths from project signatures."""
+        widths: dict[str, list[str]] = {}
+        for func in functions:
+            body = func.get("body", "") or ""
+            name = func.get("name", "") or ""
+            if not body or not name:
+                continue
+            signature = body.split("{", 1)[0].strip()
+            match = re.search(r'\b' + re.escape(name) + r'\s*\((.*)\)\s*$', signature, re.DOTALL)
+            if not match:
+                continue
+            params = cls._split_parameter_list(match.group(1))
+            if not params or (len(params) == 1 and params[0].strip() in ("void", "")):
+                widths[name] = []
+                continue
+            widths[name] = [cls._infer_type_char_width(param) for param in params]
+        return widths
+
+    @staticmethod
+    def _split_parameter_list(params: str) -> list[str]:
+        """Split a C/C++ parameter list while respecting shallow nesting."""
+        result: list[str] = []
+        current: list[str] = []
+        depth = 0
+        for ch in params:
+            if ch in "([{<":
+                depth += 1
+            elif ch in ")]}>":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                result.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        tail = "".join(current).strip()
+        if tail:
+            result.append(tail)
+        return result
+
+    @staticmethod
+    def _infer_type_char_width(type_text: str) -> str:
+        """Infer whether a type text expects wide or narrow character data."""
+        normalized = re.sub(r'\b(?:const|volatile|static|extern|register)\b', ' ', type_text)
+        normalized = re.sub(r'\s+', ' ', normalized).strip()
+        if re.search(r'\b(?:WCHAR|wchar_t|OLECHAR|BSTR|LPWSTR|LPCWSTR|PWSTR|PCWSTR)\b', normalized):
+            return "wide"
+        if re.search(r'\b(?:CHAR|char|LPSTR|LPCSTR|PSTR|PCSTR)\b', normalized):
+            return "narrow"
+        if re.search(r'\b(?:BYTE|unsigned char)\b', normalized):
+            return "byte"
+        return "unknown"
+
+    def _validate_project_call_arg_widths(self, mutated_code: str, language: str) -> tuple[bool, str]:
+        """Validate mutated call arguments against known project function signatures."""
+        expected_widths = getattr(self, "_project_call_arg_widths", {}) or {}
+        if not expected_widths or not _mutation_validator or not _mutation_validator.available:
+            return True, ""
+        feats = _mutation_validator.extract_features(mutated_code, language)
+        if not feats:
+            return True, ""
+
+        for call_name, arg_index, actual_width, expr in feats.call_arg_widths:
+            signature_widths = expected_widths.get(call_name)
+            if not signature_widths or arg_index >= len(signature_widths):
+                continue
+            expected_width = signature_widths[arg_index]
+            if expected_width not in ("wide", "narrow") or actual_width not in ("wide", "narrow"):
+                continue
+            if expected_width != actual_width:
+                return False, (
+                    f"Project signature argument type mismatch at call `{call_name}` arg {arg_index}: "
+                    f"the project function signature expects {expected_width} character data, "
+                    f"but the mutated call passes {actual_width} expression `{expr}`. "
+                    f"Preserve the callee parameter type. Fix only this argument construction; "
+                    f"do not change the callee signature or remove any logic."
+                )
+        return True, ""
 
     async def _llm_select_functions(
         self,
@@ -713,57 +925,74 @@ class MutationAgent(BaseAgent):
             _is_strat_all = strategy == "strat_all"
             if _is_strat_all:
                 _role_desc = (
-                    f"You transform function bodies by: (1) building ALL strings on the stack "
-                    f"via per-character assignment, (2) resolving Win32 API calls dynamically "
-                    f"via GetProcAddress with local function pointer variables (reusing DLL handles), "
-                    f"and (3) applying semantic substitutions where safe. "
-                    f"Use short generic variable names like _s0, _pf0 to keep the code clean."
+                    f"You apply MAXIMUM evasion: (1) build ALL strings on the stack "
+                    f"via per-character assignment — this is the #1 most impactful change, "
+                    f"(2) resolve Win32 API calls dynamically via GetProcAddress with local function pointers, "
+                    f"(3) apply semantic substitutions (CRT→byte loops, arithmetic→bitwise), "
+                    f"(4) insert behavioral noise (benign API calls, timing jitter, environmental data), "
+                    f"(5) rename ALL local variables to bland names (_v0, _t0, _ci). "
+                    f"PRIORITY: if code gets complex, do 1+2 CORRECTLY over all 5 with bugs. "
+                    f"Use short generic variable names: _s0, _pf0, _v0, _h0."
                 )
             elif strategy == "strat_4":
                 _role_desc = (
-                    f"You split large functions into smaller static helper functions. "
-                    f"STEP 1: Identify 2-5 logical blocks in the function (initialization, loops, conditionals, cleanup). "
-                    f"STEP 2: Extract each block into a separate `static` helper function defined BEFORE the original function. "
-                    f"STEP 3: The original function calls the helpers, passing only the variables each block needs (by pointer for modified values). "
-                    f"NAMING: helpers are `static` with names like _sub_FUNCNAME_0, _sub_FUNCNAME_1. "
-                    f"PARAMETERS: pass needed variables as parameters. Use pointers for out-params. "
-                    f"SAFETY: the split function MUST produce IDENTICAL behavior to the original for ALL inputs. "
-                    f"NEVER change the original function's signature, return type, or name. "
-                    f"NEVER add #include, extern, or global declarations. "
+                    f"You split functions into smaller helpers AND eliminate string signatures. "
+                    f"STEP 1: Identify 2-5 logical blocks and extract into static helpers (_sub_FUNCNAME_0, etc.). "
+                    f"STEP 2: Replace EVERY string literal in ALL helpers and the main function with stack-built: "
+                    f"char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0; "
+                    f"STEP 3: Rename ALL local variables to bland names (_v0, _t0, _ci). "
+                    f"SAFETY: the split function MUST produce IDENTICAL behavior to the original. "
+                    f"NEVER change the original function's signature. "
                     f"Output ALL helper functions FIRST, then the modified original function LAST."
                 )
             elif strategy == "strat_2":
                 _role_desc = (
-                    f"You insert dead code, opaque predicates, and flatten control flow using a "
-                    f"while/switch state-machine dispatcher. "
-                    f"DEAD CODE: add `volatile DWORD _junk; _junk = GetCurrentProcessId() ^ 0xBAAD;` between real blocks. "
-                    f"OPAQUE PREDICATES: add `volatile int _opq0 = 0; if (_opq0) {{ CreateFileA(\"NUL\", ...); }}` — "
-                    f"always-false branches with real Win32 API calls that never execute. "
-                    f"CFG FLATTENING: convert if/else chains and sequential blocks into "
-                    f"`int _state = 0; while (_state != 99) {{ switch (_state) {{ case 0: ... }} }}`. "
-                    f"CRITICAL: ALL original logic MUST remain functionally identical — same inputs, same outputs. "
-                    f"CRITICAL: Declare ALL new variables (_state, _opq0, _junk) at the TOP of the function body. "
-                    f"CRITICAL: NEVER introduce unclosed comments — every /* must have a matching */. "
-                    f"CRITICAL: For very small functions (< 5 lines), just add opaque predicates + dead code, skip flattening. "
-                    f"This destroys control flow graph patterns, adds noise to static analysis, "
-                    f"and changes byte-level signatures and file entropy."
+                    f"You flatten control flow and eliminate string signatures. "
+                    f"STRING ELIMINATION: Replace EVERY string literal with stack-built: "
+                    f"char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0; This is the #1 most impactful change. "
+                    f"CFG FLATTENING: convert if/else chains into while/switch state-machine dispatcher. "
+                    f"DEAD CODE: add volatile junk computations between real blocks. "
+                    f"OPAQUE PREDICATES: add always-false branches with real Win32 API calls. "
+                    f"API HAMMERING: scatter benign API calls (GetTickCount, GetSystemTime, GetComputerNameA) "
+                    f"throughout to flood sandbox behavioral logs. "
+                    f"CRITICAL: ALL original logic MUST remain functionally identical. "
+                    f"CRITICAL: Declare ALL new variables at the TOP of the function body. "
+                    f"CRITICAL: For very small functions (< 5 lines), skip CFG flattening, just add strings + dead code."
                 )
             elif strategy == "strat_5":
                 _role_desc = (
-                    f"You substitute every recognizable built-in operation, loop pattern, string operation, "
-                    f"and function call with a semantically equivalent but syntactically unrecognizable alternative. "
-                    f"CRT: replace memcpy/strcmp/strcpy/strlen/memset/strcat with manual byte-level loops. "
-                    f"ARITHMETIC: a+b→a-(~b)-1, a*2→a<<1, a%%2→a&1, a==b→!(a^b) (integers ONLY). "
-                    f"LOOPS: for→while+iterator, ascending→descending, forEach→manual index loop. "
-                    f"API CALLS: replace known APIs with alternative SAME-LAYER APIs achieving the same result. "
-                    f"MIX techniques — don't apply the same pattern uniformly. "
-                    f"SAFETY: every substitution MUST produce identical results for ALL inputs. "
-                    f"NEVER use NT-layer APIs, NEVER change function signatures or pointer types."
+                    f"You eliminate ALL recognizable patterns from function bodies to defeat signature scanners. "
+                    f"PRIORITY 1 — STRING ELIMINATION: Replace EVERY string literal (char*, wchar_t*, L\"...\") "
+                    f"with per-character stack assignment: char _s0[N]; _s0[0]='k'; _s0[1]='e'; ... _s0[N-1]=0; "
+                    f"or arithmetic: _s0[0]=(char)(0x60+0x0B); This is the MOST impactful change. "
+                    f"PRIORITY 2 — CRT SUBSTITUTION: replace memcpy/strcmp/strcpy/strlen/memset/strcat/lstrlen "
+                    f"with manual byte loops. Also replace sprintf/wnsprintfA format strings with stack-built strings. "
+                    f"PRIORITY 3 — ARITHMETIC: a+1→a-(~0), a==b→!(a^b), i++→i=i-(~0)-1. "
+                    f"Apply multi-layer: after replacing CRT with loop, also obfuscate the loop arithmetic. "
+                    f"PRIORITY 4 — VARIABLE RENAMING: rename ALL local variables to _v0, _v1, _t0, _ci. "
+                    f"NEVER remove or skip ANY original code. NEVER truncate output. Output the COMPLETE function. "
+                    f"SAFETY: every substitution MUST produce identical results for ALL inputs."
+                )
+            elif strategy == "strat_6":
+                _role_desc = (
+                    f"You add anti-behavioral-analysis techniques AND eliminate string signatures. "
+                    f"STRING ELIMINATION: Replace EVERY string literal with stack-built: "
+                    f"char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0; Apply to ALL strings including newly added ones. "
+                    f"API HAMMERING: insert 5-8 real calls to benign Win32 APIs "
+                    f"(GetCurrentDirectoryA, IsProcessorFeaturePresent, GetSystemTime, GetComputerNameA, "
+                    f"GetSystemInfo, GetTempPathA, GlobalMemoryStatus, CreateMutexA) scattered throughout. "
+                    f"TIMING JITTER: add 2-3 GetTickCount()-based micro-delays. "
+                    f"ENVIRONMENTAL NOISE: use GetUserNameA/GetVersion in junk computations. "
+                    f"CRITICAL: ALL original logic MUST remain functionally identical. "
+                    f"Only ADD new statements — never change, reorder, or remove existing code."
                 )
             else:
                 _role_desc = (
-                    f"You transform function bodies to protect string literals: "
-                    f"building strings at runtime via stack character assignment or arithmetic expressions."
+                    f"You transform function bodies to eliminate ALL string signatures: "
+                    f"replace EVERY string literal with stack-built per-character assignment "
+                    f"(char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0;) or arithmetic construction "
+                    f"(_s0[0]=(char)(0x60+0x0B)). Also insert 2-4 dead computation statements "
+                    f"(volatile DWORD _junk = GetTickCount() ^ 0xB0BA;) to change code entropy."
                 )
             # strat_all needs external function declarations for GetProcAddress boilerplate
             if _is_strat_all:
@@ -940,15 +1169,62 @@ class MutationAgent(BaseAgent):
                 if language not in ("python", "javascript") and func_name and func_name != 'unknown':
                     cleaned = self._suffix_generic_helpers(cleaned, func_body, func_name)
 
-                # Validation gates
-                if not self._validate_mutation(func_body, cleaned, func_name, language):
-                    logger.warning("mutation_validation_failed", attempt=attempt + 1, name=func_name)
+                # Validation gates — Layer 1: lightweight regex-based checks
+                if not self._validate_mutation(func_body, cleaned, func_name, language, strategy=strategy):
+                    _fail_reason = self._diagnose_validation_failure(
+                        func_body, cleaned, func_name, language, strategy
+                    )
+                    logger.warning("mutation_validation_failed", attempt=attempt + 1,
+                                   name=func_name, reason=_fail_reason[:200] if _fail_reason else "")
+                    if _fail_reason and attempt + 1 < retry_attempts:
+                        _feedback = (
+                            f"\n\n--- PREVIOUS ATTEMPT FAILED ---\n{_fail_reason}\n"
+                            f"Fix ONLY this error. ALL other code must remain identical.\n"
+                        )
+                        if _feedback not in user_prompt:
+                            user_prompt = user_prompt.rstrip() + _feedback
                     continue
+
+                # Validation gates — Layer 2: AST-based structural checks (tree-sitter)
+                if _mutation_validator and _mutation_validator.available and language not in ("python", "javascript"):
+                    _ast_passed, _ast_reason = _mutation_validator.validate(
+                        func_body, cleaned, language, strategy=strategy,
+                    )
+                    if not _ast_passed:
+                        logger.warning("mutation_ast_validation_failed", attempt=attempt + 1,
+                                       name=func_name,
+                                       reason=_ast_reason[:200] if _ast_reason else "")
+                        if _ast_reason and attempt + 1 < retry_attempts:
+                            _feedback = (
+                                f"\n\n--- PREVIOUS ATTEMPT FAILED (AST check) ---\n{_ast_reason}\n"
+                                f"Fix ONLY this error. ALL other code must remain identical.\n"
+                            )
+                            if _feedback not in user_prompt:
+                                user_prompt = user_prompt.rstrip() + _feedback
+                        continue
+                    _sig_passed, _sig_reason = self._validate_project_call_arg_widths(
+                        cleaned, language,
+                    )
+                    if not _sig_passed:
+                        logger.warning("mutation_signature_arg_validation_failed",
+                                       attempt=attempt + 1,
+                                       name=func_name,
+                                       reason=_sig_reason[:200] if _sig_reason else "")
+                        if _sig_reason and attempt + 1 < retry_attempts:
+                            _feedback = (
+                                f"\n\n--- PREVIOUS ATTEMPT FAILED (signature type check) ---\n{_sig_reason}\n"
+                                f"Fix ONLY this call argument construction. ALL other code must remain identical.\n"
+                            )
+                            if _feedback not in user_prompt:
+                                user_prompt = user_prompt.rstrip() + _feedback
+                        continue
 
                 return cleaned
 
             except Exception as e:
-                logger.warning("llm_mutation_error", error=str(e), attempt=attempt + 1)
+                logger.warning("llm_mutation_error", name=func_name,
+                               error=str(e), error_type=type(e).__name__,
+                               attempt=attempt + 1)
 
         return None
 
@@ -1210,8 +1486,60 @@ class MutationAgent(BaseAgent):
         return code
 
     @staticmethod
+    def _diagnose_validation_failure(
+        original_body: str, mutated_body: str, func_name: str, language: str,
+        strategy: str = "",
+    ) -> str:
+        """Return human-readable reason for validation failure (for LLM feedback)."""
+        if not mutated_body or not mutated_body.strip():
+            return "Output is empty. You MUST output the COMPLETE transformed function."
+
+        orig_len = len(original_body)
+        mut_len = len(mutated_body)
+
+        if orig_len > 50:
+            ratio = mut_len / orig_len
+            if ratio < 0.20:
+                return (
+                    f"Output is too SHORT ({mut_len} chars vs original {orig_len} chars, "
+                    f"ratio {ratio:.2f}). You likely TRUNCATED or REMOVED code. "
+                    f"Output the COMPLETE function — do NOT skip any original logic."
+                )
+            if strategy in ("strat_all", "strat_5", "strat_4"):
+                max_ratio = 15.0
+            elif strategy in ("strat_2", "strat_6"):
+                max_ratio = 12.0
+            else:
+                max_ratio = 10.0
+            if ratio > max_ratio:
+                return (
+                    f"Output is too LONG ({mut_len} chars vs original {orig_len} chars, "
+                    f"ratio {ratio:.2f}, max {max_ratio}). Reduce code bloat — "
+                    f"use more concise substitution patterns."
+                )
+
+        lower = mutated_body.lower()
+        stubs = ['// implementation goes here', '// todo: implement',
+                 '/* implementation */', '// placeholder code']
+        for s in stubs:
+            if s in lower:
+                return f"Output contains stub marker '{s}'. Output REAL code, not placeholders."
+
+        if language not in ("python",):
+            _open = mutated_body.count('{')
+            _close = mutated_body.count('}')
+            if abs(_open - _close) > 1:
+                return (
+                    f"Brace imbalance: {_open} open vs {_close} close. "
+                    f"Check for unclosed blocks or extra braces."
+                )
+
+        return "Validation failed (unknown reason). Ensure output is a complete, correct function."
+
+    @staticmethod
     def _validate_mutation(
-        original_body: str, mutated_body: str, func_name: str, language: str
+        original_body: str, mutated_body: str, func_name: str, language: str,
+        strategy: str = "",
     ) -> bool:
         """Run validation gates on mutated code."""
         if not mutated_body or not mutated_body.strip():
@@ -1221,11 +1549,15 @@ class MutationAgent(BaseAgent):
         orig_len = len(original_body)
         mut_len = len(mutated_body)
 
-        # Gate 1: Size ratio (relaxed)
-        if orig_len > 50:  # Lower threshold
+        # Gate 1: Size ratio — strategy-aware bounds
+        if orig_len > 50:
             ratio = mut_len / orig_len
-            # strat_2 (dead code/CFG) and strat_4 (algorithm replacement) can produce moderate expansion
-            max_ratio = 30.0 if ratio > 10.0 and mut_len < 3000 else 10.0
+            if strategy in ("strat_all", "strat_5", "strat_4"):
+                max_ratio = 15.0
+            elif strategy in ("strat_2", "strat_6"):
+                max_ratio = 12.0
+            else:
+                max_ratio = 10.0
             if ratio < 0.20 or ratio > max_ratio:
                 logger.warning("validation_gate1_size_ratio", name=func_name,
                                orig_len=orig_len, mut_len=mut_len, ratio=round(ratio, 2))

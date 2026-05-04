@@ -28,6 +28,7 @@ _POLL_INTERVAL_INITIAL_S = 15.0
 _POLL_INTERVAL_MAX_S = 120.0
 _POLL_BACKOFF_FACTOR = 1.5
 _TASK_TIMEOUT_S = 600.0  # 10 minutes per submission
+_REPORT_RETRY_INTERVAL_S = 15.0
 
 # Event signature: SandboxSubmittedEvent
 _SIG_SANDBOX_SUBMITTED = frozenset({"sandbox_task_id", "sandbox_backend", "submit_time"})
@@ -80,6 +81,22 @@ class ExecMonitorAgent(BaseAgent):
                     pending = self._pending_completed_events.pop(data["job_id"], None)
                     if pending:
                         await self._ctx.broker.publish(Topic.EVENTS_ALL, pending)
+                else:
+                    # handle() exited without a report (timeout or sandbox error) but
+                    # state was never transitioned — force-move to EXECUTION_FAILED so
+                    # downstream agents can proceed instead of the job staying stuck.
+                    from contracts.messages import ExecutionFailedEvent
+                    await self.transition_and_save(state, JobStatus.EXECUTION_FAILED,
+                                                   reason="no_report_after_monitoring")
+                    fail_event = ExecutionFailedEvent(
+                        job_id=data["job_id"],
+                        sample_id=data.get("sample_id", ""),
+                        correlation_id=data.get("correlation_id", ""),
+                        failure_reason="no_report_after_monitoring",
+                        sandbox_task_id=data.get("sandbox_task_id", ""),
+                        sandbox_backend=data.get("sandbox_backend", "cape"),
+                    )
+                    await self._ctx.broker.publish(Topic.EVENTS_ALL, fail_event)
 
     async def handle(self, data: dict) -> None:
         job_id = data["job_id"]
@@ -132,8 +149,26 @@ class ExecMonitorAgent(BaseAgent):
 
             # ── Check for terminal status ─────────────────────────────────
             status_str = str(status).lower()
-            if "completed" in status_str or "reported" in status_str:
+            if "reported" in status_str:
                 break
+            if "completed" in status_str:
+                if sandbox_backend == "virustotal":
+                    break
+                raw_report = await _try_get_ready_report(adapter, task_id, sandbox_backend, log)
+                if raw_report is not None:
+                    analysis_duration_s = asyncio.get_event_loop().time() - start_t
+                    await self._store_completion(
+                        job_id=job_id,
+                        data=data,
+                        task_id=task_id,
+                        sandbox_backend=sandbox_backend,
+                        raw_report=raw_report,
+                        analysis_duration_s=analysis_duration_s,
+                        adapter=adapter,
+                        log=log,
+                    )
+                    return
+                log.info("cape_completed_report_not_ready", poll=poll_count)
             if any(x in status_str for x in ("failed", "error", "aborted")):
                 log.warning("sandbox_execution_error", status=status)
                 event = ExecutionFailedEvent(
@@ -153,22 +188,41 @@ class ExecMonitorAgent(BaseAgent):
 
         # ── Fetch final report ────────────────────────────────────────────
         analysis_start = asyncio.get_event_loop().time()
-        try:
-            raw_report = await adapter.get_report(task_id)
-        except Exception as exc:
-            log.error("report_fetch_failed", error=str(exc))
-            event = ExecutionFailedEvent(
-                job_id=job_id,
-                sample_id=data["sample_id"],
-                correlation_id=data["correlation_id"],
-                failure_reason=f"report_fetch_error:{exc}",
-                sandbox_task_id=task_id,
-                sandbox_backend=sandbox_backend,
-            )
-            await self._ctx.broker.publish(Topic.EVENTS_ALL, event)
+        raw_report = await self._wait_for_ready_report(
+            adapter=adapter,
+            task_id=task_id,
+            sandbox_backend=sandbox_backend,
+            log=log,
+            start_t=start_t,
+            data=data,
+        )
+        if raw_report is None:
             return
 
         analysis_duration_s = asyncio.get_event_loop().time() - analysis_start
+        await self._store_completion(
+            job_id=job_id,
+            data=data,
+            task_id=task_id,
+            sandbox_backend=sandbox_backend,
+            raw_report=raw_report,
+            analysis_duration_s=analysis_duration_s,
+            adapter=adapter,
+            log=log,
+        )
+        return
+
+    async def _store_completion(
+        self,
+        job_id: str,
+        data: dict,
+        task_id: str,
+        sandbox_backend: str,
+        raw_report,
+        analysis_duration_s: float,
+        adapter,
+        log,
+    ) -> None:
 
         # ── Store report artifact ─────────────────────────────────────────
         if self._ctx.artifact_store and raw_report is not None:
@@ -208,15 +262,64 @@ class ExecMonitorAgent(BaseAgent):
                         job_id=job_id,
                         task_id=str(_state.original_sandbox_task_id),
                         adapter=adapter,
+                        sandbox_backend=sandbox_backend,
                         state=_state,
                         log=log,
                     )
+
+    async def _wait_for_ready_report(
+        self,
+        adapter,
+        task_id: str,
+        sandbox_backend: str,
+        log,
+        start_t: float,
+        data: dict,
+    ):
+        """Fetch a report, retrying CAPE not-ready payloads until timeout."""
+        while True:
+            elapsed = asyncio.get_event_loop().time() - start_t
+            if elapsed >= self._timeout_s:
+                log.warning("report_fetch_timeout", elapsed_s=elapsed)
+                event = ExecutionFailedEvent(
+                    job_id=data["job_id"],
+                    sample_id=data["sample_id"],
+                    correlation_id=data["correlation_id"],
+                    failure_reason="report_fetch_timeout",
+                    sandbox_task_id=task_id,
+                    sandbox_backend=sandbox_backend,
+                )
+                await self._ctx.broker.publish(Topic.EVENTS_ALL, event)
+                return None
+
+            try:
+                raw_report = await _try_get_ready_report(
+                    adapter, task_id, sandbox_backend, log
+                )
+            except Exception as exc:
+                log.error("report_fetch_failed", error=str(exc))
+                event = ExecutionFailedEvent(
+                    job_id=data["job_id"],
+                    sample_id=data["sample_id"],
+                    correlation_id=data["correlation_id"],
+                    failure_reason=f"report_fetch_error:{exc}",
+                    sandbox_task_id=task_id,
+                    sandbox_backend=sandbox_backend,
+                )
+                await self._ctx.broker.publish(Topic.EVENTS_ALL, event)
+                return None
+
+            if raw_report is not None:
+                return raw_report
+
+            await asyncio.sleep(_REPORT_RETRY_INTERVAL_S)
 
     async def _monitor_original_task(
         self,
         job_id: str,
         task_id: str,
         adapter,
+        sandbox_backend: str,
         state,
         log,
     ) -> None:
@@ -243,8 +346,15 @@ class ExecMonitorAgent(BaseAgent):
                     continue
 
                 status_str = str(status).lower()
-                if "completed" in status_str or "reported" in status_str:
+                if "reported" in status_str:
                     break
+                if "completed" in status_str:
+                    if sandbox_backend == "virustotal":
+                        break
+                    raw_report = await _try_get_ready_report(adapter, task_id, sandbox_backend, log)
+                    if raw_report is not None:
+                        break
+                    log.info("original_cape_completed_report_not_ready", task_id=task_id)
                 if any(x in status_str for x in ("failed", "error", "aborted")):
                     log.warning("original_task_sandbox_error", task_id=task_id, status=status)
                     break
@@ -252,7 +362,7 @@ class ExecMonitorAgent(BaseAgent):
                 await asyncio.sleep(poll_interval)
                 poll_interval = min(poll_interval * _POLL_BACKOFF_FACTOR, _POLL_INTERVAL_MAX_S)
 
-            raw_report = await adapter.get_report(task_id)
+            raw_report = await _try_get_ready_report(adapter, task_id, sandbox_backend, log)
             if raw_report is not None and self._ctx.artifact_store:
                 report_data = (
                     raw_report.__dict__ if hasattr(raw_report, "__dict__") else raw_report
@@ -286,3 +396,49 @@ def _safe_serialisable(obj) -> dict:
         return obj
     except TypeError:
         return str(obj)
+
+
+async def _try_get_ready_report(adapter, task_id: str, sandbox_backend: str, log):
+    raw_report = await adapter.get_report(task_id)
+    if sandbox_backend != "cape":
+        return raw_report
+    if _is_cape_report_ready(raw_report):
+        return raw_report
+    if isinstance(raw_report, dict):
+        log.debug(
+            "cape_report_not_ready",
+            task_id=task_id,
+            error=raw_report.get("error"),
+            error_value=raw_report.get("error_value"),
+            keys=list(raw_report.keys())[:8],
+        )
+    return None
+
+
+def _is_cape_report_ready(raw_report) -> bool:
+    if not isinstance(raw_report, dict) or not raw_report:
+        return False
+    if raw_report.get("error") is True:
+        return False
+
+    report_keys = {
+        "info", "target", "behavior", "network", "signatures",
+        "malscore", "malstatus", "debug", "static", "strings",
+    }
+    if not any(key in raw_report for key in report_keys):
+        return False
+
+    behavior = raw_report.get("behavior")
+    if isinstance(behavior, dict):
+        processes = behavior.get("processes")
+        summary = behavior.get("summary")
+        if isinstance(processes, list) and processes:
+            return True
+        if isinstance(summary, dict) and any(summary.values()):
+            return True
+
+    # CAPE can produce sparse but valid reports when execution yields no behavior.
+    return any(
+        key in raw_report
+        for key in ("info", "target", "debug", "static", "malscore")
+    )

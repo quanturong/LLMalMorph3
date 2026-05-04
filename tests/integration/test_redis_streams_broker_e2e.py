@@ -4,11 +4,12 @@ import os
 import uuid
 
 from agents.base_agent import AgentContext
-from agents.coordinator_agent import CoordinatorAgent
 from agents.decision_agent import DecisionAgent
+from agents.mutation_agent import MutationAgent
 from broker.redis_streams import RedisStreamsBroker
 from broker.topics import Topic
 from contracts.job import JobState, JobStatus
+from unittest.mock import AsyncMock, patch
 
 
 async def _consume_once_and_ack(msg, received):
@@ -171,36 +172,54 @@ def test_redis_autonomous_mutation_feedback_no_duplicate_build_dispatch():
             mutation_score_threshold=5.5,
             mutation_max_iocs=3,
         )
-        await decision_agent.handle(
+        # Use handle_event() so state is transitioned and the DecisionIssuedEvent is
+        # published to the broker (handle() stores the event pending the transition).
+        await decision_agent.handle_event(
             {
                 "job_id": job_id,
                 "sample_id": sample_id,
                 "correlation_id": correlation_id,
                 "analysis_result_id": analysis_result_id,
                 "job_retry_count": 0,
-            }
+            },
+            state,
         )
 
         build_mid = await _count_entries_for_job(client, Topic.CMD_BUILD_VALIDATE, job_id)
         events_mid = await _count_entries_for_job(client, Topic.EVENTS_ALL, job_id)
 
-        assert build_mid == build_before + 1
-        assert events_mid == events_before + 1
+        # New flow: DecisionAgent does NOT publish BuildValidateCommand — MutationAgent
+        # self-activates on the DecisionIssuedEvent and publishes the MutateCommand.
+        assert build_mid == build_before, "DecisionAgent must NOT publish BuildValidateCommand"
+        assert events_mid == events_before + 1, "DecisionIssuedEvent must be published to EVENTS_ALL"
 
         decision_event = await _latest_decision_event_for_job(client, job_id)
         assert decision_event.get("action") == "retry_with_mutation"
-        assert decision_event.get("autonomous_dispatched") is True
+        assert decision_event.get("autonomous_mutation_queued") is True
 
-        coordinator = CoordinatorAgent(ctx)
-        await coordinator.handle(decision_event)
+        # Production path: MutationAgent self-activates on the DecisionIssuedEvent.
+        # Simulate the CAS claim (base_agent sets status=MUTATING before calling handle_event).
+        pre_state = await state_store.get(job_id)
+        pre_state.current_status = JobStatus.MUTATING
+        await state_store.save(pre_state)
+
+        mutation_agent = MutationAgent(ctx)
+        # Patch handle() to skip LLM/artifact I/O — we only test counter increment
+        # and self-activation routing, not actual mutation quality.
+        with patch.object(mutation_agent, "handle", new_callable=AsyncMock):
+            await mutation_agent.handle_event(decision_event, pre_state)
 
         build_after = await _count_entries_for_job(client, Topic.CMD_BUILD_VALIDATE, job_id)
-        assert build_after == build_mid
+        assert build_after == build_mid, "MutationAgent must NOT publish BuildValidateCommand directly"
 
         updated_state = await state_store.get(job_id)
         assert updated_state is not None
-        assert updated_state.current_status == JobStatus.BUILD_VALIDATING
+        # MutationAgent increments feedback counters on self-activation retry path.
         assert updated_state.feedback_loop_count == 1
+        assert updated_state.mutation_cycle_count == 1
+        assert updated_state.retry_count == 1
+        # State is MUTATION_READY — handle_event transitions here after handle() completes.
+        assert updated_state.current_status == JobStatus.MUTATION_READY
 
         await broker.close()
 

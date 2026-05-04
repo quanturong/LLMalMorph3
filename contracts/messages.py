@@ -67,9 +67,11 @@ class MutateCommand(BaseModel):
     language: str
     mutation_strategy: str = "strat_1"
     requested_strategies: list[str] = Field(default_factory=list)
+    strategy_mode: str = "single"     # "single" (one strategy) | "stack" (apply strategies sequentially to same function)
     num_functions: int = 3
     target_functions: list[str] = Field(default_factory=list)
     retry_attempts: int = 5
+    feedback_context: Optional[Dict[str, Any]] = None  # VT detection info from previous cycle for feedback-driven mutation
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     retry_count: int = 0
     payload_version: str = "1.0"
@@ -187,6 +189,8 @@ class JobCreatedEvent(BaseModel):
     project_name: str
     language: str
     requested_strategies: list[str] = Field(default_factory=list)
+    strategy_mode: str = "single"
+    max_generations: int = 1
     num_functions: int = 3
     sandbox_backend: str = "cape"
     priority: int = 5
@@ -340,8 +344,9 @@ class DecisionIssuedEvent(BaseModel):
     action: str                    # see DecisionAction enum
     source: str                    # "rule_based" | "llm_advisory" | "policy_override"
     confidence: float
-    autonomous_dispatched: bool = False
+    autonomous_mutation_queued: bool = False  # True when DecisionAgent queued autonomous mutation via DecisionIssuedEvent; MutationAgent self-activates on this event
     next_mutation_strategy: str = ""
+    feedback_context: Optional[Dict[str, Any]] = None  # VT detection info for feedback-driven mutation
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     payload_version: str = "1.0"
 

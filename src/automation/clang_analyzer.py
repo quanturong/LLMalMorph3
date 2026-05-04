@@ -697,8 +697,14 @@ class ClangAnalyzer:
         """Analyze using libclang for precise AST parsing."""
         result = AnalysisResult()
         
+        _MAX_CLANG_FILE_BYTES = 1 * 1024 * 1024  # 1 MB — skip very large files (e.g. sqlite3.c)
         for source_file in source_files:
             try:
+                file_size = os.path.getsize(os.path.abspath(source_file)) if os.path.exists(os.path.abspath(source_file)) else 0
+                if file_size > _MAX_CLANG_FILE_BYTES:
+                    logger.info(f"Clang: skipping large file ({file_size//1024}KB), using regex: {os.path.basename(source_file)}")
+                    self._analyze_single_file_regex(source_file, result)
+                    continue
                 self._analyze_single_file_clang(source_file, include_paths, result)
             except Exception as e:
                 logger.warning(f"Clang parse failed for {source_file}: {e}")

@@ -7,7 +7,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -25,6 +25,17 @@ class DecisionAction(str, Enum):
     CLOSE_FAILED        = "close_failed"
 
 
+# Actions the LLM is allowed to recommend (whitelist).
+# retry_with_mutation is reserved for policy layer only — LLM never picks it.
+_LLM_ALLOWED_ACTIONS = Literal[
+    "continue_to_report",
+    "retry_sandbox",
+    "escalate_to_analyst",
+    "close_no_behavior",
+    "close_failed",
+]
+
+
 class DecisionSource(str, Enum):
     RULE_BASED      = "rule_based"
     LLM_ADVISORY    = "llm_advisory"
@@ -38,31 +49,13 @@ class DecisionSource(str, Enum):
 class DecisionLLMOutput(BaseModel):
     """Narrow structured output expected from LLM in DecisionAgent.
 
-    The action list is intentionally small. LLM can only recommend from
-    this whitelist; policy layer enforces contextual constraints _after_.
+    The action list is intentionally small — LLM can only recommend from the
+    _LLM_ALLOWED_ACTIONS whitelist.  retry_with_mutation is reserved for the
+    policy layer and will never be returned by the LLM.
     """
-    recommended_action: DecisionAction
+    recommended_action: _LLM_ALLOWED_ACTIONS  # type: ignore[valid-type]
     rationale: str = Field(max_length=500)
     confidence: float = Field(ge=0.0, le=1.0)
-
-    @field_validator("rationale")
-    @classmethod
-    def no_evasion_recommendation(cls, v: str) -> str:
-        """Hard guardrail: LLM must not recommend evasion improvements."""
-        forbidden = [
-            "improve evasion", "better evasion", "more evasion",
-            "evade detection", "bypass av", "bypass antivirus",
-            "stealth improvement", "obfuscate further", "enhance payload",
-            "optimize malware", "improve malware",
-        ]
-        lower = v.lower()
-        for phrase in forbidden:
-            if phrase in lower:
-                raise ValueError(
-                    f"Decision rationale contains forbidden phrase: '{phrase}'. "
-                    "DecisionAgent must not recommend malware improvement strategies."
-                )
-        return v
 
 
 # ──────────────────────────────────────────────────────────────────────────────

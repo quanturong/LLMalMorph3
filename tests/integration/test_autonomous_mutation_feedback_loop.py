@@ -1,11 +1,13 @@
 import asyncio
 
+from unittest.mock import AsyncMock, patch
+
 from agents.base_agent import AgentContext
-from agents.coordinator_agent import CoordinatorAgent
 from agents.decision_agent import DecisionAgent
+from agents.mutation_agent import MutationAgent
 from broker.topics import Topic
 from contracts.job import JobState, JobStatus
-from contracts.messages import BuildValidateCommand, DecisionIssuedEvent
+from contracts.messages import DecisionIssuedEvent
 
 
 class _FakeBroker:
@@ -93,43 +95,53 @@ def test_decision_autonomous_mutation_dispatch_and_coordinator_reconcile():
             mutation_max_iocs=3,
         )
 
-        await decision_agent.handle(
+        await decision_agent.handle_event(
             {
                 "job_id": job_id,
                 "sample_id": sample_id,
                 "correlation_id": correlation_id,
                 "analysis_result_id": analysis_result_id,
                 "job_retry_count": 0,
-            }
+            },
+            state,
         )
 
         build_msgs = [m for (s, m) in broker.published if s == Topic.CMD_BUILD_VALIDATE]
         event_msgs = [m for (s, m) in broker.published if s == Topic.EVENTS_ALL]
 
-        assert len(build_msgs) == 1
-        assert isinstance(build_msgs[0], BuildValidateCommand)
-        assert build_msgs[0].mutation_strategy == "variant_source_generator"
+        # New flow: DecisionAgent does NOT dispatch BuildValidateCommand or MutateCommand.
+        # It only emits DecisionIssuedEvent with action=retry_with_mutation.
+        # MutationAgent self-activates on that event and handles mutation independently.
+        assert len(build_msgs) == 0, "DecisionAgent must not publish BuildValidateCommand"
 
         assert len(event_msgs) == 1
         assert isinstance(event_msgs[0], DecisionIssuedEvent)
         assert event_msgs[0].action == "retry_with_mutation"
-        assert event_msgs[0].autonomous_dispatched is True
+        assert event_msgs[0].autonomous_mutation_queued is True
         assert event_msgs[0].next_mutation_strategy == "variant_source_generator"
 
-        coordinator = CoordinatorAgent(ctx)
-        build_count_before = len(build_msgs)
+        # Production path: MutationAgent self-activates on DecisionIssuedEvent.
+        # Simulate the CAS claim (base_agent sets status=MUTATING before calling handle_event).
+        pre_state = await state_store.get(job_id)
+        pre_state.current_status = JobStatus.MUTATING
+        await state_store.save(pre_state)
 
-        await coordinator.handle(event_msgs[0].model_dump())
+        mutation_agent = MutationAgent(ctx)
+        event_data = event_msgs[0].model_dump()
+        # Patch handle() to skip LLM/artifact I/O — tests routing and counter semantics only.
+        with patch.object(mutation_agent, "handle", new_callable=AsyncMock):
+            await mutation_agent.handle_event(event_data, pre_state)
 
         build_msgs_after = [m for (s, m) in broker.published if s == Topic.CMD_BUILD_VALIDATE]
-        assert len(build_msgs_after) == build_count_before
+        assert len(build_msgs_after) == 0, "MutationAgent must not publish BuildValidateCommand directly"
 
         updated_state = await state_store.get(job_id)
         assert updated_state is not None
-        assert updated_state.current_status == JobStatus.BUILD_VALIDATING
+        # MutationAgent increments all feedback counters on retry_with_mutation activation.
         assert updated_state.feedback_loop_count == 1
         assert updated_state.mutation_cycle_count == 1
-        assert updated_state.build_retry_count == 1
         assert updated_state.retry_count == 1
+        # handle_event transitions to MUTATION_READY after handle() completes.
+        assert updated_state.current_status == JobStatus.MUTATION_READY
 
     asyncio.run(_run())

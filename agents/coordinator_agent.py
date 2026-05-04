@@ -93,6 +93,11 @@ class CoordinatorAgent(BaseAgent):
             project_name=envelope.project_name,
             language=envelope.language,
             requested_strategies=envelope.requested_strategies,
+            strategy_mode=envelope.strategy_mode,
+            max_generations=envelope.max_generations,
+            num_functions=envelope.num_functions,
+            target_functions=envelope.target_functions,
+            llm_retry_attempts=envelope.llm_retry_attempts,
         )
         await self._save_state(state)
 
@@ -159,6 +164,8 @@ class CoordinatorAgent(BaseAgent):
         state.project_name = data.get("project_name", state.project_name)
         state.language = data.get("language", state.language)
         state.requested_strategies = data.get("requested_strategies", state.requested_strategies)
+        state.strategy_mode = data.get("strategy_mode", state.strategy_mode)
+        state.max_generations = data.get("max_generations", state.max_generations)
         state.num_functions = data.get("num_functions", state.num_functions)
         self._sm.transition(state, JobStatus.SAMPLE_PREPARING, "coordinator")
         await self._save_state(state)
@@ -200,11 +207,14 @@ class CoordinatorAgent(BaseAgent):
             language=data["language"],
             mutation_strategy=strategy,
             requested_strategies=data.get("requested_strategies", []),
+            strategy_mode=state.strategy_mode,
             num_functions=state.num_functions,
             target_functions=state.target_functions,
+            retry_attempts=state.llm_retry_attempts,
         )
         await self._ctx.broker.publish(Topic.CMD_MUTATE, cmd)
-        logger.info("dispatched_mutate", job_id=data["job_id"], strategy=strategy)
+        logger.info("dispatched_mutate", job_id=data["job_id"], strategy=strategy,
+                     strategy_mode=state.strategy_mode)
 
     async def _on_mutation_completed(self, data: dict) -> None:
         state = await self._get_state(data["job_id"])
@@ -375,9 +385,12 @@ class CoordinatorAgent(BaseAgent):
         if state is None:
             return
         state.decision_id = data["decision_id"]
-        self._sm.transition(state, JobStatus.DECISION_ISSUED, "coordinator",
-                            event_id=data.get("message_id"))
-        await self._save_state(state)
+        # Only transition if not already in DECISION_ISSUED (DecisionAgent may have
+        # advanced the state before the event was published to the broker).
+        if self._sm.can_transition(state.current_status, JobStatus.DECISION_ISSUED):
+            self._sm.transition(state, JobStatus.DECISION_ISSUED, "coordinator",
+                                event_id=data.get("message_id"))
+            await self._save_state(state)
 
         action = data.get("action", "")
         job_id = data["job_id"]
@@ -429,7 +442,7 @@ class CoordinatorAgent(BaseAgent):
                                 reason=f"decision: retry_with_mutation [{strategy}]")
             await self._save_state(state)
 
-            if data.get("autonomous_dispatched", False):
+            if data.get("autonomous_mutation_queued", False):
                 logger.info(
                     "mutation_retry_autonomous_dispatch_accepted",
                     job_id=state.job_id,
@@ -447,9 +460,12 @@ class CoordinatorAgent(BaseAgent):
                 language=state.language,
                 mutation_strategy=strategy,
                 requested_strategies=state.requested_strategies,
+                strategy_mode=state.strategy_mode,
                 num_functions=3,
                 target_functions=state.target_functions,
+                retry_attempts=state.llm_retry_attempts,
                 retry_count=state.mutation_cycle_count,
+                feedback_context=data.get("feedback_context"),
             )
             await self._ctx.broker.publish(Topic.CMD_MUTATE, cmd)
             logger.info("dispatched_mutation_retry", job_id=job_id,
@@ -468,6 +484,54 @@ class CoordinatorAgent(BaseAgent):
         state.report_id = data["report_id"]
         self._sm.transition(state, JobStatus.REPORT_READY, "coordinator",
                             event_id=data.get("message_id"))
+
+        # Multi-Generation Evolution: if more generations remain, feed the
+        # compiled variant back into the mutation pipeline as the new source.
+        if state.current_generation < state.max_generations:
+            # Use the variant source from this generation as input for the next
+            next_source = state.variant_artifact_id or state.source_artifact_id
+            state.current_generation += 1
+            state.mutation_cycle_count += 1
+            logger.info(
+                "multi_gen_next_generation",
+                job_id=state.job_id,
+                generation=state.current_generation,
+                max_generations=state.max_generations,
+                source=next_source,
+            )
+            # Reset per-generation artifacts so the new cycle is clean
+            state.mutation_artifact_id = None
+            state.compiled_artifact_id = None
+            state.sandbox_task_id = None
+            state.raw_report_artifact_id = None
+            state.analysis_result_id = None
+            state.decision_id = None
+            state.report_id = None
+
+            # Transition back to MUTATING with the previous variant as source
+            state.source_artifact_id = next_source
+            self._sm.transition(state, JobStatus.MUTATING, "coordinator",
+                                reason=f"multi-gen evolution: generation {state.current_generation}/{state.max_generations}")
+            await self._save_state(state)
+
+            strategy = self._pick_next_mutation_strategy(state)
+            cmd = MutateCommand(
+                job_id=state.job_id,
+                sample_id=state.sample_id,
+                correlation_id=state.correlation_id,
+                source_artifact_id=next_source,
+                project_name=state.project_name,
+                language=state.language,
+                mutation_strategy=strategy,
+                requested_strategies=state.requested_strategies,
+                strategy_mode=state.strategy_mode,
+                num_functions=state.num_functions,
+                target_functions=state.target_functions,
+                retry_attempts=state.llm_retry_attempts,
+            )
+            await self._ctx.broker.publish(Topic.CMD_MUTATE, cmd)
+            return
+
         await self._close_job(state, "CLOSED")
 
     async def _on_error(self, data: dict) -> None:

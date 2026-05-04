@@ -41,6 +41,8 @@ from .base_agent import AgentContext, BaseAgent
 logger = structlog.get_logger(__name__)
 
 _STUCK_JOB_TIMEOUT_S = 600  # 10 minutes without progress → stuck
+_LONG_RUNNING_TIMEOUT_S = 1800  # 30 min for MUTATING / BUILD_VALIDATING
+_LONG_RUNNING_STATES = frozenset({"MUTATING", "BUILD_VALIDATING", "EXECUTION_MONITORING"})
 _STUCK_CHECK_INTERVAL_S = 60
 
 
@@ -96,9 +98,12 @@ class MonitorAgent(BaseAgent):
             project_name=envelope.project_name,
             language=envelope.language,
             requested_strategies=envelope.requested_strategies,
+            strategy_mode=envelope.strategy_mode,
+            max_generations=envelope.max_generations,
             num_functions=envelope.num_functions,
             target_functions=envelope.target_functions,
             sandbox_backend=envelope.sandbox_backend,
+            llm_retry_attempts=envelope.llm_retry_attempts,
         )
         if self._ctx.state_store:
             await self._ctx.state_store.save(state)
@@ -111,6 +116,8 @@ class MonitorAgent(BaseAgent):
             project_name=envelope.project_name,
             language=envelope.language,
             requested_strategies=envelope.requested_strategies,
+            strategy_mode=envelope.strategy_mode,
+            max_generations=envelope.max_generations,
             num_functions=envelope.num_functions,
             sandbox_backend=envelope.sandbox_backend,
             priority=envelope.priority,
@@ -198,6 +205,32 @@ class MonitorAgent(BaseAgent):
                            job_id=job_id, agent=data.get("agent"),
                            error=data.get("error_code"))
 
+        elif "auto_fix_attempts" in data and "compiled_artifact_id" not in data:
+            # BuildFailedEvent — auto-fix exhausted, close the job immediately
+            # (Bug #19: no agent has BUILD_FAILED in activates_on, so we must
+            #  handle it here to prevent the pipeline from hanging.)
+            self._job_last_status[job_id] = "BUILD_FAILED"
+            auto_fix = data.get("auto_fix_attempts", 0)
+            logger.warning("build_failed_closing_job", job_id=job_id,
+                           auto_fix_attempts=auto_fix)
+            if self._ctx.state_store:
+                state = await self._ctx.state_store.get(job_id)
+                if state and not state.current_status.is_terminal():
+                    try:
+                        self._sm.transition(state, JobStatus.FAILED, "MonitorAgent")
+                        await self._ctx.state_store.save(state)
+                    except Exception:
+                        pass  # state may already be terminal
+            fail_evt = JobFailedEvent(
+                job_id=job_id,
+                sample_id=data.get("sample_id", ""),
+                correlation_id=data.get("correlation_id", ""),
+                failure_stage="BUILD_VALIDATION",
+                error_message=data.get("error_message", "Build failed after auto-fix exhausted")[:500],
+            )
+            await self._ctx.broker.publish(Topic.EVENTS_ALL, fail_evt)
+            self._active_jobs.discard(job_id)
+
         else:
             # Progress event — update status tracking
             status = self._infer_status(data)
@@ -259,18 +292,48 @@ class MonitorAgent(BaseAgent):
             pass
 
     async def _check_stuck_jobs(self) -> None:
-        """Detect and attempt recovery of stuck jobs."""
+        """Detect and attempt recovery of stuck jobs.
+
+        Bug #18 fix: query actual DB status instead of trusting stale cache,
+        and use a longer timeout for known long-running states (MUTATING,
+        BUILD_VALIDATING) which naturally take 15-30 min without events.
+        """
         now = time.monotonic()
         stuck_jobs = []
 
         for job_id in list(self._active_jobs):
             last_event_time = self._job_last_event.get(job_id, 0)
-            if now - last_event_time > self._stuck_timeout_s:
+            idle_s = now - last_event_time
+
+            # Query actual DB status — cache may be stale
+            actual_status = self._job_last_status.get(job_id, "unknown")
+            if self._ctx.state_store:
+                state = await self._ctx.state_store.get(job_id)
+                if state:
+                    actual_status = state.current_status.value
+                    # If actual status advanced beyond cache, refresh timer
+                    if actual_status != self._job_last_status.get(job_id, ""):
+                        self._job_last_status[job_id] = actual_status
+                        self._job_last_event[job_id] = now
+                        logger.info("job_progressed_silently", job_id=job_id,
+                                    actual_status=actual_status)
+                        continue
+                    if state.current_status.is_terminal():
+                        self._active_jobs.discard(job_id)
+                        continue
+
+            # Use longer timeout for long-running states
+            timeout = (_LONG_RUNNING_TIMEOUT_S
+                       if actual_status in _LONG_RUNNING_STATES
+                       else self._stuck_timeout_s)
+
+            if idle_s > timeout:
                 stuck_jobs.append(job_id)
 
         for job_id in stuck_jobs:
+            actual = self._job_last_status.get(job_id, "unknown")
             logger.warning("stuck_job_detected", job_id=job_id,
-                           last_status=self._job_last_status.get(job_id, "unknown"),
+                           last_status=actual,
                            idle_s=now - self._job_last_event.get(job_id, 0))
             await self._attempt_recovery(job_id)
 

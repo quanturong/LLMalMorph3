@@ -20,6 +20,7 @@ import tempfile
 import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+from types import SimpleNamespace
 import logging
 import json
 
@@ -80,6 +81,50 @@ try:
 except ImportError:
     ProjectAutoFixer = None
 
+try:
+    from vendor_classifier import classify_source_file
+except ImportError:
+    classify_source_file = None
+
+
+def _classify_vendor(path: str, *, read_content: bool = False):
+    if not classify_source_file:
+        return None
+    try:
+        return classify_source_file(path, read_content=read_content)
+    except Exception:
+        return None
+
+
+def _is_frozen_vendor_file(path: str, *, read_content: bool = False) -> bool:
+    classification = _classify_vendor(path, read_content=read_content)
+    return bool(classification and classification.is_vendor)
+
+
+def _project_for_fix_context(project):
+    """Return a lightweight project view without frozen vendor files."""
+    source_files = list(getattr(project, 'source_files', []) or [])
+    header_files = list(getattr(project, 'header_files', []) or [])
+    if not classify_source_file:
+        return project, []
+
+    kept_sources = [p for p in source_files if not _is_frozen_vendor_file(p, read_content=False)]
+    kept_headers = [p for p in header_files if not _is_frozen_vendor_file(p, read_content=False)]
+    skipped = [p for p in source_files + header_files if p not in kept_sources and p not in kept_headers]
+
+    if not kept_sources and source_files:
+        kept_sources = source_files
+        kept_headers = header_files
+        skipped = []
+
+    context_project = SimpleNamespace(
+        name=getattr(project, 'name', 'unknown_project'),
+        root_dir=getattr(project, 'root_dir', ''),
+        source_files=kept_sources,
+        header_files=kept_headers,
+    )
+    return context_project, skipped
+
 # ClangAnalyzer for AST-aware compilation support (optional)
 CLANG_ANALYZER_AVAILABLE = False
 try:
@@ -130,6 +175,50 @@ class ProjectCompiler:
         r"C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvarsall.bat",
         r"C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvarsall.bat",
     ]
+
+    @staticmethod
+    def _detect_msvc_only_requirements(project) -> list[str]:
+        """Return reasons why a project should stay on MSVC-compatible tools."""
+        source_files = list(getattr(project, 'source_files', []) or [])
+        header_files = list(getattr(project, 'header_files', []) or [])
+        build_files = list(getattr(project, 'build_files', []) or [])
+        paths = source_files + header_files + build_files
+
+        reasons: list[str] = []
+        build_names = {os.path.basename(p).lower() for p in build_files}
+        if any(name.endswith(('.vcxproj', '.vcproj', '.sln', '.dsp', '.dsw')) for name in build_names):
+            reasons.append("visual_studio_project")
+
+        probe = []
+        for path in paths:
+            try:
+                max_bytes = 65536 if os.path.getsize(path) > 1_000_000 else None
+                with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                    probe.append(fh.read(max_bytes) if max_bytes else fh.read())
+            except Exception:
+                continue
+        text = "\n".join(probe)
+        lower = text.lower()
+
+        msvc_only_headers = (
+            'atlbase.h', 'atlcom.h', 'atlwin.h', 'atlstr.h',
+            'afx.h', 'afxwin.h', 'afxcmn.h', 'comdef.h',
+        )
+        found_headers = [
+            h for h in msvc_only_headers
+            if re.search(rf'#\s*include\s*[<"]{re.escape(h)}[>"]', lower)
+        ]
+        if found_headers:
+            reasons.append("msvc_only_headers:" + ",".join(found_headers[:4]))
+
+        if re.search(r'#pragma\s+comment\s*\(\s*lib\s*,', text):
+            reasons.append("pragma_comment_lib")
+        if re.search(r'\b#import\s+[<"]', text):
+            reasons.append("msvc_import_directive")
+        if re.search(r'\b__(try|except|finally)\b', text):
+            reasons.append("msvc_seh")
+
+        return reasons
     
     @staticmethod
     def analyze_best_compiler(project) -> str:
@@ -178,6 +267,16 @@ class ProjectCompiler:
         if not all_content:
             logger.info(f"[CompilerSelect] No source content to analyze, using auto")
             return 'auto'
+
+        msvc_only_reasons = ProjectCompiler._detect_msvc_only_requirements(project)
+        if msvc_only_reasons:
+            msvc_score += 8
+            reasons_msvc.append("MSVC-only requirements: " + ", ".join(msvc_only_reasons[:3]))
+            logger.info(
+                "[CompilerSelect] MSVC-only requirements detected (%s); selecting MSVC",
+                ", ".join(msvc_only_reasons[:4]),
+            )
+            return 'msvc'
         
         # ── MSVC-specific signals ──
         # #pragma comment(lib, ...) - MSVC pragma
@@ -251,7 +350,43 @@ class ProjectCompiler:
         elif msc_guards > gnuc_guards:
             msvc_score += 1
             reasons_msvc.append(f"_MSC_VER guards ({msc_guards}>{gnuc_guards})")
-        
+
+        # ── Signal 4: compile_command.txt (MinGW/GCC explicit compile history) ──
+        root_dir = getattr(project, 'root_dir', '')
+        if root_dir:
+            _cmd_file = os.path.join(root_dir, 'compile_command.txt')
+            if os.path.isfile(_cmd_file):
+                try:
+                    _cmd_content = open(_cmd_file, 'r', encoding='utf-8', errors='replace').read()
+                    if re.search(r'\bclang-cl(?:\.exe)?\b', _cmd_content, re.IGNORECASE):
+                        msvc_score += 5
+                        reasons_msvc.append("compile_command.txt uses clang-cl")
+                    elif re.search(r'\b(?:g\+\+|gcc|mingw|clang)\b', _cmd_content, re.IGNORECASE):
+                        gcc_score += 5
+                        reasons_gcc.append("compile_command.txt uses GCC/MinGW")
+                    elif re.search(r'\bcl\.exe\b', _cmd_content, re.IGNORECASE):
+                        msvc_score += 5
+                        reasons_msvc.append("compile_command.txt uses cl.exe")
+                except Exception:
+                    pass
+
+            # MinGW-bundled CRT: msvcrt_.lib present in project root → MinGW/GCC project
+            _build_files = getattr(project, 'build_files', [])
+            _all_files = list(getattr(project, 'source_files', [])) + \
+                         list(getattr(project, 'header_files', [])) + \
+                         list(_build_files)
+            # Also scan root_dir directly for .lib/.a/.o files not tracked in project
+            if root_dir and os.path.isdir(root_dir):
+                for _entry in os.listdir(root_dir):
+                    _all_files.append(os.path.join(root_dir, _entry))
+            for _f in _all_files:
+                _bn = os.path.basename(_f).lower()
+                if _bn in ('msvcrt_.lib', 'libgcc.a', 'libstdc++.a',
+                           'crtbegin.o', 'crtend.o', 'crt2.o'):
+                    gcc_score += 4
+                    reasons_gcc.append(f"MinGW CRT file: {_bn}")
+                    break
+
         # ── Decide ──
         total = msvc_score + gcc_score
         if total == 0:
@@ -795,6 +930,44 @@ FILE * __cdecl __iob_func(void) {
         # Auto-detect UNICODE mode and additional required libraries
         additional_libs = set()
         needs_unicode = False
+
+        # --- Primary: read CharacterSet from vcxproj (most reliable) ---
+        _vcxproj_charset_detected = False
+        try:
+            import xml.etree.ElementTree as _ET
+            _vcxproj_candidates = []
+            for _bf in getattr(project, 'build_files', []):
+                if _bf.lower().endswith('.vcxproj'):
+                    _vcxproj_candidates.append(_bf)
+            # Also search source file directory for any .vcxproj
+            if not _vcxproj_candidates and project.source_files:
+                import glob as _glob
+                _src_dir = os.path.dirname(project.source_files[0])
+                _vcxproj_candidates += _glob.glob(os.path.join(_src_dir, '*.vcxproj'))
+            for _vp in _vcxproj_candidates:
+                try:
+                    _tree = _ET.parse(_vp)
+                    _root = _tree.getroot()
+                    # Strip namespace for easier search
+                    for _elem in _root.iter():
+                        if _elem.tag.endswith('}CharacterSet') or _elem.tag == 'CharacterSet':
+                            _cs = (_elem.text or '').strip()
+                            if _cs == 'Unicode':
+                                needs_unicode = True
+                                _vcxproj_charset_detected = True
+                                logger.info(f"   vcxproj CharacterSet=Unicode → /DUNICODE /D_UNICODE")
+                            elif _cs == 'MultiByte':
+                                _vcxproj_charset_detected = True
+                                logger.info(f"   vcxproj CharacterSet=MultiByte → ANSI/MBCS mode")
+                            if _vcxproj_charset_detected:
+                                break
+                except Exception:
+                    pass
+                if _vcxproj_charset_detected:
+                    break
+        except Exception:
+            pass
+
         try:
             all_content = ""
             for src_file in project.source_files + project.header_files:
@@ -873,6 +1046,9 @@ FILE * __cdecl __iob_func(void) {
             if anti_unicode_guard:
                 needs_unicode = False
                 logger.info(f"   Forced ANSI mode: project has anti-UNICODE compile guard")
+            elif _vcxproj_charset_detected:
+                # Already set by vcxproj — heuristic scores are informational only
+                logger.info(f"   Charset from vcxproj (heuristic: wide={unicode_score}, ansi={ansi_score})")
             elif unicode_score >= 3 and unicode_score > ansi_score:
                 needs_unicode = True
                 logger.info(f"   Auto-detected UNICODE mode (wide={unicode_score} >> ansi={ansi_score})")
@@ -1195,7 +1371,94 @@ FILE * __cdecl __iob_func(void) {
         logger.info(f"   Saved to: {cmd_file}")
         
         return compile_cmd
-    
+
+    def _compile_single_file_for_errors(
+        self,
+        source_file: str,
+        source_code: str,
+        language: str,
+    ):
+        """Write source_code to a temp file and do a syntax-check compile to get
+        an up-to-date error list (used after pattern fixes so LLM sees accurate
+        errors, not stale ones from before the pattern fix).
+
+        Returns a list of error strings, or None if the compile environment is
+        not available (caller should treat None as "no update").
+        """
+        import tempfile, subprocess, os as _os, re as _re_sf
+        tmp_path = None
+        try:
+            suffix = '.cpp' if language.lower() in ('cpp', 'c++') else '.c'
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix=suffix, delete=False,
+                encoding='utf-8', prefix='_pfix_check_'
+            ) as tf:
+                tf.write(source_code)
+                tmp_path = tf.name
+
+            # Determine compiler: use same compiler that was detected for this project
+            compiler_exe = getattr(self, '_last_compiler_exe', None)
+            if not compiler_exe:
+                return None  # can't determine compiler
+
+            # Include directories: source file's directory + project include_dirs
+            src_dir = _os.path.dirname(source_file)
+            extra_includes = getattr(self, 'include_dirs', [])
+
+            if 'cl.exe' in compiler_exe or 'cl ' in compiler_exe:
+                # MSVC syntax-check only (/Zs) — must use proper MSVC env
+                subprocess_env = getattr(self, '_project_msvc_env',
+                                         getattr(self, 'msvc_env', None))
+                if subprocess_env is None:
+                    return None  # no MSVC env available
+                cmd = [compiler_exe, '/nologo', '/Zs', '/W0',
+                       '/TP' if suffix == '.cpp' else '/TC',
+                       f'/I{src_dir}']
+                for inc in extra_includes:
+                    cmd.append(f'/I{inc}')
+                cmd.append(tmp_path)
+            else:
+                # GCC/Clang syntax-check only
+                subprocess_env = None
+                cmd = [compiler_exe, '-fsyntax-only', '-w', f'-I{src_dir}']
+                for inc in extra_includes:
+                    cmd.append(f'-I{inc}')
+                cmd.append(tmp_path)
+
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+                encoding='utf-8', errors='replace',
+                env=subprocess_env
+            )
+            raw = (result.stdout or '') + (result.stderr or '')
+            # Extract error lines; skip header-not-found fatals (C1083 / fatal error:)
+            # which only indicate missing env, not real code errors.
+            errors = []
+            for ln in raw.splitlines():
+                stripped = ln.strip()
+                if not stripped:
+                    continue
+                # Skip "cannot open include file" / "no such file" errors — these are
+                # environment issues, not source-code errors we want to feed the LLM.
+                if _re_sf.search(r'C1083|cannot open include file|No such file or directory'
+                                  r'|no input files', stripped, _re_sf.IGNORECASE):
+                    continue
+                if _re_sf.search(r': error [A-Z]?\d+:|\berror:', stripped):
+                    errors.append(stripped)
+            # If we only got env-type errors (all filtered), return None so caller
+            # keeps the original error list.
+            if not errors and result.returncode != 0:
+                return None
+            return errors
+        except Exception:
+            return None
+        finally:
+            if tmp_path:
+                try:
+                    _os.unlink(tmp_path)
+                except Exception:
+                    pass
+
     def compile_project(
         self, 
         project,
@@ -1204,7 +1467,7 @@ FILE * __cdecl __iob_func(void) {
         optimization: str = 'O2',
         auto_fix: bool = True,
         max_fix_attempts: int = 3,
-        llm_model: str = "qwen2.5:32b",
+        llm_model: str = "qwen3-coder:30b",
         use_llm_fixer: bool = True,
         llm_fixer_max_code_length: int = 50000,
         permissive_mode: bool = True,
@@ -1221,6 +1484,10 @@ FILE * __cdecl __iob_func(void) {
         mahoraga_memory_file: str = None,  # Path to Mahoraga memory file
         external_fixer = None,  # Pre-created fixer instance (Mahoraga or AutoFixer)
         clang_analysis = None,  # Pre-computed ClangAnalyzer result
+        preserve_function_names: Optional[set] = None,  # Whitelist of function names AutoFixer must NOT delete
+        autofix_min_line_ratio: float = 0.30,  # Reject fixes whose line count drops below this ratio
+        autofix_max_deleted_functions: int = 1,  # Hard cap on AST-level function definitions removed by a fix
+        extra_fix_context: Optional[str] = None,  # Extra guidance injected into AutoFixer prompts
     ) -> CompilationResult:
         """
         Compile complete project to executable
@@ -1268,6 +1535,7 @@ FILE * __cdecl __iob_func(void) {
             return self._compile_javascript_project(project, output_dir, output_name)
 
         compiler_cmd = self.compiler['cpp'] if language == 'cpp' else self.compiler['c']
+        self._last_compiler_exe = compiler_cmd  # track for _compile_single_file_for_errors
         
         if not compiler_cmd:
             logger.error(f"❌ No compiler found for {language}")
@@ -1377,28 +1645,38 @@ FILE * __cdecl __iob_func(void) {
                         # Re-validate after fixes
                         is_valid, validation_issues = CompilationValidator.validate_project(project, verbose=False)
         
+        # Augmented mode: use Fix History RAG + Clang AST + project context
+        # Non-augmented: basic LLM fix only (no retrieved examples, no AST context)
+        _use_augmented = os.environ.get("AUGMENTED_FIX", "1") != "0"
+        _fix_context_project, _vendor_context_skipped = _project_for_fix_context(project)
+        if _vendor_context_skipped:
+            logger.info(
+                "   Frozen vendor files excluded from LLM fix context: "
+                f"{len(_vendor_context_skipped)}"
+            )
+
         # Collect project context for LLM fixer (ALWAYS if use_project_context is enabled)
-        if ENHANCED_TOOLS_AVAILABLE and use_project_context:
+        if ENHANCED_TOOLS_AVAILABLE and use_project_context and _use_augmented:
             logger.info(f"\n📚 Collecting project context...")
-            project_context = ProjectContextCollector.collect_project_context(project, parse_result)
+            project_context = ProjectContextCollector.collect_project_context(_fix_context_project, parse_result)
         
         # Build multi-file symbol index for cross-file dependency resolution
         multi_file_support = None
-        if MULTI_FILE_SUPPORT_AVAILABLE and auto_fix:
+        if MULTI_FILE_SUPPORT_AVAILABLE and auto_fix and _use_augmented:
             logger.info(f"\n🔗 Building multi-file symbol index...")
             multi_file_support = get_multi_file_support()
-            multi_file_support.build_index(project)
+            multi_file_support.build_index(_fix_context_project)
         
         # Run Clang AST analysis for compilation-fix context
         clang_analyzer_instance = None
-        if CLANG_ANALYZER_AVAILABLE and auto_fix:
+        if CLANG_ANALYZER_AVAILABLE and auto_fix and _use_augmented:
             if clang_analysis is None:
                 try:
                     logger.info(f"\n🔬 Running Clang AST analysis for fix context...")
                     clang_analyzer_instance = ClangAnalyzer()
                     clang_analysis = clang_analyzer_instance.analyze_files(
-                        list(project.source_files),
-                        list(getattr(project, 'header_files', []))
+                        list(getattr(_fix_context_project, 'source_files', [])),
+                        list(getattr(_fix_context_project, 'header_files', []))
                     )
                     logger.info(f"   Symbols: {len(clang_analysis.symbols)}, "
                                f"Functions: {len(clang_analysis.functions) if hasattr(clang_analysis, 'functions') else len(clang_analysis.get_function_symbols())}, "
@@ -1482,6 +1760,9 @@ FILE * __cdecl __iob_func(void) {
                         api_key = os.environ.get('MISTRAL_API_KEY')
                     else:
                         api_key = os.environ.get('RUNPOD_API_KEY', 'ollama')
+                    _fhp = None
+                    if os.environ.get("AUGMENTED_FIX", "1") != "0":
+                        _fhp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'fix_history_global.json')
                     llm_fixer = AutoFixer(
                         llm_model=llm_model, 
                         api_key=api_key,
@@ -1489,8 +1770,11 @@ FILE * __cdecl __iob_func(void) {
                         local_model=hybrid_local_model,
                         cloud_file_size_limit=hybrid_cloud_file_size_limit,
                         mode=hybrid_mode,
-                        fix_history_path=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'fix_history_global.json'),
+                        fix_history_path=_fhp,
                         compiler_type=self.compiler_type,
+                        preserve_function_names=preserve_function_names,
+                        min_line_ratio=autofix_min_line_ratio,
+                        max_deleted_functions=autofix_max_deleted_functions,
                     )
                     if use_hybrid_llm:
                         logger.info(f"✓ HYBRID LLM-powered AutoFixer initialized")
@@ -1516,6 +1800,14 @@ FILE * __cdecl __iob_func(void) {
         # Backup original source files for potential compiler fallback (GCC if MSVC fails)
         _original_source_backups = {}
         if self.compiler_type == 'msvc' and self._original_compiler == 'auto' and not self._gcc_fallback_attempted:
+            for _sf in project.source_files:
+                try:
+                    with open(_sf, 'r', encoding='utf-8', errors='ignore') as _f:
+                        _original_source_backups[_sf] = _f.read()
+                except Exception:
+                    pass
+        # Also backup for GCC→MSVC fallback
+        elif self.compiler_type == 'gcc' and not getattr(self, '_msvc_fallback_attempted', False):
             for _sf in project.source_files:
                 try:
                     with open(_sf, 'r', encoding='utf-8', errors='ignore') as _f:
@@ -1818,6 +2110,12 @@ FILE * __cdecl __iob_func(void) {
                             project_context_str = None
                             if project_context and ENHANCED_TOOLS_AVAILABLE:
                                 project_context_str = project_context.to_context_string(max_length=8000)
+                            if extra_fix_context:
+                                project_context_str = (
+                                    f"{extra_fix_context}\n\n{project_context_str}"
+                                    if project_context_str
+                                    else extra_fix_context
+                                )
                             
                             # Fix each source file that has errors
                             files_fixed = 0
@@ -1857,13 +2155,37 @@ FILE * __cdecl __iob_func(void) {
                                 file_errors = [e for e in error_lines if _is_file_error(e, basename, source_file, stem)]
                                 
                                 if file_errors:
+                                    _vendor_classification = _classify_vendor(source_file, read_content=False)
+                                    if _vendor_classification and _vendor_classification.is_vendor:
+                                        logger.warning(
+                                            "   Skipping frozen vendor file %s (%d errors, score=%d: %s)",
+                                            os.path.basename(source_file),
+                                            len(file_errors),
+                                            _vendor_classification.score,
+                                            ", ".join(_vendor_classification.reasons[:3]),
+                                        )
+                                        fix_history.append({
+                                            'attempt': compilation_attempt,
+                                            'file': os.path.basename(source_file),
+                                            'errors_count': len(file_errors),
+                                            'file_size': getattr(_vendor_classification, 'size_bytes', 0),
+                                            'success': False,
+                                            'method': 'skipped_frozen_vendor'
+                                        })
+                                        continue
+
                                     # Skip files with extreme error counts — not fixable by LLM
                                     # But still allow pattern fixes: they handle C2065 cheaply at any scale
                                     c2065_count = sum(1 for e in file_errors if 'C2065' in e)
                                     _in_pattern_mode_file = getattr(self, '_force_pattern_only_fix', False)
-                                    if len(file_errors) > 100 and not _in_pattern_mode_file and c2065_count < len(file_errors) * 0.5:
+                                    if len(file_errors) > 200 and not _in_pattern_mode_file and c2065_count < len(file_errors) * 0.5:
                                         logger.warning(f"   Skipping {os.path.basename(source_file)} ({len(file_errors)} errors — extreme)")
                                         continue
+                                    # For files with 100-200 errors: use pattern-only fix (no LLM)
+                                    _force_pattern_for_extreme = False
+                                    if len(file_errors) > 100 and not _in_pattern_mode_file and c2065_count < len(file_errors) * 0.5:
+                                        logger.warning(f"   {os.path.basename(source_file)} has {len(file_errors)} errors — using pattern-only fix (no LLM)")
+                                        _force_pattern_for_extreme = True
                                     
                                     logger.info(f"   Fixing {os.path.basename(source_file)}...")
                                     
@@ -1956,7 +2278,9 @@ FILE * __cdecl __iob_func(void) {
                                         # 3. Missing includes for known Win32 types
                                         import re as _re_vla
                                         pattern_fixed_code, pattern_fix_count, lnk_libs = AutoFixer.apply_generic_pattern_fixes(
-                                            source_code, file_errors, language, file_path=source_file
+                                            source_code, file_errors, language,
+                                            file_path=source_file,
+                                            clang_analysis=clang_analysis,
                                         )
                                         if pattern_fix_count > 0:
                                             source_code = pattern_fixed_code
@@ -1998,6 +2322,13 @@ FILE * __cdecl __iob_func(void) {
                                                     continue  # C2065 handled by pattern fix
                                                 if any(code in _e for code in ('C2057', 'C2466', 'C2133')):
                                                     continue  # VLA-related
+                                                # GCC SAL annotation errors: '__in'/'__out'/'__inout' not declared
+                                                # These are handled by SAL strip in apply_generic_pattern_fixes()
+                                                if _re_vla.search(r"'__(?:in|out|inout)(?:_opt|_z|_part|_ecount(?:_opt)?|_bcount(?:_opt)?|_full)?'\s+was not declared", _e):
+                                                    continue
+                                                # GCC redeclaration error caused by SAL annotations
+                                                if _re_vla.search(r"redeclared as different kind of entity", _e):
+                                                    continue
                                                 _non_pattern_errors.append(_e)
                                             if len(_non_pattern_errors) <= 2:
                                                 logger.info(f"      ✓ Pattern-only errors: writing fix directly (no LLM needed)")
@@ -2034,7 +2365,54 @@ FILE * __cdecl __iob_func(void) {
                                                 logger.warning(f"      ⚠️  No pattern fix applicable in pattern-only mode, skipping LLM")
                                             continue
 
+                                        # Extreme error count: apply pattern fixes only (no LLM)
+                                        if _force_pattern_for_extreme:
+                                            if pattern_fix_count > 0:
+                                                logger.info(f"      ✓ Extreme-error pattern fix: {pattern_fix_count} fix(es) applied, writing without LLM")
+                                                with open(source_file, 'w', encoding='utf-8') as f:
+                                                    f.write(source_code)
+                                                files_fixed += 1
+                                                fix_history.append({
+                                                    'attempt': compilation_attempt,
+                                                    'file': os.path.basename(source_file),
+                                                    'errors_count': len(file_errors),
+                                                    'file_size': len(source_code),
+                                                    'success': True,
+                                                    'method': 'extreme_error_pattern_fix'
+                                                })
+                                            else:
+                                                logger.warning(f"      ⚠️  No pattern fix applicable for extreme-error file, skipping LLM")
+                                            continue
+
                                         # Use LLM to fix with enhanced context
+                                        # If pattern fixes changed the source, re-run a quick
+                                        # single-file compile to get an up-to-date error list
+                                        # so the LLM isn't confused by stale line numbers.
+                                        if pattern_fix_count > 0:
+                                            try:
+                                                _tmp_errors = self._compile_single_file_for_errors(
+                                                    source_file, source_code, language
+                                                )
+                                                if _tmp_errors is not None:
+                                                    file_errors = _tmp_errors
+                                                    logger.info(f"      ↺ Re-checked errors after pattern fix: {len(file_errors)} remaining")
+                                                    # If re-compile confirms zero errors, write pattern-fixed code and skip LLM
+                                                    if len(file_errors) == 0:
+                                                        logger.info(f"      ✓ Pattern fix cleared all errors (re-compile confirmed): writing without LLM")
+                                                        with open(source_file, 'w', encoding='utf-8') as f:
+                                                            f.write(source_code)
+                                                        files_fixed += 1
+                                                        fix_history.append({
+                                                            'attempt': compilation_attempt,
+                                                            'file': os.path.basename(source_file),
+                                                            'errors_count': len(file_errors),
+                                                            'file_size': len(source_code),
+                                                            'success': True,
+                                                            'method': 'pattern_fix_recompile_confirmed'
+                                                        })
+                                                        continue
+                                            except Exception as _rce:
+                                                logger.debug(f"      Re-check compile failed (non-fatal): {_rce}")
                                         _prev_errs = self._prev_file_errors.get(source_file)
                                         fixed_code, fix_success, remaining_errors = llm_fixer.fix_compilation_errors(
                                             source_code,
@@ -2181,10 +2559,23 @@ FILE * __cdecl __iob_func(void) {
             result.errors = str(e)
         
         # ── GCC Fallback: if MSVC failed in auto mode, retry with GCC/MinGW ──
+        _msvc_only_fallback_reasons = (
+            self._detect_msvc_only_requirements(project)
+            if (not result.success and self.compiler_type == 'msvc')
+            else []
+        )
+        if (_msvc_only_fallback_reasons
+            and self._original_compiler == 'auto'
+            and not self._gcc_fallback_attempted):
+            logger.warning(
+                "   Skipping GCC/MinGW fallback: project requires MSVC-compatible toolchain (%s)",
+                ", ".join(_msvc_only_fallback_reasons[:4]),
+            )
         if (not result.success
             and self.compiler_type == 'msvc'
             and self._original_compiler == 'auto'
             and not self._gcc_fallback_attempted
+            and not _msvc_only_fallback_reasons
             and _original_source_backups):
             
             # Check if GCC/MinGW is available
@@ -2255,6 +2646,92 @@ FILE * __cdecl __iob_func(void) {
                     # Restore MSVC state
                     self.compiler_type = _saved_compiler_type
                     self.msvc_env = _saved_msvc_env
+        
+        # ── MSVC Fallback: if GCC failed (e.g. cc1plus not found), retry with MSVC ──
+        if (not result.success
+            and self.compiler_type == 'gcc'
+            and self._original_compiler in ('gcc', 'auto')
+            and not getattr(self, '_msvc_fallback_attempted', False)
+            and _original_source_backups):
+            
+            # Check if errors indicate broken GCC installation
+            _gcc_broken = False
+            if result.errors:
+                _gcc_broken_patterns = [
+                    'cannot execute',     # cc1plus: cannot execute
+                    'cc1plus',            # cc1plus not found
+                    'cc1',                # cc1 not found
+                    'No such file or directory',  # g++: No such file
+                ]
+                _gcc_broken = any(p in result.errors for p in _gcc_broken_patterns)
+            
+            if _gcc_broken:
+                # Try MSVC as fallback
+                _msvc_check = shutil.which('cl.exe')
+                if not _msvc_check:
+                    # Try to find via vcvarsall
+                    _msvc_check = self._find_msvc()
+                
+                if _msvc_check:
+                    logger.info(f"\n{'='*60}")
+                    logger.info(f"🔄 MSVC FALLBACK: GCC/MinGW broken, retrying with MSVC")
+                    logger.info(f"{'='*60}")
+                    
+                    # Restore original source files
+                    _restored = 0
+                    for _sf, _content in _original_source_backups.items():
+                        try:
+                            with open(_sf, 'w', encoding='utf-8') as _f:
+                                _f.write(_content)
+                            _restored += 1
+                        except Exception:
+                            pass
+                    if _restored:
+                        logger.info(f"   Restored {_restored} source file(s) to original state")
+                    
+                    # Switch to MSVC
+                    self._msvc_fallback_attempted = True
+                    _saved_gcc_type = self.compiler_type
+                    self.compiler = self._find_compiler('msvc')
+                    
+                    if self.compiler_type == 'msvc':
+                        self._setup_default_flags()
+                        logger.info(f"   Switched to MSVC, retrying full compilation...")
+                        
+                        msvc_result = self.compile_project(
+                            project=project,
+                            output_dir=output_dir,
+                            output_name=output_name,
+                            optimization=optimization,
+                            auto_fix=auto_fix,
+                            max_fix_attempts=max_fix_attempts,
+                            llm_model=llm_model,
+                            use_llm_fixer=use_llm_fixer,
+                            llm_fixer_max_code_length=llm_fixer_max_code_length,
+                            permissive_mode=permissive_mode,
+                            parse_result=parse_result,
+                            pre_validate=pre_validate,
+                            auto_generate_headers=auto_generate_headers,
+                            use_enhanced_categorization=use_enhanced_categorization,
+                            use_project_context=use_project_context,
+                            use_hybrid_llm=use_hybrid_llm,
+                            hybrid_local_model=hybrid_local_model,
+                            hybrid_cloud_file_size_limit=hybrid_cloud_file_size_limit,
+                            hybrid_mode=hybrid_mode,
+                            use_mahoraga=use_mahoraga,
+                            mahoraga_memory_file=mahoraga_memory_file,
+                            external_fixer=external_fixer,
+                            clang_analysis=clang_analysis,
+                        )
+                        if msvc_result.success:
+                            logger.info(f"\n✅ MSVC FALLBACK SUCCESSFUL!")
+                            return msvc_result
+                        else:
+                            logger.warning(f"\n⚠️ MSVC fallback also failed")
+                            self.compiler_type = _saved_gcc_type
+                    else:
+                        logger.warning(f"   ⚠️ MSVC not available, cannot fallback")
+                        self.compiler_type = _saved_gcc_type
         
         # Add auto-fix summary to result
         if llm_fixer and fix_history:
@@ -2503,11 +2980,17 @@ FILE * __cdecl __iob_func(void) {
 
     @staticmethod
     def _find_python_entry_point(project) -> Optional[str]:
-        """Find the main entry point for a Python project."""
+        """Find the main entry point for a Python project.
+        
+        If no natural entry point exists, creates a synthetic __main__.py
+        wrapper that imports the main module.
+        """
         candidates = []
+        all_py = []
         for sf in project.source_files:
             if not sf.lower().endswith('.py'):
                 continue
+            all_py.append(sf)
             basename = os.path.basename(sf).lower()
             # Highest priority: __main__.py
             if basename == '__main__.py':
@@ -2526,7 +3009,53 @@ FILE * __cdecl __iob_func(void) {
         if candidates:
             candidates.sort(key=lambda x: -x[0])
             return candidates[0][1]
-        # Fallback: first .py file
+        
+        # No natural entry point found — create a synthetic wrapper
+        if all_py:
+            target = all_py[0]
+            # Find the best target: prefer files NOT in lib/ or utils/ subdirs
+            for sf in all_py:
+                rel = os.path.relpath(sf, project.root_dir)
+                if not any(part in rel.lower() for part in ('lib', 'utils', 'vendor', 'third_party')):
+                    target = sf
+                    break
+            
+            # Create a __main__.py wrapper in project root
+            wrapper_path = os.path.join(project.root_dir, '__main__.py')
+            rel_target = os.path.relpath(target, project.root_dir)
+            # Convert file path to module name (strip .py, replace os.sep with .)
+            module_name = rel_target.replace('.py', '').replace(os.sep, '.').replace('/', '.')
+            # Sanitize: dots in filename break imports, use exec instead
+            if '.' in os.path.basename(target).replace('.py', ''):
+                # File has dots in name like "HackTool.Python.Doxing.py"
+                # Cannot import as module — use exec/runpy
+                wrapper_code = (
+                    f"# Auto-generated entry point wrapper\n"
+                    f"import runpy, os, sys\n"
+                    f"sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+                    f"runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "
+                    f"{repr(rel_target)}), run_name='__main__')\n"
+                )
+            else:
+                wrapper_code = (
+                    f"# Auto-generated entry point wrapper\n"
+                    f"import os, sys\n"
+                    f"sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+                    f"import {module_name}\n"
+                )
+            try:
+                with open(wrapper_path, 'w', encoding='utf-8') as f:
+                    f.write(wrapper_code)
+                logger.info(f"   🐍 Created synthetic entry point: {wrapper_path}")
+                logger.info(f"      Target module: {rel_target}")
+                # Add to project source files so it gets included
+                if wrapper_path not in project.source_files:
+                    project.source_files.append(wrapper_path)
+                return wrapper_path
+            except OSError as e:
+                logger.warning(f"   ⚠️  Failed to create entry point wrapper: {e}")
+        
+        # Absolute fallback: first .py file
         for sf in project.source_files:
             if sf.lower().endswith('.py'):
                 return sf
@@ -2920,4 +3449,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

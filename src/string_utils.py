@@ -14,7 +14,6 @@ def escape_string_for_json(source_code):
 
 
 def extract_only_function_name(str_to_search):
-    print("the string to search is:", str_to_search)
     """
     Extracts the name of the function from a given string.
 
@@ -31,7 +30,6 @@ def extract_only_function_name(str_to_search):
     # Allow optional whitespace before opening parenthesis
     pattern = r'(?:(\w+)::)?(\w+|operator\S+)(?:<[^>]+>)?\s*\('
     match = re.findall(pattern, str_to_search)
-    print('the match is: ', match)
     return match[0][1]
 
 

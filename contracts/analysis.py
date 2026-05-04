@@ -85,15 +85,19 @@ class BehaviorLLMOutput(BaseModel):
     """Strict structured output expected from LLM in BehaviorAnalysisAgent."""
     primary_behavior_category: BehaviorCategory
     confidence: float = Field(ge=0.0, le=1.0)
-    key_behaviors: List[str] = Field(max_length=5)
+    key_behaviors: List[str] = Field(default_factory=list)
     anomalies: List[str] = Field(default_factory=list)
     analyst_summary: str = Field(max_length=2000)
     ioc_extraction: List[IOCEntry] = Field(default_factory=list)
 
-    @field_validator("key_behaviors")
+    @field_validator("key_behaviors", mode="before")
     @classmethod
-    def limit_behaviors(cls, v: List[str]) -> List[str]:
-        return v[:5]
+    def limit_behaviors(cls, v: Any) -> List[str]:
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            v = [str(v)]
+        return [str(item).strip() for item in v if str(item).strip()][:5]
 
     @field_validator("analyst_summary")
     @classmethod
