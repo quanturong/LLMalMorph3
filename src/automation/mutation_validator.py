@@ -26,7 +26,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+try:
+    from .mutation_policy import MutationPolicyEngine
+except Exception:  # pragma: no cover - compatibility for direct script imports
+    from mutation_policy import MutationPolicyEngine  # type: ignore
+
 logger = logging.getLogger(__name__)
+_mutation_policy = MutationPolicyEngine()
 
 # ── tree-sitter import ──────────────────────────────────────────────
 _HAS_TREE_SITTER = False
@@ -46,6 +52,34 @@ try:
 except ImportError:
     logger.warning("tree-sitter not installed. MutationValidator disabled.")
     Node = None  # type: ignore
+
+
+# ── Win32 APIs that return void ────────────────────────────────────
+# Assigning the "return value" of these APIs is a compile error.
+# Used by strat_2/strat_6 API hammering — LLMs sometimes generate
+#   `_junk = GetSystemTimeAsFileTime(NULL);`   ← ERROR: void return
+# instead of the correct pattern:
+#   `FILETIME _ft; GetSystemTimeAsFileTime(&_ft);` ← correct
+_VOID_WIN32_APIS: frozenset = frozenset({
+    # Time — all write through output pointer, return void
+    'GetSystemTimeAsFileTime', 'GetSystemTime', 'GetLocalTime',
+    'GetFileTime',
+    # System info — write through output pointer, return void
+    'GetSystemInfo', 'GetNativeSystemInfo', 'GetStartupInfoA', 'GetStartupInfoW',
+    # Memory — GlobalMemoryStatus writes through struct pointer
+    'GlobalMemoryStatus',
+    # Debug / process
+    'OutputDebugStringA', 'OutputDebugStringW', 'DebugBreak', 'ExitProcess',
+    'PostQuitMessage',
+    # Sleep
+    'Sleep', 'SleepEx',
+    # Memory ops (macros but commonly appear as calls)
+    'ZeroMemory', 'RtlZeroMemory', 'FillMemory', 'RtlFillMemory',
+    'CopyMemory', 'RtlCopyMemory', 'MoveMemory', 'RtlMoveMemory',
+    'SecureZeroMemory',
+    # CPUID-like
+    '__cpuid', '__cpuidex',
+})
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -89,6 +123,10 @@ class CodeFeatures:
 
     # String literals still present in the code
     string_literals: List[str] = field(default_factory=list)
+
+    # Void API misassignments: list of (api_name, offending_snippet)
+    # e.g. ("GetSystemTimeAsFileTime", "_junk = GetSystemTimeAsFileTime(NULL);")
+    void_api_assignments: List[Tuple[str, str]] = field(default_factory=list)
 
     @property
     def logic_density(self) -> float:
@@ -160,6 +198,7 @@ class _FeatureExtractor:
         self._extract_call_arg_widths_regex(code, feats)
         self._extract_string_literals_regex(code, feats)
         self._extract_suspicious_casts_regex(code, feats)
+        self._extract_void_api_assignments_regex(code, feats)
 
         return feats
 
@@ -466,6 +505,42 @@ class _FeatureExtractor:
             if var_name in narrow_vars:
                 feats.suspicious_casts.append((cast_type, var_name, 'char'))
 
+    def _extract_void_api_assignments_regex(self, code: str, feats: CodeFeatures):
+        """Detect assignments of void-returning Win32 APIs.
+
+        Catches patterns like:
+          _junk = GetSystemTimeAsFileTime(NULL);       // void return assigned
+          _dc3 = GetSystemTimeAsFileTime(NULL) >> 16;  // void return in expression
+
+        These produce 'cannot convert void to DWORD' compile errors.
+        """
+        # Build alternation pattern for all known void APIs (sorted for determinism)
+        _api_pat = '|'.join(re.escape(api) for api in sorted(_VOID_WIN32_APIS))
+        # Match: <word_or_deref> = <VoidApi>(
+        # Covers: _junk = GetSystemTimeAsFileTime(  and  *p = Sleep(
+        _assign_re = re.compile(
+            r'(?:^|[;\n{])\s*'          # statement start
+            r'\*?\s*\w+\s*'             # lhs variable (possibly dereferenced)
+            r'(?:\[[^\]]*\]\s*)?'       # optional array subscript in lhs
+            r'='                        # assignment
+            r'(?!=)'                    # not == (comparison)
+            r'\s*'
+            r'(' + _api_pat + r')'      # <== captured void API name
+            r'\s*\(',                   # opening paren of call
+            re.MULTILINE,
+        )
+        for m in _assign_re.finditer(code):
+            api_name = m.group(1)
+            # Use position of the captured API name (group 1) to find its line,
+            # not m.start() which points at the anchor character (newline/semicolon).
+            api_pos = m.start(1)
+            line_start = code.rfind('\n', 0, api_pos) + 1
+            line_end = code.find('\n', api_pos)
+            if line_end == -1:
+                line_end = len(code)
+            snippet = code[line_start:line_end].strip()[:120]
+            feats.void_api_assignments.append((api_name, snippet))
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Pluggable Checks
@@ -703,6 +778,52 @@ def _check_complexity_preservation(
     return True, ""
 
 
+def _check_void_api_assignment(
+    orig: CodeFeatures, mut: CodeFeatures, strategy: str,
+) -> CheckResult:
+    """Reject if void-returning Win32 APIs are assigned to variables.
+
+    Catches strat_2/strat_6 API hammering mistakes like:
+      _junk = GetSystemTimeAsFileTime(NULL);      // ERROR: GetSystemTimeAsFileTime returns void
+      _dc3 = GetSystemTimeAsFileTime(NULL) >> 16; // ERROR: can't use void in expression
+      _n1  = GetSystemTime(NULL);                 // ERROR: same
+      _n2  = GetSystemInfo(NULL);                 // ERROR: same
+
+    The correct pattern is:
+      FILETIME  _ft; GetSystemTimeAsFileTime(&_ft);               // read via output ptr
+      SYSTEMTIME _st; GetSystemTime(&_st); volatile DWORD _h = _st.wMilliseconds;
+      SYSTEM_INFO _si; GetSystemInfo(&_si); volatile DWORD _h = _si.dwPageSize;
+    """
+    # Only flag NEW violations not already present in the original
+    # (the original, if it compiled, should have zero such patterns)
+    orig_offending = {v[0] for v in orig.void_api_assignments}
+    new_violations = [v for v in mut.void_api_assignments if v[0] not in orig_offending]
+
+    if new_violations:
+        # Deduplicate by API name for the summary
+        seen: set = set()
+        unique = []
+        for api, snip in new_violations:
+            if api not in seen:
+                seen.add(api)
+                unique.append((api, snip))
+
+        first_api, first_snip = unique[0]
+        all_apis = ', '.join(a for a, _ in unique)
+        return False, (
+            f"Void API assignment: `{first_snip}`. "
+            f"`{first_api}` returns VOID — its return value cannot be assigned to a variable "
+            f"or used in an expression. "
+            f"You MUST call it as a STATEMENT through an output pointer, e.g.:\n"
+            f"  GetSystemTimeAsFileTime → `FILETIME _ft; GetSystemTimeAsFileTime(&_ft);`\n"
+            f"  GetSystemTime          → `SYSTEMTIME _st; GetSystemTime(&_st); volatile DWORD _h = _st.wMilliseconds;`\n"
+            f"  GetSystemInfo          → `SYSTEM_INFO _si; GetSystemInfo(&_si); volatile DWORD _h = _si.dwPageSize;`\n"
+            f"  Sleep                  → `Sleep(1);`  (no assignment)\n"
+            f"Fix ALL occurrences: {all_apis}."
+        )
+    return True, ""
+
+
 # ── Registry of all checks ─────────────────────────────────────────
 # Order matters: cheaper/faster checks first for early rejection.
 
@@ -711,11 +832,37 @@ _CHECKS: List[Tuple[str, CheckFn]] = [
     ("function_call_preservation", _check_function_call_preservation),
     ("buffer_overflow",          _check_buffer_overflow),
     ("suspicious_casts",         _check_suspicious_casts),
+    ("void_api_assignment",      _check_void_api_assignment),
     ("call_argument_char_width", _check_call_argument_char_width_preservation),
     ("forward_declarations",     _check_forward_declarations),
     ("ast_error_rate",           _check_ast_error_rate),
     ("complexity_preservation",  _check_complexity_preservation),
 ]
+
+_ALWAYS_ENABLED_CHECKS = frozenset({
+    "logic_density",
+    "function_call_preservation",
+    "forward_declarations",
+    "ast_error_rate",
+    "complexity_preservation",
+})
+
+_CHECK_TO_POLICY_GATES = {
+    "buffer_overflow": {"string_buffer_bounds"},
+    "suspicious_casts": {"char_width", "call_arg_width"},
+    "call_argument_char_width": {"char_width", "call_arg_width", "api_signature"},
+    "void_api_assignment": {"void_api_assignment"},
+}
+
+
+def _enabled_checks_for_strategy(strategy: str) -> Set[str]:
+    """Select validator checks from strategy capabilities."""
+    gates = set(_mutation_policy.capabilities_for(strategy).gate_names())
+    enabled = set(_ALWAYS_ENABLED_CHECKS)
+    for check_name, gate_names in _CHECK_TO_POLICY_GATES.items():
+        if gates & gate_names:
+            enabled.add(check_name)
+    return enabled
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -769,7 +916,15 @@ class MutationValidator:
             logger.warning("mutation_validator_parse_failed_passthrough")
             return True, None  # Can't validate → pass through
 
+        enabled_checks = _enabled_checks_for_strategy(strategy)
         for check_name, check_fn in _CHECKS:
+            if check_name not in enabled_checks:
+                logger.debug(
+                    "mutation_validator_check_skipped_by_policy: %s strategy=%s",
+                    check_name,
+                    strategy,
+                )
+                continue
             passed, reason = check_fn(orig_feats, mut_feats, strategy)
             if not passed:
                 logger.warning(

@@ -159,15 +159,15 @@ class PolicyEngine:
             recommended = DecisionAction(llm_output.recommended_action)
         except ValueError:
             logger.warning(
-                "LLM recommended unknown action '%s'. Falling back to ESCALATE_TO_ANALYST.",
+                "LLM recommended unknown action '%s'. Falling back to CONTINUE_TO_REPORT.",
                 llm_output.recommended_action,
             )
             return DecisionResult(
                 job_id=job_state.job_id,
                 sample_id=job_state.sample_id,
-                action=DecisionAction.ESCALATE_TO_ANALYST,
-                rationale=f"LLM recommended unknown action '{llm_output.recommended_action}'.",
-                confidence=1.0,
+                action=DecisionAction.CONTINUE_TO_REPORT,
+                rationale=f"LLM recommended unknown action '{llm_output.recommended_action}'; defaulting to continue_to_report.",
+                confidence=0.6,
                 source=DecisionSource.POLICY_OVERRIDE,
                 llm_raw_output=llm_output.model_dump(),
             )
@@ -177,19 +177,19 @@ class PolicyEngine:
         if recommended not in allowed:
             logger.warning(
                 "LLM recommended %s which is not in allowed actions for state %s. "
-                "Falling back to ESCALATE_TO_ANALYST.",
+                "Falling back to CONTINUE_TO_REPORT.",
                 recommended.value,
                 job_state.current_status.value,
             )
             return DecisionResult(
                 job_id=job_state.job_id,
                 sample_id=job_state.sample_id,
-                action=DecisionAction.ESCALATE_TO_ANALYST,
+                action=DecisionAction.CONTINUE_TO_REPORT,
                 rationale=(
                     f"LLM recommended '{recommended.value}' "
-                    f"which is not allowed in state '{job_state.current_status.value}'."
+                    f"which is not allowed in state '{job_state.current_status.value}'; defaulting to continue_to_report."
                 ),
-                confidence=1.0,
+                confidence=0.6,
                 source=DecisionSource.POLICY_OVERRIDE,
                 llm_raw_output=llm_output.model_dump(),
             )

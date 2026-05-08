@@ -29,11 +29,32 @@ class CompilationValidator:
     
     # Entry point patterns - support various calling conventions
     ENTRY_POINTS = {
-        'WinMain': re.compile(r'int\s+(?:WINAPI\s+|APIENTRY\s+|__stdcall\s+)?WinMain\s*\('),
-        'wWinMain': re.compile(r'int\s+(?:WINAPI\s+|APIENTRY\s+|__stdcall\s+)?wWinMain\s*\('),
-        'main': re.compile(r'int\s+main\s*\('),
-        '_start': re.compile(r'void\s+_start\s*\('),
-        'DllMain': re.compile(r'BOOL\s+(?:WINAPI\s+|APIENTRY\s+|__stdcall\s+)?DllMain\s*\('),
+        # Keep these broad: old malware projects use _stdcall, PASCAL,
+        # APIENTRY/WINAPI, omitted return types, and multiline signatures.
+        'WinMain': re.compile(
+            r'(?m)^\s*(?:extern\s+)?(?:int|INT|void|VOID)?\s*'
+            r'(?:(?:WINAPI|APIENTRY|CALLBACK|PASCAL|__stdcall|_stdcall)\s+)*'
+            r'WinMain\s*\('
+        ),
+        'wWinMain': re.compile(
+            r'(?m)^\s*(?:extern\s+)?(?:int|INT|void|VOID)?\s*'
+            r'(?:(?:WINAPI|APIENTRY|CALLBACK|PASCAL|__stdcall|_stdcall)\s+)*'
+            r'wWinMain\s*\('
+        ),
+        'main': re.compile(
+            r'(?m)^\s*(?:extern\s+)?(?:int|void|VOID)?\s*main\s*\('
+        ),
+        'wmain': re.compile(
+            r'(?m)^\s*(?:extern\s+)?(?:int|void|VOID)?\s*wmain\s*\('
+        ),
+        '_start': re.compile(
+            r'(?m)^\s*(?:extern\s+)?(?:void|VOID|int)?\s*_start\s*\('
+        ),
+        'DllMain': re.compile(
+            r'(?m)^\s*(?:extern\s+)?(?:BOOL|int|INT)?\s*'
+            r'(?:(?:WINAPI|APIENTRY|CALLBACK|PASCAL|__stdcall|_stdcall)\s+)*'
+            r'DllMain\s*\('
+        ),
     }
     
     # System types that should not be redefined
@@ -458,8 +479,22 @@ class CompilationValidator:
                 with open(first_source, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
                 
-                # Check if really missing
-                if not any(cls.ENTRY_POINTS[ep].search(content) for ep in cls.ENTRY_POINTS):
+                # Check project-wide, not only the first file.  The old logic
+                # appended a WinMain stub to file[0] even when another source
+                # already had WinMain/main with a non-standard calling
+                # convention, creating duplicate entry point failures.
+                project_has_entry = False
+                for source_file in project.source_files:
+                    try:
+                        with open(source_file, 'r', encoding='utf-8', errors='ignore') as sf:
+                            source_text = sf.read()
+                        if any(pattern.search(source_text) for pattern in cls.ENTRY_POINTS.values()):
+                            project_has_entry = True
+                            break
+                    except Exception:
+                        continue
+
+                if not project_has_entry:
                     entry_point_code = """
 // Auto-generated entry point
 #include <windows.h>
@@ -535,4 +570,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

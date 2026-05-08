@@ -171,16 +171,43 @@ class DecisionAgent(BaseAgent):
             )
             return
 
+        # Load behavioral equivalence result so LLM has full context
+        equivalence_result: Optional[dict] = None
+        if self._ctx.artifact_store and getattr(job_state, 'equivalence_result_id', None):
+            equivalence_result = await self._ctx.artifact_store.get_json(
+                job_id, job_state.equivalence_result_id
+            )
+
         llm_recommendation: Optional[DecisionLLMOutput] = None
         if self._ctx.llm_provider:
             llm_recommendation = await self._ask_llm(
-                job_id, threat_score, analysis_result or {}, log
+                job_id, threat_score, analysis_result or {}, equivalence_result, log
             )
 
         if llm_recommendation:
             final_decision = self._policy.apply_post_llm(
                 llm_recommendation, job_state, threat_score
             )
+            # Deterministic equivalence override: if behavioral equivalence shows
+            # the variant is equivalent/mostly_equivalent, always continue_to_report
+            # regardless of what the LLM or policy engine decided.
+            if final_decision.action == DecisionAction.ESCALATE_TO_ANALYST and equivalence_result:
+                eq_verdict = (equivalence_result.get("verdict") or "").lower()
+                if eq_verdict in ("equivalent", "mostly_equivalent"):
+                    eq_score = equivalence_result.get("overall_equivalence_score", 0)
+                    final_decision = DecisionResult(
+                        job_id=final_decision.job_id,
+                        sample_id=final_decision.sample_id,
+                        action=DecisionAction.CONTINUE_TO_REPORT,
+                        rationale=(
+                            f"Equivalence check passed (verdict={eq_verdict}, "
+                            f"score={eq_score:.2f}); overriding escalation to continue_to_report."
+                        ),
+                        confidence=0.95,
+                        source=DecisionSource.POLICY_OVERRIDE,
+                        policy_applied="equivalence_override",
+                        llm_raw_output=final_decision.llm_raw_output,
+                    )
         else:
             ioc_count = len((analysis_result or {}).get("iocs", []))
             if threat_score == 0 and not ioc_count:
@@ -260,23 +287,39 @@ class DecisionAgent(BaseAgent):
     # ──────────────────────────────────────────────────────────────────────
 
     async def _ask_llm(
-        self, job_id: str, threat_score: float, analysis_result: dict, log
+        self, job_id: str, threat_score: float, analysis_result: dict,
+        equivalence_result: Optional[dict], log
     ) -> Optional[DecisionLLMOutput]:
         try:
             prompt_template = _load_prompt(_DECISION_PROMPT_PATH)
+
+            eq_summary = None
+            if equivalence_result:
+                eq_summary = {
+                    "verdict": equivalence_result.get("verdict"),
+                    "overall_equivalence_score": equivalence_result.get("overall_equivalence_score"),
+                    "ttp_preservation_rate": equivalence_result.get("ttp_preservation_rate"),
+                    "api_call_jaccard_similarity": equivalence_result.get("api_call_jaccard_similarity"),
+                    "summary": (equivalence_result.get("summary") or "")[:200],
+                }
+
             context_json = json.dumps({
                 "job_id": job_id,
                 "threat_score": threat_score,
                 "analysis_summary": _summarize_analysis(analysis_result),
+                "behavioral_equivalence": eq_summary,
             }, indent=2)
             prompt = prompt_template.replace("{{decision_context_json}}", context_json)
 
             request = LLMRequest(
                 system_prompt=(
-                    "You are a security orchestration agent. "
-                    "Given analysis context, recommend ONE action from: "
-                    "continue_to_report, retry_sandbox, escalate_to_analyst, "
-                    "close_no_behavior, close_failed. "
+                    "You are a decision agent in a malware mutation research pipeline. "
+                    "Samples are known malware — high threat scores are expected and normal. "
+                    "Your job is to evaluate whether a mutated variant should proceed to reporting. "
+                    "RULE: if behavioral_equivalence.verdict is 'equivalent' or 'mostly_equivalent', "
+                    "you MUST recommend 'continue_to_report' unless there is a critical technical failure. "
+                    "Only use 'escalate_to_analyst' for genuine anomalies (e.g., sandbox crash, "
+                    "equivalence check skipped, contradictory data). "
                     "Respond ONLY as valid JSON."
                 ),
                 user_prompt=prompt,
@@ -462,7 +505,12 @@ class DecisionAgent(BaseAgent):
                     for ioc in iocs[:20]
                 ]
             # Behavior categories indicate what triggered detection
-            categories = analysis_result.get("behavior_categories", [])
+            # primary_category is the canonical field in BehaviorAnalysisResult;
+            # fall back to legacy behavior_categories list if present.
+            primary_cat = analysis_result.get("primary_category") or ""
+            categories = analysis_result.get("behavior_categories") or (
+                [primary_cat] if primary_cat and primary_cat not in ("", "unknown") else []
+            )
             if categories:
                 ctx["behavior_categories"] = categories
             threat_score = analysis_result.get("threat_score", 0)
@@ -488,11 +536,18 @@ class DecisionAgent(BaseAgent):
 
 def _summarize_analysis(analysis: dict) -> dict:
     """Produce a compact summary for LLM context."""
+    # primary_category/analyst_narrative are canonical fields in BehaviorAnalysisResult.
+    # Fall back to legacy behavior_categories/summary if present (older artifact format).
+    primary_cat = analysis.get("primary_category") or ""
+    categories = analysis.get("behavior_categories") or (
+        [primary_cat] if primary_cat and primary_cat not in ("", "unknown") else []
+    )
+    narrative = analysis.get("analyst_narrative") or analysis.get("summary") or ""
     return {
         "threat_score": analysis.get("threat_score", 0),
         "ioc_count": len(analysis.get("iocs", [])),
-        "behavior_categories": analysis.get("behavior_categories", []),
-        "summary": analysis.get("summary", "")[:400],
+        "behavior_categories": categories,
+        "summary": narrative[:400],
     }
 
 

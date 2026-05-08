@@ -165,6 +165,12 @@ class CompilationResult:
 
 class ProjectCompiler:
     """Compile complete C/C++ projects"""
+
+    _ENTRY_POINT_SYMBOLS = frozenset({
+        'main', 'wmain', 'WinMain', 'wWinMain', 'DllMain',
+        '_start', 'WinMainCRTStartup', 'wWinMainCRTStartup',
+        'mainCRTStartup', 'wmainCRTStartup',
+    })
     
     # Known MSVC installation paths
     _MSVC_SEARCH_PATHS = [
@@ -217,6 +223,8 @@ class ProjectCompiler:
             reasons.append("msvc_import_directive")
         if re.search(r'\b__(try|except|finally)\b', text):
             reasons.append("msvc_seh")
+        if re.search(r'\btypedef\s+struct\s+\w+__\s*\*\s*H[A-Z]\w+\s*;', text):
+            reasons.append("project_defines_win32_handle_types")
 
         return reasons
     
@@ -792,6 +800,468 @@ class ProjectCompiler:
             logger.info(f"   🧹 Wiped {removed} build intermediates from {output_dir}")
         return removed
     
+    # ── Dynamic duplicate global symbol detection ────────────────────────
+    # Replaces the old hardcoded `main()` regex with a full scan for ANY
+    # function defined at global scope in multiple source files.
+
+    @staticmethod
+    def _extract_global_function_defs(content: str) -> set:
+        """Extract function names defined at global scope (brace depth 0).
+
+        Uses brace-depth tracking so that nested function-like patterns
+        inside class/struct bodies are ignored.  Returns a set of names.
+        """
+        _KEYWORDS = frozenset({
+            'if', 'for', 'while', 'do', 'switch', 'case', 'catch', 'return',
+            'sizeof', 'typeof', 'alignof', 'decltype', 'noexcept',
+            'struct', 'class', 'enum', 'union', 'namespace', 'template',
+            'typedef', 'using', 'extern', 'static_assert',
+            'defined', 'elif', 'ifdef', 'ifndef', 'endif',
+            'pragma', 'include', 'define', 'undef', 'else',
+            # C++ casts / operators
+            'new', 'delete', 'throw', 'try', 'operator',
+        })
+        # Pattern: word immediately before '(' — candidate function name
+        _NAME_RE = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
+
+        funcs: set = set()
+        brace_depth = 0
+        lines = content.splitlines()
+        i = 0
+        n = len(lines)
+        in_block_comment = False
+
+        while i < n:
+            raw = lines[i]
+            stripped = raw.strip()
+
+            # ── Handle block comments ──
+            if in_block_comment:
+                if '*/' in stripped:
+                    in_block_comment = False
+                    stripped = stripped[stripped.index('*/') + 2:]
+                else:
+                    i += 1
+                    continue
+            if '/*' in stripped:
+                # Remove inline block comments for this line
+                cleaned = re.sub(r'/\*.*?\*/', '', stripped)
+                if '/*' in cleaned:  # unclosed block comment
+                    in_block_comment = True
+                    stripped = cleaned[:cleaned.index('/*')]
+                else:
+                    stripped = cleaned
+
+            # Skip preprocessor directives and line comments
+            if stripped.startswith('#') or stripped.startswith('//'):
+                i += 1
+                continue
+
+            # ── At global scope, look for function definitions ──
+            if brace_depth == 0 and '(' in stripped and not stripped.rstrip().endswith(';'):
+                # Ignore lines that are purely type declarations or forward decls
+                m = _NAME_RE.search(stripped)
+                if m:
+                    name = m.group(1)
+                    if name not in _KEYWORDS:
+                        prefix = stripped[:m.start(1)]
+                        if re.search(r'\b(static|inline|__inline|__forceinline|FORCEINLINE)\b', prefix):
+                            i += 1
+                            continue
+                        qualified = re.search(
+                            r'([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)::\s*$',
+                            prefix,
+                        )
+                        symbol_name = f"{qualified.group(1)}::{name}" if qualified else name
+                        # Verify this is a definition (has '{'), not a declaration
+                        # Look at current line and up to 5 following lines
+                        lookahead = stripped[m.end():]
+                        found_brace = '{' in lookahead
+                        if not found_brace:
+                            for j in range(i + 1, min(i + 6, n)):
+                                nxt = lines[j].strip()
+                                if '{' in nxt:
+                                    found_brace = True
+                                    break
+                                if ';' in nxt or nxt.startswith('#'):
+                                    break
+                        if found_brace:
+                            funcs.add(symbol_name)
+
+            # ── Track brace depth (crude but sufficient) ──
+            # Remove string literals and char literals to avoid counting braces inside them
+            clean_for_braces = re.sub(r'"(?:[^"\\]|\\.)*"', '', stripped)
+            clean_for_braces = re.sub(r"'(?:[^'\\]|\\.)*'", '', clean_for_braces)
+            brace_depth += clean_for_braces.count('{') - clean_for_braces.count('}')
+            if brace_depth < 0:
+                brace_depth = 0  # safety clamp
+
+            i += 1
+
+        return funcs
+
+    @staticmethod
+    def _detect_duplicate_global_symbols(
+        source_files: list,
+    ) -> tuple:
+        """Detect function definitions that appear in multiple source files.
+
+        Scans every source file for globally-scoped function definitions,
+        finds names defined in 2+ files, and returns which files to exclude.
+
+        Returns
+        -------
+        (effective_sources, excluded_info)
+            *effective_sources* preserves original order minus excluded files.
+            *excluded_info* is a list of ``(filepath, [dup_names])`` tuples
+            describing what was removed and why.
+        """
+        from collections import defaultdict
+
+        file_functions: dict = {}  # {filepath: set(func_names)}
+        for src in source_files:
+            # Skip pre-compiled objects
+            if src.lower().endswith(('.o', '.obj', '.lib', '.a', '.res')):
+                continue
+            try:
+                with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            except Exception:
+                continue
+            funcs = ProjectCompiler._extract_global_function_defs(content)
+            if funcs:
+                file_functions[src] = funcs
+
+        # Build reverse index: func_name → [files that define it]
+        func_to_files: dict = defaultdict(list)
+        for src, funcs in file_functions.items():
+            for fn in funcs:
+                func_to_files[fn].append(src)
+
+        # Identify duplicates (defined in 2+ files)
+        duplicates = {fn: files for fn, files in func_to_files.items()
+                      if len(files) >= 2}
+
+        if not duplicates:
+            return list(source_files), []
+
+        def _provider_score(path: str, fn: str) -> tuple:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            basename = os.path.basename(path).lower()
+            entry_bonus = 1 if fn in ProjectCompiler._ENTRY_POINT_SYMBOLS else 0
+            return (entry_bonus, size, -len(basename))
+
+        provider_for: dict = {}
+        for fn, files in duplicates.items():
+            provider_for[fn] = max(files, key=lambda f: _provider_score(f, fn))
+
+        excluded_by_duplicate: set = set()
+        duplicate_names = set(duplicates.keys())
+        for src, funcs in file_functions.items():
+            duplicate_funcs = funcs & duplicate_names
+            if not duplicate_funcs:
+                continue
+            non_provider_dups = {
+                fn for fn in duplicate_funcs
+                if fn in provider_for and provider_for[fn] != src
+            }
+            if not non_provider_dups:
+                continue
+            unique_funcs = funcs - duplicate_names
+            has_entrypoint_dup = any(
+                fn in ProjectCompiler._ENTRY_POINT_SYMBOLS
+                for fn in non_provider_dups
+            )
+            if has_entrypoint_dup or not unique_funcs:
+                excluded_by_duplicate.add(src)
+
+        if excluded_by_duplicate:
+            effective = [f for f in source_files if f not in excluded_by_duplicate]
+            excluded_info = [
+                (f, sorted(file_functions.get(f, set()) & set(duplicates.keys())))
+                for f in excluded_by_duplicate
+            ]
+            return effective, excluded_info
+
+        # Decide which files to exclude.
+        # Strategy: for each duplicate group, keep the largest file (most
+        # likely the "real" implementation or the richest translation unit).
+        # A file is excluded only if ALL its globally-defined functions that
+        # are duplicates are also defined in a larger file.
+        files_to_exclude: set = set()
+        for fn, files in duplicates.items():
+            sized = sorted(files, key=lambda f: os.path.getsize(f), reverse=True)
+            # Keep the first (largest), mark the rest as exclude candidates
+            for excluded in sized[1:]:
+                files_to_exclude.add(excluded)
+
+        # Don't exclude a file if it defines unique symbols not found elsewhere
+        # (it may be needed for linking even if it duplicates one entrypoint)
+        truly_excluded: set = set()
+        for f in files_to_exclude:
+            f_funcs = file_functions.get(f, set())
+            # Check if ALL this file's functions are also in another kept file
+            unique_to_this = set()
+            for fn in f_funcs:
+                definers = func_to_files[fn]
+                # Is there another file that defines this AND is NOT excluded?
+                other_definers = [d for d in definers if d != f and d not in files_to_exclude]
+                if not other_definers:
+                    unique_to_this.add(fn)
+            if not unique_to_this:
+                truly_excluded.add(f)
+            else:
+                logger.info(
+                    "   ℹ️  Keeping %s despite duplicates — defines unique symbols: %s",
+                    os.path.basename(f), ', '.join(sorted(unique_to_this)[:5]),
+                )
+
+        effective = [f for f in source_files if f not in truly_excluded]
+        excluded_info = [
+            (f, sorted(file_functions.get(f, set()) & set(duplicates.keys())))
+            for f in truly_excluded
+        ]
+        return effective, excluded_info
+
+    # ── Header conflict pre-detection ──────────────────────────────────────
+    @staticmethod
+    def _check_preprocessor_balance(source_files: list, header_files: list = None) -> list:
+        """Find unmatched preprocessor conditionals before invoking a compiler."""
+        issues = []
+        open_re = re.compile(r'^\s*#\s*(if|ifdef|ifndef)\b')
+        close_re = re.compile(r'^\s*#\s*endif\b')
+
+        for path in list(source_files or []) + list(header_files or []):
+            try:
+                lines = Path(path).read_text(encoding='utf-8', errors='ignore').splitlines()
+            except Exception:
+                continue
+
+            stack = []
+            for idx, line in enumerate(lines, 1):
+                if open_re.search(line):
+                    stack.append(idx)
+                elif close_re.search(line):
+                    if stack:
+                        stack.pop()
+                    else:
+                        issues.append({
+                            'file': path,
+                            'line': idx,
+                            'type': 'unexpected_endif',
+                            'message': 'Unexpected #endif without matching #if/#ifdef/#ifndef',
+                        })
+            if stack:
+                issues.append({
+                    'file': path,
+                    'line': stack[-1],
+                    'type': 'unclosed_if',
+                    'message': f'{len(stack)} preprocessor block(s) left unclosed',
+                })
+
+        return issues
+
+    def _apply_header_conflict_mitigations(self, project, conflicts: dict, output_dir: str) -> Optional[str]:
+        """Apply compiler-level mitigations for detected header-order conflicts."""
+        conflict_types = {c.get('type') for c in conflicts.get('conflicts', [])}
+        if 'winsock_order' not in conflict_types:
+            return None
+
+        prefix_path = os.path.join(output_dir, '_llmalmorph_prefix.h')
+        prefix_content = (
+            "/* Auto-generated build prefix for SDK include ordering. */\n"
+            "#ifndef WIN32_LEAN_AND_MEAN\n"
+            "#define WIN32_LEAN_AND_MEAN 1\n"
+            "#endif\n"
+            "#ifndef NOMINMAX\n"
+            "#define NOMINMAX 1\n"
+            "#endif\n"
+            "#include <winsock2.h>\n"
+            "#include <ws2tcpip.h>\n"
+        )
+        try:
+            Path(prefix_path).write_text(prefix_content, encoding='utf-8')
+        except Exception as exc:
+            logger.debug("Failed to write header prefix: %s", exc)
+            return None
+
+        if hasattr(project, 'add_header_file') and prefix_path not in getattr(project, 'header_files', []):
+            try:
+                project.add_header_file(prefix_path)
+            except Exception:
+                pass
+
+        if self.compiler_type == 'msvc':
+            flags = [f'/FI{prefix_path}']
+        else:
+            flags = ['-include', prefix_path]
+        for flag in reversed(flags):
+            if flag not in self.compile_flags:
+                self.compile_flags.insert(0, flag)
+        return prefix_path
+
+    @staticmethod
+    def _detect_header_conflicts(source_files: list, header_files: list = None) -> dict:
+        """Scan source and header files for known header-ordering conflicts.
+
+        Returns a dict with:
+          'conflicts': list of {type, files, remedy} dicts
+          'defines_to_inject': list of -D / /D defines to add to compiler flags
+        """
+        all_files = list(source_files) + list(header_files or [])
+        includes_by_file: dict = {}  # file → [included headers]
+
+        for fpath in all_files:
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    text = f.read()
+            except Exception:
+                continue
+            # Extract #include <...> and #include "..."
+            incs = re.findall(r'#\s*include\s*[<"]([^>"]+)[>"]', text, re.IGNORECASE)
+            includes_by_file[fpath] = [h.lower().replace('\\', '/') for h in incs]
+
+        conflicts = []
+        defines_to_inject = set()
+
+        # Flatten all includes across the project
+        all_includes = set()
+        for incs in includes_by_file.values():
+            all_includes.update(incs)
+
+        # ── Conflict 1: winsock.h vs winsock2.h ──
+        # If ANY file includes winsock2.h and ANY file includes winsock.h
+        # (or windows.h without WIN32_LEAN_AND_MEAN), there will be redefinition errors.
+        has_winsock2 = 'winsock2.h' in all_includes or 'ws2tcpip.h' in all_includes
+        has_winsock1 = 'winsock.h' in all_includes
+        has_windows_h = 'windows.h' in all_includes
+
+        if has_winsock2 and (has_winsock1 or has_windows_h):
+            ws2_files = [f for f, incs in includes_by_file.items()
+                         if 'winsock2.h' in incs or 'ws2tcpip.h' in incs]
+            ws1_files = [f for f, incs in includes_by_file.items()
+                         if 'winsock.h' in incs]
+            win_files = [f for f, incs in includes_by_file.items()
+                         if 'windows.h' in incs]
+            conflicts.append({
+                'type': 'winsock_order',
+                'ws2_files': [os.path.basename(f) for f in ws2_files],
+                'ws1_files': [os.path.basename(f) for f in ws1_files],
+                'win_files': [os.path.basename(f) for f in win_files],
+                'remedy': 'Inject WIN32_LEAN_AND_MEAN and include winsock2.h before windows.h',
+            })
+            defines_to_inject.add('WIN32_LEAN_AND_MEAN')
+
+        # ── Conflict 2: winternl.h + ntddk.h / ntdef.h type redefinitions ──
+        has_winternl = 'winternl.h' in all_includes
+        has_ntddk = 'ntddk.h' in all_includes or 'ntdef.h' in all_includes or 'ntstatus.h' in all_includes
+        if has_winternl and has_ntddk:
+            conflicts.append({
+                'type': 'winternl_ntddk',
+                'remedy': 'Conflicting NT headers — may cause type redefinitions',
+            })
+
+        # ── Conflict 3: multiple files defining the same macro-guarded types ──
+        # Detect by scanning for typedef + common type names in multiple files
+        # (dynamic — not hardcoded to specific type names)
+        typedef_defs = {}  # type_name → [files]
+        _typedef_re = re.compile(r'\btypedef\b\s+.*?\b(\w+)\s*;', re.MULTILINE)
+        for fpath in all_files:
+            if not fpath.lower().endswith(('.h', '.hpp', '.hxx')):
+                continue
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    text = f.read()
+            except Exception:
+                continue
+            for m in _typedef_re.finditer(text):
+                tname = m.group(1)
+                if len(tname) > 2:  # skip single-char typedefs
+                    typedef_defs.setdefault(tname, set()).add(fpath)
+
+        dup_typedefs = {t: files for t, files in typedef_defs.items() if len(files) >= 2}
+        if dup_typedefs:
+            # Only report the top 5 most-duplicated
+            top_dups = sorted(dup_typedefs.items(), key=lambda x: -len(x[1]))[:5]
+            conflicts.append({
+                'type': 'duplicate_typedefs',
+                'examples': {t: [os.path.basename(f) for f in files]
+                             for t, files in top_dups},
+                'remedy': 'Multiple headers define the same type — may cause redefinition errors',
+            })
+
+        return {
+            'conflicts': conflicts,
+            'defines_to_inject': sorted(defines_to_inject),
+        }
+
+    # ── Smart syntax-only precheck ─────────────────────────────────────────
+    def _syntax_precheck(
+        self,
+        source_files: list,
+        compiler_cmd: str,
+        language: str,
+        include_dirs: list,
+        subprocess_env: dict = None,
+    ) -> dict:
+        """Run a quick syntax-only check on each source file individually.
+
+        Returns a dict with per-file error counts and overall stats.
+        Used for smart compiler selection (try both, pick the better one).
+        """
+        if not compiler_cmd:
+            return {'total_errors': 999, 'files': {}}
+
+        is_msvc = (self.compiler_type == 'msvc')
+        results = {}
+        total_errors = 0
+
+        for src in source_files:
+            if src.lower().endswith(('.o', '.obj', '.lib', '.a', '.res')):
+                continue
+            args = [compiler_cmd]
+            if is_msvc:
+                args += ['/Zs', '/W0', '/nologo']
+                for d in include_dirs:
+                    args.append(f'/I{d}')
+                # Add defines
+                for d in self.compile_flags:
+                    if d.startswith('/D'):
+                        args.append(d)
+            else:
+                args += ['-fsyntax-only', '-w']
+                if language == 'cpp':
+                    args += ['-std=gnu++17', '-x', 'c++']
+                else:
+                    args += ['-std=gnu11', '-x', 'c']
+                for d in include_dirs:
+                    args.append(f'-I{d}')
+                for d in self.compile_flags:
+                    if d.startswith('-D'):
+                        args.append(d)
+
+            args.append(src)
+
+            try:
+                proc = subprocess.run(
+                    args, capture_output=True, timeout=30,
+                    encoding='utf-8', errors='replace',
+                    env=subprocess_env,
+                )
+                output = (proc.stderr or '') + '\n' + (proc.stdout or '')
+                # Count error lines (not warnings)
+                err_count = sum(1 for line in output.splitlines()
+                                if ': error' in line.lower() or 'fatal error' in line.lower())
+                results[os.path.basename(src)] = err_count
+                total_errors += err_count
+            except Exception:
+                results[os.path.basename(src)] = 0  # can't check → assume OK
+
+        return {'total_errors': total_errors, 'files': results}
+
     def _build_msvc_compile_cmd(self, project, language, compiler_cmd, executable_path, optimization, output_dir):
         """Build MSVC cl.exe compilation command"""
         # MSVC cl.exe: cl /nologo /O2 /MT /EHsc /Fe:out.exe file1.c file2.cpp /I dir /link lib.lib
@@ -834,33 +1304,17 @@ class ProjectCompiler:
         for inc_dir in self.include_dirs:
             compile_cmd.append(f'/I{inc_dir}')
         
-        # Detect multiple main() definitions - each file with main() is a separate program
-        # Only keep the largest file with main() and include all non-main files
-        import re as _re_local
-        main_files = []
-        non_main_files = []
-        for src_file in project.source_files:
-            try:
-                with open(src_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                # Match main() definition (not declaration or comment)
-                if _re_local.search(r'^\s*(?:int\s+)?main\s*\(', content, _re_local.MULTILINE):
-                    main_files.append(src_file)
-                else:
-                    non_main_files.append(src_file)
-            except Exception:
-                non_main_files.append(src_file)
-        
-        if len(main_files) > 1:
-            # Multiple main() — pick the largest file as the "primary" entry point
-            main_files.sort(key=lambda f: os.path.getsize(f), reverse=True)
-            primary_main = main_files[0]
-            logger.info(f"   ⚠️  Multiple main() found in {len(main_files)} files — using {os.path.basename(primary_main)}")
-            for excluded in main_files[1:]:
-                logger.info(f"      Excluding: {os.path.basename(excluded)} (duplicate main)")
-            effective_sources = [primary_main] + non_main_files
-        else:
-            effective_sources = project.source_files
+        # Detect duplicate global symbols (main, WinMain, DllMain, or ANY function
+        # defined in multiple source files) — dynamic scan, not hardcoded to main().
+        effective_sources, excluded_info = self._detect_duplicate_global_symbols(
+            project.source_files
+        )
+        if excluded_info:
+            for exc_file, dup_names in excluded_info:
+                logger.info(
+                    "   ⚠️  Excluding %s — duplicate symbols: %s",
+                    os.path.basename(exc_file), ', '.join(dup_names[:5]),
+                )
         
         # Check if project links old OpenSSL libs that reference __iob_func (removed in VS2015+)
         # If so, inject a compatibility shim source file
@@ -1298,31 +1752,16 @@ FILE * __cdecl __iob_func(void) {
                 c_object_files = []
                 effective_source_files = list(project.source_files)
         
-        # Detect multiple main() definitions for GCC path too
-        import re as _re_local_gcc
-        gcc_main_files = []
-        gcc_non_main_files = []
-        for src_file in effective_source_files:
-            if src_file.endswith('.o') or src_file.endswith('.obj'):
-                gcc_non_main_files.append(src_file)
-                continue
-            try:
-                with open(src_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                if _re_local_gcc.search(r'^\s*(?:int\s+)?main\s*\(', content, _re_local_gcc.MULTILINE):
-                    gcc_main_files.append(src_file)
-                else:
-                    gcc_non_main_files.append(src_file)
-            except Exception:
-                gcc_non_main_files.append(src_file)
-        
-        if len(gcc_main_files) > 1:
-            gcc_main_files.sort(key=lambda f: os.path.getsize(f), reverse=True)
-            primary = gcc_main_files[0]
-            logger.info(f"   ⚠️  Multiple main() found in {len(gcc_main_files)} files — using {os.path.basename(primary)}")
-            for excluded in gcc_main_files[1:]:
-                logger.info(f"      Excluding: {os.path.basename(excluded)} (duplicate main)")
-            effective_source_files = [primary] + gcc_non_main_files
+        # Detect duplicate global symbols — dynamic scan (same as MSVC path)
+        effective_source_files, gcc_excluded = self._detect_duplicate_global_symbols(
+            effective_source_files
+        )
+        if gcc_excluded:
+            for exc_file, dup_names in gcc_excluded:
+                logger.info(
+                    "   ⚠️  Excluding %s — duplicate symbols: %s",
+                    os.path.basename(exc_file), ', '.join(dup_names[:5]),
+                )
         
         # Add source files
         compile_cmd.extend(effective_source_files)
@@ -1508,12 +1947,27 @@ FILE * __cdecl __iob_func(void) {
             CompilationResult object
         """
         result = CompilationResult()
-        
+
+        # ── Fix 4: helper to guarantee compilation_result.json on ALL paths ──
+        def _ensure_result_written(res, out_dir):
+            """Write compilation_result.json if it hasn't been written yet."""
+            rf = os.path.join(out_dir, 'compilation_result.json')
+            if not os.path.exists(rf):
+                try:
+                    rd = res.to_dict() if hasattr(res, 'to_dict') else {'success': False, 'errors': str(res)}
+                    rd.setdefault('last_error', res.errors if hasattr(res, 'errors') else '')
+                    with open(rf, 'w', encoding='utf-8') as _f:
+                        json.dump(rd, _f, indent=2)
+                except Exception:
+                    pass  # truly best-effort
+
         if not project.source_files:
             logger.error("❌ No source files to compile")
             result.errors = "No source files"
+            os.makedirs(output_dir, exist_ok=True)
+            _ensure_result_written(result, output_dir)
             return result
-        
+
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
@@ -1540,6 +1994,7 @@ FILE * __cdecl __iob_func(void) {
         if not compiler_cmd:
             logger.error(f"❌ No compiler found for {language}")
             result.errors = f"No {language} compiler found"
+            _ensure_result_written(result, output_dir)
             return result
         
         logger.info(f"\n{'='*60}")
@@ -1699,9 +2154,179 @@ FILE * __cdecl __iob_func(void) {
                 # Add header to project
                 if header_path not in project.header_files:
                     project.add_header_file(header_path)
+                try:
+                    generated_header = Path(header_path).read_text(encoding='utf-8', errors='ignore')
+                    missing_decl_includes = set()
+                    include_re = re.compile(r'#\s*include\s+"([^"]*_declarations\.h)"')
+                    for source_file in project.source_files:
+                        try:
+                            source_text = Path(source_file).read_text(encoding='utf-8', errors='ignore')
+                        except Exception:
+                            continue
+                        for include_name in include_re.findall(source_text):
+                            include_path = os.path.join(os.path.dirname(source_file), include_name)
+                            if not os.path.exists(include_path):
+                                missing_decl_includes.add(include_path)
+                    for include_path in sorted(missing_decl_includes):
+                        try:
+                            Path(include_path).write_text(generated_header, encoding='utf-8')
+                            if include_path not in project.header_files:
+                                project.add_header_file(include_path)
+                            logger.info(
+                                "   Created generated-header alias: %s",
+                                os.path.basename(include_path),
+                            )
+                        except Exception as alias_exc:
+                            logger.debug("Failed to create generated-header alias %s: %s", include_path, alias_exc)
+                except Exception as alias_scan_exc:
+                    logger.debug(f"Generated-header alias scan failed (non-fatal): {alias_scan_exc}")
             except Exception as e:
                 logger.warning(f"Failed to generate project header: {e}")
         
+        # ── Fix 2: Header conflict pre-detection ──────────────────────────
+        # Scan includes across all source/header files BEFORE building so we
+        # can inject protective defines (e.g. WIN32_LEAN_AND_MEAN for
+        # winsock2.h / windows.h ordering issues).
+        try:
+            hdr_conflicts = self._detect_header_conflicts(
+                project.source_files,
+                getattr(project, 'header_files', []),
+            )
+            if hdr_conflicts['conflicts']:
+                logger.info(f"\n🔍 Header conflict pre-detection:")
+                for conflict in hdr_conflicts['conflicts']:
+                    logger.warning(f"   ⚠️  {conflict['type']}: {conflict['remedy']}")
+                # Inject protective defines into compile flags
+                for define in hdr_conflicts['defines_to_inject']:
+                    if self.compiler_type == 'msvc':
+                        flag = f'/D{define}'
+                    else:
+                        flag = f'-D{define}'
+                    if flag not in self.compile_flags:
+                        self.compile_flags.insert(0, flag)
+                        logger.info(f"   💉 Injected {flag} to prevent header conflicts")
+                prefix_header = self._apply_header_conflict_mitigations(project, hdr_conflicts, output_dir)
+                if prefix_header:
+                    logger.info(f"   Injected prefix header: {prefix_header}")
+        except Exception as hdr_exc:
+            logger.debug(f"   Header conflict scan failed (non-fatal): {hdr_exc}")
+
+        try:
+            preprocessor_issues = self._check_preprocessor_balance(
+                project.source_files,
+                getattr(project, 'header_files', []),
+            )
+            if preprocessor_issues:
+                result.errors = "\n".join(
+                    f"{issue['file']}:{issue['line']}: {issue['message']}"
+                    for issue in preprocessor_issues[:20]
+                )
+                result.output = result.errors
+                result.warnings.append(
+                    f"preprocessor_balance_failed:{len(preprocessor_issues)}"
+                )
+                logger.error(
+                    "Preprocessor balance check failed before compile: %d issue(s)",
+                    len(preprocessor_issues),
+                )
+                _ensure_result_written(result, output_dir)
+                return result
+        except Exception as pp_exc:
+            logger.debug(f"   Preprocessor balance check failed (non-fatal): {pp_exc}")
+
+        # ── Fix 3: Smart compiler selection via syntax-only precheck ───────
+        # If in 'auto' mode and both compilers are available, run a quick
+        # syntax-only check with each compiler and pick the one with fewer
+        # errors — instead of blindly defaulting to MSVC then falling back.
+        _did_smart_switch = False
+        if (self._original_compiler == 'auto'
+            and not self._gcc_fallback_attempted
+            and not getattr(self, '_msvc_fallback_attempted', False)
+            and not self._detect_msvc_only_requirements(project)):
+            _other_type = 'gcc' if self.compiler_type == 'msvc' else 'msvc'
+            _other_available = False
+
+            if _other_type == 'gcc':
+                _other_available = bool(
+                    shutil.which('g++') or shutil.which('gcc')
+                    or shutil.which('x86_64-w64-mingw32-g++')
+                )
+            else:
+                _other_available = bool(shutil.which('cl.exe') or self._find_msvc())
+
+            if _other_available:
+                # Quick syntax check with current compiler
+                current_precheck = self._syntax_precheck(
+                    project.source_files, compiler_cmd, language,
+                    self.include_dirs,
+                    subprocess_env=self.msvc_env if self.compiler_type == 'msvc' else None,
+                )
+                current_errs = current_precheck['total_errors']
+
+                if current_errs > 0:
+                    logger.info(
+                        f"\n🔬 Smart compiler check: {self.compiler_type.upper()} "
+                        f"has {current_errs} syntax errors, checking {_other_type.upper()}..."
+                    )
+                    # Try the other compiler
+                    _saved_type = self.compiler_type
+                    _saved_env = self.msvc_env
+                    _saved_compiler = self.compiler
+                    _saved_flags = list(self.compile_flags)
+
+                    try:
+                        self.compiler = self._find_compiler(_other_type)
+                        if self.compiler_type == _other_type:
+                            if _other_type == 'msvc':
+                                self._setup_msvc_flags()
+                            else:
+                                self._setup_default_flags()
+
+                            other_cmd = (
+                                self.compiler['cpp'] if language == 'cpp'
+                                else self.compiler['c']
+                            )
+                            other_env = (
+                                self.msvc_env if self.compiler_type == 'msvc'
+                                else None
+                            )
+                            other_precheck = self._syntax_precheck(
+                                project.source_files, other_cmd, language,
+                                self.include_dirs, subprocess_env=other_env,
+                            )
+                            other_errs = other_precheck['total_errors']
+
+                            logger.info(
+                                f"   {_other_type.upper()} has {other_errs} syntax errors"
+                            )
+
+                            if other_errs < current_errs:
+                                # Switch to better compiler
+                                logger.info(
+                                    f"   ✅ Switching to {_other_type.upper()} "
+                                    f"({other_errs} < {current_errs} errors)"
+                                )
+                                compiler_cmd = other_cmd
+                                _did_smart_switch = True
+                            else:
+                                # Restore original compiler
+                                self.compiler_type = _saved_type
+                                self.msvc_env = _saved_env
+                                self.compiler = _saved_compiler
+                                self.compile_flags = _saved_flags
+                        else:
+                            # Couldn't switch, restore
+                            self.compiler_type = _saved_type
+                            self.msvc_env = _saved_env
+                            self.compiler = _saved_compiler
+                            self.compile_flags = _saved_flags
+                    except Exception as smart_exc:
+                        logger.debug(f"   Smart compiler check failed: {smart_exc}")
+                        self.compiler_type = _saved_type
+                        self.msvc_env = _saved_env
+                        self.compiler = _saved_compiler
+                        self.compile_flags = _saved_flags
+
         # Build compilation command — branch on compiler type
         if self.compiler_type == 'msvc':
             compile_cmd, subprocess_env = self._build_msvc_compile_cmd(
@@ -2695,7 +3320,7 @@ FILE * __cdecl __iob_func(void) {
                     self.compiler = self._find_compiler('msvc')
                     
                     if self.compiler_type == 'msvc':
-                        self._setup_default_flags()
+                        self._setup_msvc_flags()
                         logger.info(f"   Switched to MSVC, retrying full compilation...")
                         
                         msvc_result = self.compile_project(
@@ -2767,10 +3392,16 @@ FILE * __cdecl __iob_func(void) {
                 logger.info(f"   Attempts: {fix_summary['total_attempts']}")
                 logger.info(f"   Fixes applied: {fix_summary['total_fixes']}")
         
-        # Save result
+        # Save result — mandatory telemetry on ALL paths (Fix 4)
         result_file = os.path.join(output_dir, 'compilation_result.json')
         result_dict = result.to_dict()
-        
+        # Always include last_error for diagnostics even on success
+        if not result.success and result.errors:
+            # Truncate to last 2000 chars to keep file reasonable
+            result_dict['last_error'] = (result.errors[-2000:]
+                                         if len(result.errors) > 2000
+                                         else result.errors)
+
         if llm_fixer and fix_history:
             result_dict['auto_fix_summary'] = {
                 'type': 'mahoraga_adaptive' if hasattr(llm_fixer, 'get_session_stats') else 'llm_powered',
@@ -2786,7 +3417,20 @@ FILE * __cdecl __iob_func(void) {
         elif auto_fixer:
             result_dict['auto_fix_summary'] = auto_fixer.get_fix_summary()
             result_dict['auto_fix_summary']['type'] = 'pattern_based'
-        
+
+        # Add pipeline diagnostics
+        result_dict['pipeline_diagnostics'] = {
+            'compiler_type': self.compiler_type,
+            'smart_compiler_switch': _did_smart_switch if '_did_smart_switch' in dir() else False,
+            'header_conflicts_detected': (
+                len(hdr_conflicts['conflicts'])
+                if 'hdr_conflicts' in dir() and hdr_conflicts.get('conflicts')
+                else 0
+            ),
+            'gcc_fallback_attempted': self._gcc_fallback_attempted,
+            'msvc_fallback_attempted': getattr(self, '_msvc_fallback_attempted', False),
+        }
+
         with open(result_file, 'w', encoding='utf-8') as f:
             json.dump(result_dict, f, indent=2)
         

@@ -29,8 +29,9 @@ _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from utility_prompt_library import strategy_prompt_dict, get_strategy_prompt  # type: ignore
+from utility_prompt_library import strategy_prompt_dict, get_strategy_prompt, STRATEGY_CONFIGS  # type: ignore
 from automation.vendor_classifier import classify_source_file  # type: ignore
+from automation.mutation_policy import MutationPolicyEngine  # type: ignore
 
 # AST-based mutation validation (tree-sitter)
 try:
@@ -38,6 +39,13 @@ try:
     _mutation_validator = MutationValidator()
 except Exception:
     _mutation_validator = None  # type: ignore
+
+# Compiler-based syntax validation (Layer 3: g++ -fsyntax-only / cl.exe /Zs)
+try:
+    from automation.syntax_checker import SyntaxChecker
+    _syntax_checker = SyntaxChecker()
+except Exception:
+    _syntax_checker = None  # type: ignore
 
 from broker.topics import Topic
 from contracts.job import JobStatus
@@ -47,6 +55,7 @@ from llm.provider import LLMRequest
 from .base_agent import BaseAgent
 
 logger = structlog.get_logger(__name__)
+_mutation_policy = MutationPolicyEngine()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -120,54 +129,31 @@ class MutationAgent(BaseAgent):
 
     @staticmethod
     def _adaptive_max_tokens(func_body: str, strategy: str, language: str) -> int:
-        """Compute LLM token budget based on function size and strategy.
-
-        Larger functions need more tokens.  strat_all (stack-strings +
-        GetProcAddress boilerplate) expands code ~4x, while simpler strategies
-        expand ~2x.  We estimate output size then clamp to a safe range.
-        """
+        """Compute LLM token budget based on function size and strategy."""
         CHARS_PER_TOKEN = 3.5
-        SAFETY_FACTOR = 1.25  # headroom for LLM variation
+        SAFETY_FACTOR = 1.25
 
         if language in ("python", "javascript"):
             multiplier, lo, hi = 2.0, 2048, 8192
-        elif strategy == "strat_all":
-            multiplier, lo, hi = 4.0, 4096, 16384
-        elif strategy == "strat_2":
-            multiplier, lo, hi = 3.5, 4096, 16384
-        elif strategy == "strat_3":
-            multiplier, lo, hi = 2.5, 4096, 10240
-        elif strategy == "strat_5":
-            multiplier, lo, hi = 3.5, 4096, 16384
-        elif strategy == "strat_4":
-            multiplier, lo, hi = 3.5, 4096, 16384
-        elif strategy == "strat_6":
-            multiplier, lo, hi = 3.0, 4096, 16384
         else:
-            multiplier, lo, hi = 2.0, 2048, 10240
+            cfg = STRATEGY_CONFIGS.get(strategy)
+            if cfg:
+                multiplier, lo, hi = cfg.token_multiplier, cfg.token_lo, cfg.token_hi
+            else:
+                multiplier, lo, hi = 2.0, 2048, 10240
 
         estimated = int(len(func_body) * multiplier * SAFETY_FACTOR / CHARS_PER_TOKEN)
-        result = max(lo, min(hi, estimated))
-        return result
+        return max(lo, min(hi, estimated))
 
     @staticmethod
     def _adaptive_max_select(functions: list[dict], strategy: str) -> int:
-        """Decide how many functions the LLM should select for mutation.
-
-        Considers: strategy cost, total available functions, and average
-        complexity (line count).  Returns a sensible cap for max_select.
-        """
+        """Decide how many functions the LLM should select for mutation."""
         n = len(functions)
         if n <= 2:
             return n  # tiny project — mutate everything available
 
-        # Strategy-based base cap
-        if strategy == "strat_all":
-            strategy_cap = 5      # expensive, higher compile-failure risk
-        elif strategy == "strat_2":
-            strategy_cap = 8      # error hardening is moderate — can mutate many functions
-        else:
-            strategy_cap = 8      # string obfuscation / literal encoding is lighter
+        cfg = STRATEGY_CONFIGS.get(strategy)
+        strategy_cap = cfg.strategy_cap if cfg else 8
 
         # Don't try to mutate more than ~60% of available functions
         availability_cap = max(2, int(n * 0.6))
@@ -361,6 +347,53 @@ class MutationAgent(BaseAgent):
                  source=_enrichment_meta.get("source", "disabled"),
                  techniques=_enrichment_meta.get("techniques_found", 0))
 
+        # Dynamic mutation policy: profile every candidate from code features,
+        # then use the strategy capability model to avoid transformations that
+        # are likely to break compile or semantics for this function shape.
+        policy_profiles = _mutation_policy.profile_functions(functions, language)
+        policy_profiles_by_key = {
+            _mutation_policy.profile_key(p): p for p in policy_profiles
+        }
+        policy_kept, policy_skipped = _mutation_policy.filter_candidates(
+            functions,
+            policy_profiles,
+            effective_strategy,
+        )
+        if policy_skipped:
+            log.info(
+                "policy_skipped_high_risk_functions",
+                count=len(policy_skipped),
+                examples=policy_skipped[:8],
+                strategy=effective_strategy,
+            )
+        if policy_kept:
+            functions = policy_kept
+            policy_profiles = [
+                policy_profiles_by_key[_mutation_policy.profile_key(f)]
+                for f in functions
+                if _mutation_policy.profile_key(f) in policy_profiles_by_key
+            ]
+        else:
+            # Last resort: keep the lowest-risk candidates instead of failing
+            # the whole job.  This remains dynamic and avoids sample-specific
+            # exceptions.
+            ranked = sorted(
+                zip(functions, policy_profiles),
+                key=lambda pair: pair[1].risk_score,
+            )
+            fallback_count = max(1, min(2, len(ranked)))
+            functions = [pair[0] for pair in ranked[:fallback_count]]
+            policy_profiles = [pair[1] for pair in ranked[:fallback_count]]
+            log.warning(
+                "policy_all_candidates_high_risk_fallback_lowest_risk",
+                fallback_count=fallback_count,
+                names=[f.get("name", "?") for f in functions],
+                strategy=effective_strategy,
+            )
+        policy_profiles_by_key = {
+            _mutation_policy.profile_key(p): p for p in policy_profiles
+        }
+
         # Check for forced target functions (bypass LLM selection)
         target_functions = data.get("target_functions", [])
         if target_functions:
@@ -377,11 +410,18 @@ class MutationAgent(BaseAgent):
             # Adaptive max_select: use config value if explicitly set (>0), else compute
             config_num_functions = int(source_payload.get("num_functions", 0))
             if config_num_functions > 0:
-                max_select = config_num_functions
+                legacy_max_select = config_num_functions
             else:
-                max_select = self._adaptive_max_select(functions, effective_strategy)
+                legacy_max_select = self._adaptive_max_select(functions, effective_strategy)
+            max_select = _mutation_policy.recommend_max_select(
+                functions,
+                policy_profiles,
+                effective_strategy,
+                legacy_max_select,
+            )
             log.info("adaptive_max_select",
                      config_num_functions=config_num_functions,
+                     legacy_max_select=legacy_max_select,
                      computed_max_select=max_select,
                      total_available=len(functions),
                      strategy=effective_strategy)
@@ -425,6 +465,7 @@ class MutationAgent(BaseAgent):
                 if n != func_name
             ]
             _file_struct_bodies = self._file_context_cache["file_structs"].get(func_file, [])
+            _risk_profile = policy_profiles_by_key.get(_mutation_policy.profile_key(func))
             file_context = ""
             if _sibling_names or _file_struct_bodies:
                 parts = []
@@ -434,6 +475,12 @@ class MutationAgent(BaseAgent):
                     parts.append("Existing struct/type definitions in this file:\n" +
                                  "\n".join(_file_struct_bodies[:10]))
                 file_context = "\n".join(parts)
+            _policy_guidance = _mutation_policy.prompt_guidance(
+                _risk_profile,
+                effective_strategy,
+            )
+            if _policy_guidance:
+                file_context = (file_context + "\n" if file_context else "") + _policy_guidance
 
             # For strat_2: include project-wide void function names so LLM
             # knows which calls must NOT be wrapped in assignments/if-checks
@@ -454,6 +501,7 @@ class MutationAgent(BaseAgent):
                 retry_attempts=retry_attempts,
                 file_context=file_context,
                 strategy=effective_strategy,
+                source_file=func_file,
             )
 
             if mutated_body is not None:
@@ -465,6 +513,8 @@ class MutationAgent(BaseAgent):
                     "source_file": func.get("file", ""),
                     "start_line": func.get("start_line", 0),
                     "end_line": func.get("end_line", 0),
+                    "risk_profile": _risk_profile.to_dict() if _risk_profile else {},
+                    "policy_gates": _mutation_policy.capabilities_for(effective_strategy).gate_names(),
                 })
                 log.info("mutation_success", name=func_name)
             else:
@@ -501,7 +551,14 @@ class MutationAgent(BaseAgent):
             "source_artifact_id": source_artifact_id,
             "mutated_functions": mutated_functions,
             "selected_functions": [
-                {"name": f.get("name", ""), "file": f.get("file", "")}
+                {
+                    "name": f.get("name", ""),
+                    "file": f.get("file", ""),
+                    "risk_score": (
+                        policy_profiles_by_key[_mutation_policy.profile_key(f)].risk_score
+                        if _mutation_policy.profile_key(f) in policy_profiles_by_key else None
+                    ),
+                }
                 for f in selected
             ],
             "statistics": {
@@ -512,6 +569,14 @@ class MutationAgent(BaseAgent):
                 "total_vendor_skipped": len(skipped_vendor),
             },
             "vendor_skipped_functions": skipped_vendor,
+            "mutation_policy": {
+                "strategy_capabilities": _mutation_policy.capabilities_for(effective_strategy).__dict__,
+                "policy_gates": _mutation_policy.capabilities_for(effective_strategy).gate_names(),
+                "skipped_high_risk": policy_skipped,
+                "candidate_profiles": [
+                    p.to_dict() for p in policy_profiles
+                ],
+            },
             "web_enrichment": {
                 "applied": _enrichment_meta.get("applied", False),
                 "source": _enrichment_meta.get("source", "disabled"),
@@ -824,6 +889,7 @@ class MutationAgent(BaseAgent):
         retry_attempts: int = 5,
         file_context: str = "",
         strategy: str = "strat_1",
+        source_file: str = "",
     ) -> str | None:
         """Call LLM to mutate a single function. Returns mutated body or None."""
         if self._ctx.llm_provider is None:
@@ -922,96 +988,24 @@ class MutationAgent(BaseAgent):
                    f"If your output still uses the original variable names, you have FAILED the task.\n\n")
                 + f"Here is the code to transform:\n"
             )
+            # ── Pull role/struct rules from STRATEGY_CONFIGS (single source of truth) ──
+            _strat_cfg = STRATEGY_CONFIGS.get(strategy)
             _is_strat_all = strategy == "strat_all"
-            if _is_strat_all:
-                _role_desc = (
-                    f"You apply MAXIMUM evasion: (1) build ALL strings on the stack "
-                    f"via per-character assignment — this is the #1 most impactful change, "
-                    f"(2) resolve Win32 API calls dynamically via GetProcAddress with local function pointers, "
-                    f"(3) apply semantic substitutions (CRT→byte loops, arithmetic→bitwise), "
-                    f"(4) insert behavioral noise (benign API calls, timing jitter, environmental data), "
-                    f"(5) rename ALL local variables to bland names (_v0, _t0, _ci). "
-                    f"PRIORITY: if code gets complex, do 1+2 CORRECTLY over all 5 with bugs. "
-                    f"Use short generic variable names: _s0, _pf0, _v0, _h0."
-                )
-            elif strategy == "strat_4":
-                _role_desc = (
-                    f"You split functions into smaller helpers AND eliminate string signatures. "
-                    f"STEP 1: Identify 2-5 logical blocks and extract into static helpers (_sub_FUNCNAME_0, etc.). "
-                    f"STEP 2: Replace EVERY string literal in ALL helpers and the main function with stack-built: "
-                    f"char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0; "
-                    f"STEP 3: Rename ALL local variables to bland names (_v0, _t0, _ci). "
-                    f"SAFETY: the split function MUST produce IDENTICAL behavior to the original. "
-                    f"NEVER change the original function's signature. "
-                    f"Output ALL helper functions FIRST, then the modified original function LAST."
-                )
-            elif strategy == "strat_2":
-                _role_desc = (
-                    f"You flatten control flow and eliminate string signatures. "
-                    f"STRING ELIMINATION: Replace EVERY string literal with stack-built: "
-                    f"char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0; This is the #1 most impactful change. "
-                    f"CFG FLATTENING: convert if/else chains into while/switch state-machine dispatcher. "
-                    f"DEAD CODE: add volatile junk computations between real blocks. "
-                    f"OPAQUE PREDICATES: add always-false branches with real Win32 API calls. "
-                    f"API HAMMERING: scatter benign API calls (GetTickCount, GetSystemTime, GetComputerNameA) "
-                    f"throughout to flood sandbox behavioral logs. "
-                    f"CRITICAL: ALL original logic MUST remain functionally identical. "
-                    f"CRITICAL: Declare ALL new variables at the TOP of the function body. "
-                    f"CRITICAL: For very small functions (< 5 lines), skip CFG flattening, just add strings + dead code."
-                )
-            elif strategy == "strat_5":
-                _role_desc = (
-                    f"You eliminate ALL recognizable patterns from function bodies to defeat signature scanners. "
-                    f"PRIORITY 1 — STRING ELIMINATION: Replace EVERY string literal (char*, wchar_t*, L\"...\") "
-                    f"with per-character stack assignment: char _s0[N]; _s0[0]='k'; _s0[1]='e'; ... _s0[N-1]=0; "
-                    f"or arithmetic: _s0[0]=(char)(0x60+0x0B); This is the MOST impactful change. "
-                    f"PRIORITY 2 — CRT SUBSTITUTION: replace memcpy/strcmp/strcpy/strlen/memset/strcat/lstrlen "
-                    f"with manual byte loops. Also replace sprintf/wnsprintfA format strings with stack-built strings. "
-                    f"PRIORITY 3 — ARITHMETIC: a+1→a-(~0), a==b→!(a^b), i++→i=i-(~0)-1. "
-                    f"Apply multi-layer: after replacing CRT with loop, also obfuscate the loop arithmetic. "
-                    f"PRIORITY 4 — VARIABLE RENAMING: rename ALL local variables to _v0, _v1, _t0, _ci. "
-                    f"NEVER remove or skip ANY original code. NEVER truncate output. Output the COMPLETE function. "
-                    f"SAFETY: every substitution MUST produce identical results for ALL inputs."
-                )
-            elif strategy == "strat_6":
-                _role_desc = (
-                    f"You add anti-behavioral-analysis techniques AND eliminate string signatures. "
-                    f"STRING ELIMINATION: Replace EVERY string literal with stack-built: "
-                    f"char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0; Apply to ALL strings including newly added ones. "
-                    f"API HAMMERING: insert 5-8 real calls to benign Win32 APIs "
-                    f"(GetCurrentDirectoryA, IsProcessorFeaturePresent, GetSystemTime, GetComputerNameA, "
-                    f"GetSystemInfo, GetTempPathA, GlobalMemoryStatus, CreateMutexA) scattered throughout. "
-                    f"TIMING JITTER: add 2-3 GetTickCount()-based micro-delays. "
-                    f"ENVIRONMENTAL NOISE: use GetUserNameA/GetVersion in junk computations. "
-                    f"CRITICAL: ALL original logic MUST remain functionally identical. "
-                    f"Only ADD new statements — never change, reorder, or remove existing code."
-                )
+            if _strat_cfg:
+                _role_desc = _strat_cfg.role_desc
+                _struct_rule = _strat_cfg.struct_rule
             else:
                 _role_desc = (
-                    f"You transform function bodies to eliminate ALL string signatures: "
-                    f"replace EVERY string literal with stack-built per-character assignment "
-                    f"(char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0;) or arithmetic construction "
-                    f"(_s0[0]=(char)(0x60+0x0B)). Also insert 2-4 dead computation statements "
-                    f"(volatile DWORD _junk = GetTickCount() ^ 0xB0BA;) to change code entropy."
+                    "You transform function bodies to eliminate ALL string signatures: "
+                    "replace EVERY string literal with stack-built per-character assignment "
+                    "(char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0;) or arithmetic construction "
+                    "(_s0[0]=(char)(0x60+0x0B)). Also insert 2-4 dead computation statements "
+                    "(volatile DWORD _junk = GetTickCount() ^ 0xB0BA;) to change code entropy."
                 )
-            # strat_all needs external function declarations for GetProcAddress boilerplate
-            if _is_strat_all:
-                _struct_rule = (
-                    "You MAY define typedef and function pointer types OUTSIDE the main function for GetProcAddress. "
-                    "Use unique names with the function name suffix to avoid collisions. "
-                )
-            elif strategy == "strat_4":
-                _struct_rule = (
-                    "You MUST define static helper functions BEFORE the original function at file scope. "
-                    "Each helper is a complete `static` function with its own signature and body. "
-                    "NEVER add #include, extern, typedef, or global variable declarations. "
-                    "The original function's local variables that helpers need MUST be passed as parameters (by pointer if modified). "
-                )
-            else:
                 _struct_rule = (
                     "NEVER add #include directives, extern declarations, forward function declarations, "
                     "global variable declarations, or typedef/struct definitions — these already exist in scope. "
-                    "ALL variable declarations must be LOCAL inside the function body. "
+                    "ALL variable declarations must be LOCAL inside the function body."
                 )
             system_prompt = (f"You are a {lang_label} software protection specialist. "
                              f"{_role_desc} "
@@ -1029,20 +1023,9 @@ class MutationAgent(BaseAgent):
         else:
             user_prompt = mutation_prompt + "\nHere is the code:\n" + func_body
 
-        # For strat_2, add post-body reminder — the LLM tends to output fragments
-        # or reasoning instead of the complete function
-        if strategy == "strat_2":
-            user_prompt += (
-                "\n\nOUTPUT THE COMPLETE FUNCTION from its original signature line "
-                "to the closing }. Do NOT output only the changed parts. "
-                "Do NOT add comments. Do NOT explain.\n"
-            )
-        elif strategy == "strat_4":
-            user_prompt += (
-                "\n\nOutput ALL static helper functions FIRST, then the COMPLETE modified original function LAST. "
-                "Every helper and the original function must be complete from signature to closing brace. "
-                "Do NOT add comments. Do NOT explain.\n"
-            )
+        # Append post-body reminder defined per-strategy in STRATEGY_CONFIGS
+        if _strat_cfg and _strat_cfg.post_body_reminder and language not in ("python", "javascript"):
+            user_prompt += _strat_cfg.post_body_reminder
 
         # Disable thinking mode for qwen3 models (produces 10-18x bloated output)
         # Also add explicit code fence instructions — qwen3 ignores "no markdown"
@@ -1139,7 +1122,10 @@ class MutationAgent(BaseAgent):
 
                 # Sanitize SDK patterns (C/C++ only) — skip struct stripping for strat_2
                 if language not in ("python", "javascript"):
-                    cleaned = self._sanitize_mutation_output(cleaned, allow_structs=_is_strat_all)
+                    cleaned = self._sanitize_mutation_output(
+                        cleaned,
+                        allow_structs=(_strat_cfg.allow_structs if _strat_cfg else _is_strat_all),
+                    )
 
                 # Fix LLM renaming APIs/functions with _funcname suffix (e.g. RegOpenKeyEx_getActivationKey -> RegOpenKeyEx)
                 if language not in ("python", "javascript") and func_name:
@@ -1214,6 +1200,33 @@ class MutationAgent(BaseAgent):
                             _feedback = (
                                 f"\n\n--- PREVIOUS ATTEMPT FAILED (signature type check) ---\n{_sig_reason}\n"
                                 f"Fix ONLY this call argument construction. ALL other code must remain identical.\n"
+                            )
+                            if _feedback not in user_prompt:
+                                user_prompt = user_prompt.rstrip() + _feedback
+                        continue
+
+                # Validation gates — Layer 3: actual compiler syntax check
+                # (g++ -fsyntax-only / cl.exe /Zs) — catches void-return
+                # assignments and other type errors that regex/AST miss.
+                if (_syntax_checker and _syntax_checker.available
+                        and language not in ("python", "javascript")
+                        and source_file):
+                    _syn_passed, _syn_feedback = _syntax_checker.check(
+                        code=cleaned,
+                        language=language,
+                        source_file=source_file,
+                    )
+                    if not _syn_passed:
+                        logger.warning("mutation_syntax_check_failed",
+                                       attempt=attempt + 1,
+                                       name=func_name,
+                                       reason=_syn_feedback[:200] if _syn_feedback else "")
+                        if _syn_feedback and attempt + 1 < retry_attempts:
+                            _feedback = (
+                                f"\n\n--- PREVIOUS ATTEMPT FAILED (compiler check) ---\n"
+                                f"{_syn_feedback}\n"
+                                f"Fix ONLY the compiler errors listed above. "
+                                f"ALL other code must remain identical.\n"
                             )
                             if _feedback not in user_prompt:
                                 user_prompt = user_prompt.rstrip() + _feedback
@@ -1505,12 +1518,8 @@ class MutationAgent(BaseAgent):
                     f"ratio {ratio:.2f}). You likely TRUNCATED or REMOVED code. "
                     f"Output the COMPLETE function — do NOT skip any original logic."
                 )
-            if strategy in ("strat_all", "strat_5", "strat_4"):
-                max_ratio = 15.0
-            elif strategy in ("strat_2", "strat_6"):
-                max_ratio = 12.0
-            else:
-                max_ratio = 10.0
+            _cfg = STRATEGY_CONFIGS.get(strategy)
+            max_ratio = _cfg.max_ratio if _cfg else 10.0
             if ratio > max_ratio:
                 return (
                     f"Output is too LONG ({mut_len} chars vs original {orig_len} chars, "
@@ -1552,12 +1561,8 @@ class MutationAgent(BaseAgent):
         # Gate 1: Size ratio — strategy-aware bounds
         if orig_len > 50:
             ratio = mut_len / orig_len
-            if strategy in ("strat_all", "strat_5", "strat_4"):
-                max_ratio = 15.0
-            elif strategy in ("strat_2", "strat_6"):
-                max_ratio = 12.0
-            else:
-                max_ratio = 10.0
+            _cfg = STRATEGY_CONFIGS.get(strategy)
+            max_ratio = _cfg.max_ratio if _cfg else 10.0
             if ratio < 0.20 or ratio > max_ratio:
                 logger.warning("validation_gate1_size_ratio", name=func_name,
                                orig_len=orig_len, mut_len=mut_len, ratio=round(ratio, 2))

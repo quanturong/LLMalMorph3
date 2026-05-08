@@ -1,4 +1,188 @@
+from dataclasses import dataclass, field
 from typing import Optional
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Strategy configuration — single source of truth for all per-strategy params.
+# Add a new strategy here; mutation_agent.py reads everything from this dict.
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    """All per-strategy knobs consumed by MutationAgent."""
+    role_desc: str        # Capability description injected into the LLM system prompt
+    struct_rule: str      # Rules about helper structs / static functions allowed in output
+    token_multiplier: float  # body_chars → estimated output-token multiplier
+    token_lo: int         # min value for max_tokens
+    token_hi: int         # max value for max_tokens
+    max_ratio: float      # max allowed len(mutated) / len(original) ratio
+    strategy_cap: int     # max functions to select for mutation per job
+    allow_structs: bool = False  # permit typedef/struct blocks in mutated output
+    post_body_reminder: str = ""  # appended after func_body in user_prompt to reinforce output format
+
+
+# Shared baseline injected into role_desc for strategies that include string elimination
+_STRING_ELIMINATION_BASE = (
+    "Replace EVERY string literal with per-character stack assignment "
+    "(char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0;) or arithmetic construction "
+    "(_s0[0]=(char)(0x60+0x0B)). "
+    "Use BLAND names: _s0, _s1, _s2. AVOID XOR decode loops and enc/dec/xor/key variable names."
+)
+
+# Struct rule shared by all strategies that do NOT introduce file-scope helpers
+_NO_EXTRA_STRUCTS = (
+    "NEVER add #include directives, extern declarations, forward function declarations, "
+    "global variable declarations, or typedef/struct definitions — these already exist in scope. "
+    "ALL variable declarations must be LOCAL inside the function body."
+)
+
+STRATEGY_CONFIGS: dict[str, StrategyConfig] = {
+    "strat_1": StrategyConfig(
+        role_desc=(
+            "You transform function bodies to eliminate ALL string signatures: "
+            "replace EVERY string literal with stack-built per-character assignment "
+            "(char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0;) or arithmetic construction "
+            "(_s0[0]=(char)(0x60+0x0B)). Also insert 2-4 dead computation statements "
+            "(volatile DWORD _junk = GetTickCount() ^ 0xB0BA;) to change code entropy."
+        ),
+        struct_rule=_NO_EXTRA_STRUCTS,
+        token_multiplier=2.0,
+        token_lo=2048,
+        token_hi=10240,
+        max_ratio=10.0,
+        strategy_cap=8,
+    ),
+    "strat_2": StrategyConfig(
+        role_desc=(
+            "You flatten control flow and eliminate string signatures. "
+            "STRING ELIMINATION: " + _STRING_ELIMINATION_BASE + " This is the #1 most impactful change. "
+            "CFG FLATTENING: convert if/else chains into while/switch state-machine dispatcher. "
+            "DEAD CODE: add volatile junk computations between real blocks. "
+            "OPAQUE PREDICATES: add always-false branches with real Win32 API calls. "
+            "API HAMMERING: scatter benign API calls (GetTickCount, GetSystemTime, GetComputerNameA) "
+            "throughout to flood sandbox behavioral logs. "
+            "CRITICAL: ALL original logic MUST remain functionally identical. "
+            "CRITICAL: Declare ALL new variables at the TOP of the function body. "
+            "CRITICAL: For very small functions (< 5 lines), skip CFG flattening, just add strings + dead code."
+        ),
+        struct_rule=_NO_EXTRA_STRUCTS,
+        token_multiplier=3.5,
+        token_lo=4096,
+        token_hi=16384,
+        max_ratio=12.0,
+        strategy_cap=8,
+        post_body_reminder=(
+            "\n\nOUTPUT THE COMPLETE FUNCTION from its original signature line "
+            "to the closing }. Do NOT output only the changed parts. "
+            "Do NOT add comments. Do NOT explain.\n"
+        ),
+    ),
+    "strat_3": StrategyConfig(
+        role_desc=(
+            "You resolve Win32 API calls dynamically via GetProcAddress with local function pointers, "
+            "AND eliminate ALL string signatures. "
+            "STRING ELIMINATION: " + _STRING_ELIMINATION_BASE + " "
+            "Build DLL and API name strings on the stack using the same technique. "
+            "Each function pointer MUST match the EXACT signature of the real API. "
+            "Load each DLL ONCE and reuse the handle for all its exports."
+        ),
+        struct_rule=_NO_EXTRA_STRUCTS,
+        token_multiplier=2.5,
+        token_lo=4096,
+        token_hi=10240,
+        max_ratio=10.0,
+        strategy_cap=8,
+    ),
+    "strat_4": StrategyConfig(
+        role_desc=(
+            "You split functions into smaller helpers AND eliminate string signatures. "
+            "STEP 1: Identify 2-5 logical blocks and extract into static helpers (_sub_FUNCNAME_0, etc.). "
+            "STEP 2: Replace EVERY string literal in ALL helpers and the main function with stack-built: "
+            "char _s0[N]; _s0[0]='k'; ... _s0[N-1]=0; "
+            "STEP 3: Rename ALL local variables to bland names (_v0, _t0, _ci). "
+            "SAFETY: the split function MUST produce IDENTICAL behavior to the original. "
+            "NEVER change the original function's signature. "
+            "Output ALL helper functions FIRST, then the modified original function LAST."
+        ),
+        struct_rule=(
+            "You MUST define static helper functions BEFORE the original function at file scope. "
+            "Each helper is a complete `static` function with its own signature and body. "
+            "NEVER add #include, extern, typedef, or global variable declarations. "
+            "The original function's local variables that helpers need MUST be passed as parameters "
+            "(by pointer if modified)."
+        ),
+        token_multiplier=3.5,
+        token_lo=4096,
+        token_hi=16384,
+        max_ratio=10.0,
+        strategy_cap=8,
+        post_body_reminder=(
+            "\n\nOutput ALL static helper functions FIRST, then the COMPLETE modified original function LAST. "
+            "Every helper and the original function must be complete from signature to closing brace. "
+            "Do NOT add comments. Do NOT explain.\n"
+        ),
+    ),
+    "strat_5": StrategyConfig(
+        role_desc=(
+            "You eliminate ALL recognizable patterns from function bodies to defeat signature scanners. "
+            "PRIORITY 1 — STRING ELIMINATION: " + _STRING_ELIMINATION_BASE + " "
+            "PRIORITY 2 — CRT SUBSTITUTION: replace memcpy/strcmp/strcpy/strlen/memset/strcat/lstrlen "
+            "with manual byte loops. Also replace sprintf/wnsprintfA format strings with stack-built strings. "
+            "PRIORITY 3 — ARITHMETIC: a+1→a-(~0), a==b→!(a^b), i++→i=i-(~0)-1. "
+            "Apply multi-layer: after replacing CRT with a loop, also obfuscate the loop arithmetic. "
+            "PRIORITY 4 — VARIABLE RENAMING: rename ALL local variables to _v0, _v1, _t0, _ci. "
+            "NEVER remove or skip ANY original code. NEVER truncate output. Output the COMPLETE function. "
+            "SAFETY: every substitution MUST produce identical results for ALL inputs."
+        ),
+        struct_rule=_NO_EXTRA_STRUCTS,
+        token_multiplier=3.5,
+        token_lo=4096,
+        token_hi=16384,
+        max_ratio=12.0,
+        strategy_cap=8,
+    ),
+    "strat_6": StrategyConfig(
+        role_desc=(
+            "You add anti-behavioral-analysis techniques AND eliminate string signatures. "
+            "STRING ELIMINATION: " + _STRING_ELIMINATION_BASE + " Apply to ALL strings including newly added ones. "
+            "API HAMMERING: insert 5-8 real calls to benign Win32 APIs "
+            "(GetCurrentDirectoryA, IsProcessorFeaturePresent, GetSystemTime, GetComputerNameA, "
+            "GetSystemInfo, GetTempPathA, GlobalMemoryStatus, CreateMutexA) scattered throughout. "
+            "TIMING JITTER: add 2-3 GetTickCount()-based micro-delays. "
+            "ENVIRONMENTAL NOISE: use GetUserNameA/GetVersion in junk computations. "
+            "CRITICAL: ALL original logic MUST remain functionally identical. "
+            "Only ADD new statements — never change, reorder, or remove existing code."
+        ),
+        struct_rule=_NO_EXTRA_STRUCTS,
+        token_multiplier=3.0,
+        token_lo=4096,
+        token_hi=16384,
+        max_ratio=12.0,
+        strategy_cap=8,
+    ),
+    "strat_all": StrategyConfig(
+        role_desc=(
+            "You apply MAXIMUM evasion: (1) build ALL strings on the stack "
+            "via per-character assignment — this is the #1 most impactful change, "
+            "(2) resolve Win32 API calls dynamically via GetProcAddress with local function pointers, "
+            "(3) apply semantic substitutions (CRT→byte loops, arithmetic→bitwise), "
+            "(4) insert behavioral noise (benign API calls, timing jitter, environmental data), "
+            "(5) rename ALL local variables to bland names (_v0, _t0, _ci). "
+            "PRIORITY: if code gets complex, do 1+2 CORRECTLY over all 5 with bugs. "
+            "Use short generic variable names: _s0, _pf0, _v0, _h0."
+        ),
+        struct_rule=(
+            "You MAY define typedef and function pointer types OUTSIDE the main function for GetProcAddress. "
+            "Use unique names with the function name suffix to avoid collisions."
+        ),
+        token_multiplier=4.0,
+        token_lo=4096,
+        token_hi=16384,
+        max_ratio=15.0,
+        strategy_cap=5,
+        allow_structs=True,
+    ),
+}
 
 
 def _get_language_specific_prohibitions(language: str, compiler_type: str = 'msvc') -> str:
@@ -742,6 +926,16 @@ _strategy_prompt_base = {
         "- For functions with goto: keep goto as-is, add dead code around it but do NOT flatten goto-based flow.\n"
         "- Aim for 50-100%% code size increase from all three techniques combined.\n"
         "- Output the COMPLETE function from signature to closing brace. Output ONLY code.\n"
+        "CRITICAL — API HAMMERING VOID RETURN BUG (causes compile failure):\n"
+        "GetSystemTimeAsFileTime, GetSystemTime, GetLocalTime, GetSystemInfo, GetNativeSystemInfo,\n"
+        "GlobalMemoryStatus, Sleep, OutputDebugStringA/W, ExitProcess ALL return VOID.\n"
+        "NEVER assign their return value: `_junk = GetSystemTime(NULL);` IS A COMPILE ERROR.\n"
+        "ALWAYS call them via an output pointer and read from the struct field:\n"
+        "  CORRECT: `SYSTEMTIME _st; GetSystemTime(&_st); volatile DWORD _h = _st.wMilliseconds;`\n"
+        "  CORRECT: `SYSTEM_INFO _si; GetSystemInfo(&_si); volatile DWORD _h = _si.dwPageSize;`\n"
+        "  CORRECT: `FILETIME _ft; GetSystemTimeAsFileTime(&_ft);`\n"
+        "  WRONG:   `_junk = GetSystemTime(NULL);`  ← VOID RETURN, WILL NOT COMPILE\n"
+        "  WRONG:   `_junk = GetSystemInfo(NULL);`  ← VOID RETURN, WILL NOT COMPILE\n"
     ),
     # Strategy 2: Dynamic Import and API Resolution
     # Goal: Remove all static import references and visible module/API/DLL names from the binary
@@ -976,6 +1170,14 @@ _strategy_prompt_base = {
         "- NEVER change, reorder, or remove ANY original code — only ADD new statements.\n"
         "- Aim for 80-150%% code size increase from all four techniques combined.\n"
         "- Output the COMPLETE function from signature to closing brace. Output ONLY code.\n"
+        "CRITICAL — API HAMMERING VOID RETURN BUG (causes compile failure):\n"
+        "GetSystemTimeAsFileTime, GetSystemTime, GetLocalTime, GetSystemInfo, GetNativeSystemInfo,\n"
+        "GlobalMemoryStatus, Sleep, OutputDebugStringA/W ALL return VOID.\n"
+        "NEVER assign their return value: `_h = GetSystemTime(NULL);` IS A COMPILE ERROR.\n"
+        "ALWAYS call them via output pointer and read from the struct field:\n"
+        "  CORRECT: `SYSTEMTIME _st; GetSystemTime(&_st); volatile DWORD _h = _st.wMilliseconds;`\n"
+        "  CORRECT: `SYSTEM_INFO _si; GetSystemInfo(&_si); volatile DWORD _h = _si.dwPageSize;`\n"
+        "  WRONG:   `_h = GetSystemTime(NULL);`  ← VOID RETURN, WILL NOT COMPILE\n"
     ),
     # Combined: Maximum Evasion (strat_1 + strat_3 + strat_5 combined)
     "strat_all": (
@@ -1038,6 +1240,11 @@ _strategy_prompt_base = {
         "- NEVER rename the function itself or any existing project helper functions.\n"
         "- PRIORITY ORDER: If code gets too complex, apply Priority 1+2 CORRECTLY first.\n"
         "  A correct Priority 1+2 is worth more than a buggy 1+2+3+4+5.\n"
+        "CRITICAL — API HAMMERING VOID RETURN BUG (causes compile failure):\n"
+        "GetSystemTimeAsFileTime, GetSystemTime, GetLocalTime, GetSystemInfo, GetNativeSystemInfo,\n"
+        "GlobalMemoryStatus, Sleep, OutputDebugStringA/W ALL return VOID.\n"
+        "NEVER write: `_h2 = GetSystemTime(&_st);` or `_h = GetSystemInfo(NULL);`\n"
+        "CORRECT:     `SYSTEMTIME _st; GetSystemTime(&_st); volatile DWORD _h2 = _st.wMilliseconds;`\n"
     ),
 }
 

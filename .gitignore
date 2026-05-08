@@ -125,6 +125,25 @@ llmalmorph.ipynb
 temp/
 tmp/
 *.tmp
+_tmp_*/
+_tmp_*.py
+_tmp_*.bat
+
+# Root-level experiment/scratch scripts
+_build_*.bat
+_check_*.py
+_scan_*.py
+_tmp_*.py
+_tmp_*.bat
+_fix_*.py
+_vt_submit_*.py
+
+# Large data/log files
+fix_history_global.json
+
+# MSVC/LLM cache files
+src/automation/_win32_type_cache.json
+src/automation/msvc_doc_cache.json
 
 # Claude / AI assistant workspace files
 .claude/
