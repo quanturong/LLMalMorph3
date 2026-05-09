@@ -218,7 +218,12 @@ class MutationPolicyEngine:
             cleanup_calls=len(cls._CLEANUP_RE.findall(body)),
             has_naked=bool(cls._NAKED_RE.search(body)),
             has_inline_asm=bool(cls._INLINE_ASM_RE.search(body)),
-            has_labels=bool(re.search(r'^\s*[A-Za-z_]\w*\s*:\s*$', body, re.MULTILINE)),
+            has_labels=bool(re.search(
+                r'^\s*(?!case\b|default\b|public\b|private\b|protected\b)'
+                r'[A-Za-z_]\w*\s*:\s*(?:$|//|/\*)',
+                body,
+                re.MULTILINE,
+            )),
             has_wide_narrow_mix=wide_literals > 0 and narrow_literals > 0,
             has_pe_header_usage=bool(cls._PE_HEADER_RE.search(body)),
             has_seh=bool(cls._SEH_RE.search(body)),

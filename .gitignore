@@ -96,6 +96,7 @@ batch_*_results/
 storage/
 fix_history_global.json
 compile_test_50_v*_results.json
+src/automation/_win32_header_index_cache.json
 
 # Build artifacts
 *.obj

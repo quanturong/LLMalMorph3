@@ -461,7 +461,7 @@ class CoordinatorAgent(BaseAgent):
                 mutation_strategy=strategy,
                 requested_strategies=state.requested_strategies,
                 strategy_mode=state.strategy_mode,
-                num_functions=3,
+                num_functions=state.num_functions,
                 target_functions=state.target_functions,
                 retry_attempts=state.llm_retry_attempts,
                 retry_count=state.mutation_cycle_count,

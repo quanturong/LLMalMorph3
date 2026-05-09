@@ -24,6 +24,88 @@ class Declaration:
 
 class HeaderGenerator:
     """Generate and update header files with missing declarations"""
+
+    _CONTROL_KEYWORDS = {
+        "if", "for", "while", "switch", "else", "do", "return", "sizeof",
+        "For", "iFor", "jFor",
+    }
+
+    @staticmethod
+    def _extract_function_signatures(content: str) -> List[Tuple[str, str]]:
+        """Extract exact top-level function definition signatures."""
+        signatures: List[Tuple[str, str]] = []
+        lines = content.splitlines()
+        i = 0
+        brace_depth = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            current_depth = brace_depth
+            brace_depth += line.count('{') - line.count('}')
+
+            if current_depth != 0:
+                i += 1
+                continue
+            if (
+                not stripped
+                or stripped.startswith('#')
+                or stripped.startswith('//')
+                or stripped.startswith('/*')
+                or stripped.endswith(';')
+            ):
+                i += 1
+                continue
+
+            if '(' not in stripped:
+                i += 1
+                continue
+
+            sig_lines = [line.strip()]
+            j = i
+            while '{' not in sig_lines[-1] and j + 1 < len(lines):
+                j += 1
+                next_line = lines[j].strip()
+                sig_lines.append(next_line)
+                if next_line.endswith(';'):
+                    break
+
+            joined = ' '.join(part for part in sig_lines if part).strip()
+            if '{' not in joined or ';' in joined.split('{', 1)[0]:
+                i += 1
+                continue
+
+            signature = joined.split('{', 1)[0].strip()
+            if not signature:
+                i += 1
+                continue
+
+            name_match = re.search(r'\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*$', signature)
+            if not name_match:
+                i += 1
+                continue
+
+            func_name = name_match.group(1)
+            if func_name in HeaderGenerator._CONTROL_KEYWORDS:
+                i += 1
+                continue
+            prefix = signature[:name_match.start(1)].strip()
+            if not prefix or prefix.endswith(('=', ',', '(', '!', '&&', '||')):
+                i += 1
+                continue
+            if func_name not in ['main', 'WinMain', 'wWinMain', 'DllMain', '_DllMain', '_start']:
+                signatures.append((func_name, signature + ';'))
+
+            body_depth = 0
+            k = j
+            while k < len(lines):
+                body_depth += lines[k].count('{') - lines[k].count('}')
+                if body_depth <= 0 and '{' in lines[j]:
+                    break
+                k += 1
+            i = max(i + 1, k + 1)
+            brace_depth = 0
+
+        return signatures
     
     @classmethod
     def generate_project_header(
@@ -76,12 +158,6 @@ class HeaderGenerator:
         declarations = []
         seen_names = set()
         
-        # Patterns for extracting declarations
-        func_pattern = re.compile(
-            r'^\s*(?!static)([A-Za-z_][\w\s\*]+?)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{',
-            re.MULTILINE
-        )
-        
         struct_pattern = re.compile(
             r'^\s*typedef\s+struct\s+([A-Za-z_]\w*)?\s*\{[^}]+\}\s*([A-Za-z_]\w*)\s*;',
             re.MULTILINE | re.DOTALL
@@ -97,18 +173,9 @@ class HeaderGenerator:
                 with open(source_file, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
                 
-                # Extract function definitions (non-static)
-                for match in func_pattern.finditer(content):
-                    return_type = match.group(1).strip()
-                    func_name = match.group(2).strip()
-                    params = match.group(3).strip()
-                    
-                    # Skip main/WinMain
-                    if func_name in ['main', 'WinMain', 'wWinMain', '_start']:
-                        continue
-                    
+                # Extract function definitions using exact source signatures.
+                for func_name, declaration_str in cls._extract_function_signatures(content):
                     if func_name not in seen_names:
-                        declaration_str = f"{return_type} {func_name}({params});"
                         declarations.append(Declaration(
                             kind='function',
                             name=func_name,
@@ -177,6 +244,8 @@ class HeaderGenerator:
         lines.append("#include <windows.h>")
         lines.append("#include <stdio.h>")
         lines.append("#include <stdlib.h>")
+        if any(re.search(r'\bbool\b', decl.declaration) for decl in declarations):
+            lines.append("#include <stdbool.h>")
         lines.append("")
         
         # Group declarations by kind

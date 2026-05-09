@@ -134,7 +134,7 @@ class VariantGenerationAgent(BaseAgent):
                 modified_code = self._ensure_includes_preserved(original_code, modified_code)
                 if language in ("c", "cpp", "c++"):
                     modified_code = self._deduplicate_c_helpers(modified_code)
-                    modified_code = self._reorder_functions(modified_code)
+                    modified_code = self._reorder_functions(modified_code, log=log, source_file=sf)
             else:
                 modified_code = original_code
 
@@ -392,7 +392,7 @@ class VariantGenerationAgent(BaseAgent):
         return '\n'.join(result)
 
     @staticmethod
-    def _reorder_functions(code: str) -> str:
+    def _reorder_functions(code: str, log=None, source_file: str = "") -> str:
         """Shuffle the order of top-level function definitions in C/C++ source.
 
         Keeps #include / #define / typedef / struct / global-variable blocks in
@@ -404,6 +404,26 @@ class VariantGenerationAgent(BaseAgent):
         Entry-point functions (main, WinMain, DllMain, wmain, _tmain,
         wWinMain, WinMainCRTStartup) are always placed LAST.
         """
+        enabled = os.getenv("ENABLE_VARIANT_FUNCTION_REORDERING", "0").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            return code
+
+        # This regex-based rewriter is intentionally conservative.  Old malware
+        # sources often interleave preprocessor conditionals, labels, inline asm,
+        # and entry-point-specific parameter scopes; moving functions in those
+        # files can create dangling else/goto blocks or invalid forward decls.
+        complex_patterns = [
+            r'^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b',
+            r'\b(__asm|asm\s*\(|__declspec\s*\(\s*naked\s*\))\b',
+            r'^\s*[A-Za-z_]\w*\s*:\s*$',
+            r'\bgoto\s+[A-Za-z_]\w*\s*;',
+            r'\b(__try|__except|__finally)\b',
+        ]
+        if any(re.search(pattern, code, re.MULTILINE) for pattern in complex_patterns):
+            if log:
+                log.info("function_reorder_skipped_complex_file", file=source_file)
+            return code
+
         # Split code into "preamble" (includes, globals, typedefs, structs)
         # and "function blocks"
         lines = code.split('\n')
@@ -534,4 +554,19 @@ class VariantGenerationAgent(BaseAgent):
         for _, func_lines in entry_funcs:
             result_parts.append('\n'.join(func_lines))
 
-        return '\n'.join(result_parts)
+        reordered = '\n'.join(result_parts)
+
+        # Structural sanity guard: if the transform changes basic balance, keep
+        # the original source. This protects projects where the simple parser
+        # misclassified a block as a function.
+        if (
+            reordered.count('{') != code.count('{')
+            or reordered.count('}') != code.count('}')
+            or len(re.findall(r'^\s*#\s*endif\b', reordered, re.MULTILINE))
+            != len(re.findall(r'^\s*#\s*endif\b', code, re.MULTILINE))
+        ):
+            if log:
+                log.warning("function_reorder_rejected_unbalanced", file=source_file)
+            return code
+
+        return reordered

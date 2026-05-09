@@ -1034,17 +1034,60 @@ class ProjectCompiler:
         open_re = re.compile(r'^\s*#\s*(if|ifdef|ifndef)\b')
         close_re = re.compile(r'^\s*#\s*endif\b')
 
+        def _strip_comments(line: str, in_block_comment: bool) -> tuple[str, bool]:
+            """Remove C/C++ comments while preserving real preprocessor lines."""
+            out = []
+            i = 0
+            while i < len(line):
+                if in_block_comment:
+                    end = line.find('*/', i)
+                    if end == -1:
+                        return ''.join(out), True
+                    i = end + 2
+                    in_block_comment = False
+                    continue
+
+                line_comment = line.find('//', i)
+                block_comment = line.find('/*', i)
+
+                if line_comment == -1 and block_comment == -1:
+                    out.append(line[i:])
+                    break
+                if line_comment != -1 and (block_comment == -1 or line_comment < block_comment):
+                    out.append(line[i:line_comment])
+                    break
+
+                out.append(line[i:block_comment])
+                i = block_comment + 2
+                in_block_comment = True
+
+            return ''.join(out), in_block_comment
+
         for path in list(source_files or []) + list(header_files or []):
             try:
-                lines = Path(path).read_text(encoding='utf-8', errors='ignore').splitlines()
+                text = Path(path).read_text(encoding='utf-8', errors='ignore')
+                lines = text.splitlines()
             except Exception:
                 continue
 
+            # Legacy malware sources sometimes contain intentionally unclosed or
+            # compiler-tolerated block comments around disabled code. The
+            # preprocessor still sees real #endif lines in cases our lightweight
+            # comment stripper can misclassify. If the raw directive counts are
+            # balanced, do not fail the build at this pre-validation layer; the
+            # compiler remains the source of truth.
+            raw_opens = len(open_re.findall(text))
+            raw_closes = len(close_re.findall(text))
+            if raw_opens == raw_closes:
+                continue
+
             stack = []
+            in_block_comment = False
             for idx, line in enumerate(lines, 1):
-                if open_re.search(line):
+                code_line, in_block_comment = _strip_comments(line, in_block_comment)
+                if open_re.search(code_line):
                     stack.append(idx)
-                elif close_re.search(line):
+                elif close_re.search(code_line):
                     if stack:
                         stack.pop()
                     else:
@@ -1912,7 +1955,7 @@ FILE * __cdecl __iob_func(void) {
         permissive_mode: bool = True,
         parse_result = None,  # Optional parse result for enhanced context
         pre_validate: bool = True,  # Run validation before compilation
-        auto_generate_headers: bool = True,  # Auto-generate missing headers
+        auto_generate_headers: bool = False,  # Opt-in: generated headers can conflict with legacy local typedefs
         use_enhanced_categorization: bool = True,  # Use enhanced error categorization
         use_project_context: bool = True,  # Collect project-wide context for LLM
         use_hybrid_llm: bool = False,  # Enable hybrid mode (Ollama + Mistral)
@@ -2475,7 +2518,8 @@ FILE * __cdecl __iob_func(void) {
                     compile_cmd,
                     capture_output=True,
                     timeout=300,  # 5 minutes timeout
-                    env=subprocess_env  # MSVC env or None for GCC
+                    env=subprocess_env,  # MSVC env or None for GCC
+                    cwd=output_dir,
                 )
                 
                 result.compile_time = time.time() - start_time
@@ -2594,7 +2638,8 @@ FILE * __cdecl __iob_func(void) {
                             permissive_cmd,
                             capture_output=True,
                             timeout=300,
-                            env=subprocess_env
+                            env=subprocess_env,
+                            cwd=output_dir,
                         )
                         
                         if permissive_process.returncode == 0 and os.path.exists(executable_path):

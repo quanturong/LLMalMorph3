@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import structlog
 
@@ -69,6 +69,31 @@ class ReportingAgent(BaseAgent):
         super().__init__(ctx)
         self._pending_report_events: dict = {}
         self._vt = vt_adapter
+
+    async def _update_pending_report_json(self, job_id: str, updates: dict[str, Any]) -> None:
+        """Best-effort append of late report fields, such as VT status/metrics."""
+        pending_evt = self._pending_report_events.get(job_id)
+        if not pending_evt or not getattr(pending_evt, "report_path", None):
+            return
+
+        rpath = pending_evt.report_path
+
+        def _update_report() -> None:
+            import os as _os
+
+            if not _os.path.exists(rpath):
+                return
+            with open(rpath, "r", encoding="utf-8") as f:
+                report_data = json.load(f)
+            report_data.update(updates)
+            with open(rpath, "w", encoding="utf-8") as f:
+                json.dump(report_data, f, indent=2, ensure_ascii=False)
+
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _update_report)
+        except Exception:
+            # Report mutation is non-critical; the state/artifact logs still carry the event.
+            return
 
     async def handle_event(self, data: dict, claimed_state) -> None:
         """Handle decision events — generate report for continue_to_report, close otherwise."""
@@ -373,6 +398,14 @@ class ReportingAgent(BaseAgent):
         original_art_id = state.original_compiled_artifact_id
         if not variant_art_id or not original_art_id:
             log.info("vt_skip_no_binaries")
+            await self._update_pending_report_json(job_id, {
+                "vt_status": {
+                    "status": "skipped",
+                    "reason": "missing_original_or_variant_binary",
+                    "variant_artifact_id": variant_art_id,
+                    "original_artifact_id": original_art_id,
+                }
+            })
             return
 
         # Resolve file paths
@@ -389,6 +422,14 @@ class ReportingAgent(BaseAgent):
         if not variant_path or not original_path:
             log.warning("vt_skip_paths_not_resolved",
                         variant_art_id=variant_art_id, original_art_id=original_art_id)
+            await self._update_pending_report_json(job_id, {
+                "vt_status": {
+                    "status": "skipped",
+                    "reason": "binary_paths_not_resolved",
+                    "variant_artifact_id": variant_art_id,
+                    "original_artifact_id": original_art_id,
+                }
+            })
             return
 
         log.info("vt_submitting", variant=str(variant_path), original=str(original_path))
@@ -424,24 +465,57 @@ class ReportingAgent(BaseAgent):
                         break
                     await asyncio.sleep(15)
 
-            # Fetch results by hash
-            async def _fetch_by_hash(sha):
+            # Fetch results by hash. VT may accept a submission before the file
+            # report is fully materialized, and network/proxy timeouts happen
+            # often enough that a single GET makes CLOSED reports misleading.
+            async def _fetch_by_hash(sha, *, attempts: int = 8, delay_s: int = 15):
                 import requests as _req
                 headers = {"x-apikey": self._vt._client.api_token}
                 url = f"{self._vt._client.api_url}/api/v3/files/{sha}"
-                resp = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: _req.get(url, headers=headers, timeout=30))
-                if resp.status_code == 200:
-                    return resp.json().get("data", {}).get("attributes", {})
-                return None
+                last_error = None
+                for attempt in range(attempts):
+                    try:
+                        resp = await asyncio.get_event_loop().run_in_executor(
+                            None, lambda: _req.get(url, headers=headers, timeout=(20, 60)))
+                        if resp.status_code == 200:
+                            attrs = resp.json().get("data", {}).get("attributes", {})
+                            return attrs, None
+                        last_error = {
+                            "status_code": resp.status_code,
+                            "body": resp.text[:300],
+                            "attempt": attempt + 1,
+                        }
+                        if resp.status_code not in (404, 429, 500, 502, 503, 504):
+                            break
+                    except Exception as exc:
+                        last_error = {
+                            "exception": type(exc).__name__,
+                            "message": str(exc)[:300],
+                            "attempt": attempt + 1,
+                        }
+                    if attempt + 1 < attempts:
+                        await asyncio.sleep(delay_s)
+                return None, last_error
 
-            var_attrs = await _fetch_by_hash(variant_sha)
+            var_attrs, var_error = await _fetch_by_hash(variant_sha, attempts=6)
             await asyncio.sleep(1)
-            orig_attrs = await _fetch_by_hash(original_sha)
+            orig_attrs, orig_error = await _fetch_by_hash(original_sha, attempts=10)
 
             if not var_attrs or not orig_attrs:
                 log.warning("vt_results_incomplete",
                             var_found=bool(var_attrs), orig_found=bool(orig_attrs))
+                await self._update_pending_report_json(job_id, {
+                    "vt_status": {
+                        "status": "incomplete",
+                        "reason": "hash_report_not_available",
+                        "variant_sha256": variant_sha,
+                        "original_sha256": original_sha,
+                        "variant_found": bool(var_attrs),
+                        "original_found": bool(orig_attrs),
+                        "variant_error": var_error,
+                        "original_error": orig_error,
+                    }
+                })
                 return
 
             # Parse stats
@@ -451,6 +525,25 @@ class ReportingAgent(BaseAgent):
             var_mal = var_stats.get("malicious", 0)
             orig_total = sum(orig_stats.values())
             var_total = sum(var_stats.values())
+
+            if orig_total <= 0 or var_total <= 0:
+                log.warning("vt_results_incomplete",
+                            reason="missing_engine_stats",
+                            original_total=orig_total,
+                            variant_total=var_total)
+                await self._update_pending_report_json(job_id, {
+                    "vt_status": {
+                        "status": "incomplete",
+                        "reason": "missing_engine_stats",
+                        "variant_sha256": variant_sha,
+                        "original_sha256": original_sha,
+                        "original_stats": orig_stats,
+                        "variant_stats": var_stats,
+                        "original_total_engines": orig_total,
+                        "variant_total_engines": var_total,
+                    }
+                })
+                return
 
             # Engine-level diff
             orig_engines = orig_attrs.get("last_analysis_results", {})
@@ -510,21 +603,10 @@ class ReportingAgent(BaseAgent):
             await self._ctx.state_store.save(state)
 
             # Update report file with VT data
-            pending_evt = self._pending_report_events.get(job_id)
-            if pending_evt and hasattr(pending_evt, "report_path") and pending_evt.report_path:
-                try:
-                    rpath = pending_evt.report_path
-                    def _update_report():
-                        import os as _os
-                        if _os.path.exists(rpath):
-                            with open(rpath, "r") as f:
-                                rd = json.load(f)
-                            rd["vt_comparison"] = vt_comparison
-                            with open(rpath, "w") as f:
-                                json.dump(rd, f, indent=2)
-                    await asyncio.get_event_loop().run_in_executor(None, _update_report)
-                except Exception:
-                    pass  # non-critical
+            await self._update_pending_report_json(job_id, {
+                "vt_comparison": vt_comparison,
+                "vt_status": {"status": "complete"},
+            })
 
             log.info("vt_complete",
                      original=f"{orig_mal}/{orig_total}",
@@ -536,6 +618,13 @@ class ReportingAgent(BaseAgent):
 
         except Exception as exc:
             log.warning("vt_submission_failed", error=str(exc))
+            await self._update_pending_report_json(job_id, {
+                "vt_status": {
+                    "status": "failed",
+                    "reason": "exception",
+                    "error": str(exc)[:500],
+                }
+            })
 
     async def _generate_exec_summary(self, tech_report: TechnicalReport) -> Optional[ExecutiveSummary]:
         try:

@@ -421,6 +421,10 @@ async def run_production(config_path: Path, dry_run: bool = False) -> int:
     status_interval_s = int(cfg["runtime"]["status_interval_s"])
     last_status_t = 0.0
 
+    all_terminal = False
+    timed_out = False
+    last_snapshots: list[tuple[str, str]] = []
+
     while time.time() - start < max_wait_s:
         snapshots = []
         all_terminal = True
@@ -429,6 +433,7 @@ async def run_production(config_path: Path, dry_run: bool = False) -> int:
             status = state.current_status.value if state else "NONE"
             snapshots.append((sample_id, status))
             all_terminal = all_terminal and bool(state and state.current_status.is_terminal())
+        last_snapshots = snapshots
 
         now = time.time()
         if now - last_status_t >= status_interval_s:
@@ -439,6 +444,15 @@ async def run_production(config_path: Path, dry_run: bool = False) -> int:
             print("TERMINAL", int(time.time() - start))
             break
         await asyncio.sleep(2)
+    else:
+        timed_out = True
+        non_terminal = [
+            (sample_id, status)
+            for sample_id, status in last_snapshots
+            if status not in {"CLOSED", "FAILED", "ESCALATED"}
+        ]
+        print("TIMEOUT", int(time.time() - start), "max_wait_s", max_wait_s)
+        print("NON_TERMINAL", non_terminal)
 
     final_states: dict[str, str] = {}
     for sample_id, env in envelopes:
@@ -486,7 +500,10 @@ async def run_production(config_path: Path, dry_run: bool = False) -> int:
     if redis_client is not None:
         await redis_client.aclose()
 
-    print("DONE", final_states)
+    if timed_out:
+        print("DONE_TIMEOUT", final_states)
+    else:
+        print("DONE", final_states)
     return 0 if all(v == "CLOSED" for v in final_states.values()) else 1
 
 

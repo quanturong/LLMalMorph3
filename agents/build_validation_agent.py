@@ -296,6 +296,7 @@ class BuildValidationAgent(BaseAgent):
                         project=project_obj,
                         output_dir=output_dir,
                         output_name=output_name,
+                        auto_generate_headers=False,
                     ),
                 )
                 compilation_time_s = loop.time() - t0
@@ -304,6 +305,14 @@ class BuildValidationAgent(BaseAgent):
             else:
                 # Enhanced compilation with advanced retry logic (C/C++)
                 t0 = loop.time()
+                source_count = len(getattr(project_obj, "source_files", []) or [])
+                effective_build_timeout_s = max(
+                    _BUILD_VALIDATION_TIMEOUT_S,
+                    min(
+                        _int_env("BUILD_VALIDATION_MAX_TIMEOUT_S", 7200),
+                        source_count * _int_env("BUILD_VALIDATION_TIMEOUT_PER_FILE_S", 60),
+                    ),
+                )
                 try:
                     compile_result, fix_stats = await loop.run_in_executor(
                         None,
@@ -315,18 +324,19 @@ class BuildValidationAgent(BaseAgent):
                             job_id=job_id,
                             sample_id=sample_id,
                             fixer_model=self._fixer_model,
-                            timeout_s=_BUILD_VALIDATION_TIMEOUT_S,
+                            timeout_s=effective_build_timeout_s,
                             mutation_data=mutation_data,
                             original_source_path=original_source_path,
                         ),
                     )
                 except TimeoutError:
                     error_msg = (
-                        f"Build validation timed out after {_BUILD_VALIDATION_TIMEOUT_S}s"
+                        f"Build validation timed out after {effective_build_timeout_s}s"
                     )
                     log.warning(
                         "build_validation_timeout",
-                        timeout_s=_BUILD_VALIDATION_TIMEOUT_S,
+                        timeout_s=effective_build_timeout_s,
+                        source_files=source_count,
                     )
                     await self._emit_build_failed(job_id, sample_id, correlation_id, error_msg)
                     return
@@ -356,12 +366,13 @@ class BuildValidationAgent(BaseAgent):
                                     compiler_name=best_compiler,
                                     output_dir=output_dir,
                                     output_name=f"{output_name}_rb",
-                                    timeout_s=_BUILD_VALIDATION_TIMEOUT_S,
+                                    timeout_s=effective_build_timeout_s,
                                     compile_kwargs={
                                         "max_fix_attempts": 2,
                                         "auto_fix": True,
                                         "llm_model": _fixer_model,
                                         "preserve_function_names": set(),
+                                        "auto_generate_headers": False,
                                         "extra_fix_context": _build_mutation_fix_context(
                                             build_source_path,
                                             mutation_data,
@@ -520,6 +531,7 @@ class BuildValidationAgent(BaseAgent):
                     project=project_obj,
                     output_dir=output_dir,
                     output_name=output_name,
+                    auto_generate_headers=False,
                 ),
             )
             if not (result and result.success and result.executable_path
@@ -731,6 +743,10 @@ class BuildValidationAgent(BaseAgent):
         Returns (compile_result, fix_stats)
         """
         os.environ.setdefault("AUTOFIX_LLM_TIMEOUT_S", str(_AUTOFIX_LLM_TIMEOUT_S))
+        auto_generate_project_headers = (
+            os.getenv("AUTO_GENERATE_PROJECT_HEADERS", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
 
         fix_stats = {
             "total_attempts": 0,
@@ -811,6 +827,76 @@ class BuildValidationAgent(BaseAgent):
         except Exception as _ph_exc:
             log.warning("prefix_header_patch_failed", error=str(_ph_exc))
 
+        try:
+            guarded = self._patch_missing_include_guards(project, log)
+            if guarded:
+                fix_stats["error_categories"].append("missing_include_guards_patched")
+        except Exception as _ig_exc:
+            log.warning("missing_include_guard_patch_failed", error=str(_ig_exc))
+
+        try:
+            local_includes = self._patch_missing_local_includes(project, original_source_path, log)
+            if local_includes:
+                fix_stats["error_categories"].append("missing_local_includes_restored")
+        except Exception as _li_exc:
+            log.warning("missing_local_include_patch_failed", error=str(_li_exc))
+
+        try:
+            normalized = self._normalize_generated_forward_declarations(project, log)
+            if normalized:
+                fix_stats["error_categories"].append("generated_forward_decls_normalized")
+        except Exception as _fd_exc:
+            log.warning("generated_forward_declarations_normalize_failed", error=str(_fd_exc))
+
+        try:
+            relocated = self._normalize_generated_declaration_includes(project, log)
+            if relocated:
+                fix_stats["error_categories"].append("generated_decl_includes_relocated")
+        except Exception as _gi_exc:
+            log.warning("generated_declaration_include_relocate_failed", error=str(_gi_exc))
+
+        try:
+            deduped = self._dedupe_typedef_blocks(project, log)
+            if deduped:
+                fix_stats["error_categories"].append("duplicate_typedef_blocks_removed")
+        except Exception as _td_exc:
+            log.warning("duplicate_typedef_block_remove_failed", error=str(_td_exc))
+
+        try:
+            sdk_aliases = self._normalize_sdk_tag_alias_typedefs(project, log)
+            if sdk_aliases:
+                fix_stats["error_categories"].append("sdk_tag_alias_typedefs_normalized")
+        except Exception as _sa_exc:
+            log.warning("sdk_tag_alias_typedef_normalize_failed", error=str(_sa_exc))
+
+        try:
+            shadowed = self._normalize_sdk_symbol_shadowing(project, log)
+            if shadowed:
+                fix_stats["error_categories"].append("sdk_symbol_shadowing_normalized")
+        except Exception as _ss_exc:
+            log.warning("sdk_symbol_shadowing_normalize_failed", error=str(_ss_exc))
+
+        try:
+            nt_conflicts = self._normalize_nt_header_local_conflicts(project, log)
+            if nt_conflicts:
+                fix_stats["error_categories"].append("nt_header_local_conflicts_normalized")
+        except Exception as _nt_exc:
+            log.warning("nt_header_local_conflict_normalize_failed", error=str(_nt_exc))
+
+        try:
+            mingw_shadowed = self._neutralize_mingw_sdk_shadow_headers(project, log)
+            if mingw_shadowed:
+                fix_stats["error_categories"].append("mingw_sdk_shadow_headers_neutralized")
+        except Exception as _mw_exc:
+            log.warning("mingw_sdk_shadow_header_normalize_failed", error=str(_mw_exc))
+
+        try:
+            sdk_typedefs = self._normalize_sdk_typedef_redefinitions(project, log)
+            if sdk_typedefs:
+                fix_stats["error_categories"].append("sdk_typedef_redefinitions_normalized")
+        except Exception as _tr_exc:
+            log.warning("sdk_typedef_redefinition_normalize_failed", error=str(_tr_exc))
+
         _fixer_model = (fixer_model or _resolve_fixer_model()).strip()
         log.info("autofix_model_selected", model=_fixer_model)
         _mutation_fix_context = _build_mutation_fix_context(
@@ -834,6 +920,7 @@ class BuildValidationAgent(BaseAgent):
                 autofix_min_line_ratio=_autofix_min_line_ratio,
                 autofix_max_deleted_functions=_autofix_max_deleted,
                 extra_fix_context=_mutation_fix_context,
+                auto_generate_headers=auto_generate_project_headers,
             )
             fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
             fix_stats["standard_attempts"] += getattr(result, "auto_fix_attempts", 0)
@@ -849,6 +936,53 @@ class BuildValidationAgent(BaseAgent):
         except Exception as e:
             log.warning("compile_exception_standard", error=str(e))
             fix_stats["error_categories"].append("exception_standard")
+
+        # Deterministic dynamic header retry: use the compiler's own missing
+        # identifier diagnostics to look up SDK headers, then recompile once
+        # before spending permissive/surgical attempts.
+        if last_result and not getattr(last_result, "success", False):
+            missing_symbols = self._extract_missing_header_symbols(
+                "\n".join([
+                    str(getattr(last_result, "errors", "") or ""),
+                    str(getattr(last_result, "output", "") or ""),
+                ])
+            )
+            if missing_symbols:
+                try:
+                    patched = self._patch_missing_headers_deterministic(
+                        project,
+                        log,
+                        candidate_symbols=missing_symbols,
+                    )
+                    if patched:
+                        log.info(
+                            "dynamic_missing_header_retry",
+                            files_patched=patched,
+                            symbols=sorted(missing_symbols)[:20],
+                        )
+                        fix_stats["error_categories"].append("dynamic_missing_headers_autopatched")
+                        result = compiler.compile_project(
+                            project=project,
+                            output_dir=output_dir,
+                            output_name=f"{output_name}_headers",
+                            max_fix_attempts=1,
+                            auto_fix=True,
+                            llm_model=_fixer_model,
+                            preserve_function_names=preserve_funcs,
+                            autofix_min_line_ratio=_autofix_min_line_ratio,
+                            autofix_max_deleted_functions=_autofix_max_deleted,
+                            extra_fix_context=_mutation_fix_context,
+                            auto_generate_headers=auto_generate_project_headers,
+                        )
+                        fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
+                        fix_stats["standard_attempts"] += getattr(result, "auto_fix_attempts", 0)
+                        last_result = result
+                        if result and result.success:
+                            log.info("compile_success_after_dynamic_header_patch")
+                            fix_stats["final_error_count"] = 0
+                            return result, fix_stats
+                except Exception as hdr_retry_exc:  # noqa: BLE001
+                    log.warning("dynamic_missing_header_retry_failed", error=str(hdr_retry_exc))
 
         # Tier 2: Permissive mode retry
         log.info("compile_attempt_permissive", attempts=_PERMISSIVE_RETRY_ATTEMPTS)
@@ -867,6 +1001,7 @@ class BuildValidationAgent(BaseAgent):
                     autofix_min_line_ratio=_autofix_min_line_ratio,
                     autofix_max_deleted_functions=_autofix_max_deleted,
                     extra_fix_context=_mutation_fix_context,
+                    auto_generate_headers=auto_generate_project_headers,
                 )
                 fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
                 fix_stats["permissive_attempts"] += getattr(result, "auto_fix_attempts", 0)
@@ -902,6 +1037,7 @@ class BuildValidationAgent(BaseAgent):
                 autofix_min_line_ratio=_autofix_min_line_ratio,
                 autofix_max_deleted_functions=_autofix_max_deleted,
                 extra_fix_context=_mutation_fix_context,
+                auto_generate_headers=auto_generate_project_headers,
             )
             fix_stats["total_attempts"] += getattr(result, "auto_fix_attempts", 0)
             fix_stats["surgical_attempts"] += getattr(result, "auto_fix_attempts", 0)
@@ -927,6 +1063,7 @@ class BuildValidationAgent(BaseAgent):
                     output_name=output_name + "_rbprobe",
                     max_fix_attempts=0,
                     auto_fix=False,
+                    auto_generate_headers=auto_generate_project_headers,
                 )
                 error_files = _extract_error_files(_rb_probe) if _rb_probe else set()
                 if error_files:
@@ -944,12 +1081,35 @@ class BuildValidationAgent(BaseAgent):
                             count=rolled,
                             error_files=len(error_files),
                         )
+                        try:
+                            rb_missing = self._extract_missing_header_symbols(
+                                "\n".join([
+                                    str(getattr(last_result, "errors", "") or ""),
+                                    str(getattr(last_result, "output", "") or ""),
+                                ])
+                            )
+                            patched = self._patch_missing_headers_deterministic(
+                                project,
+                                log,
+                                candidate_symbols=rb_missing,
+                            )
+                            if patched:
+                                fix_stats["error_categories"].append("rollback_missing_headers_autopatched")
+                                log.info(
+                                    "rollback_missing_headers_patched",
+                                    files_patched=patched,
+                                    symbols=sorted(rb_missing)[:20],
+                                )
+                        except Exception as _rb_hdr_exc:  # noqa: BLE001
+                            log.warning("rollback_missing_header_patch_failed", error=str(_rb_hdr_exc))
+
                         rb_result = compiler.compile_project(
                             project=project,
                             output_dir=output_dir + "_rb",
                             output_name=output_name + "_rb",
                             max_fix_attempts=0,
                             auto_fix=False,
+                            auto_generate_headers=auto_generate_project_headers,
                         )
                         if rb_result and rb_result.success:
                             fix_stats["targeted_rollback_success"] = True
@@ -1211,8 +1371,15 @@ class BuildValidationAgent(BaseAgent):
         "Thread32First":        ("<tlhelp32.h>", None),
         "Thread32Next":         ("<tlhelp32.h>", None),
         # ShellAPI (usually pulled by shlobj.h but not always)
+        "ShellExecute":         ("<shellapi.h>", "shell32.lib"),
         "ShellExecuteA":        ("<shellapi.h>", "shell32.lib"),
         "ShellExecuteW":        ("<shellapi.h>", "shell32.lib"),
+        "ShellExecuteEx":       ("<shellapi.h>", "shell32.lib"),
+        "ShellExecuteExA":      ("<shellapi.h>", "shell32.lib"),
+        "ShellExecuteExW":      ("<shellapi.h>", "shell32.lib"),
+        "SHELLEXECUTEINFO":     ("<shellapi.h>", "shell32.lib"),
+        "SHELLEXECUTEINFOA":    ("<shellapi.h>", "shell32.lib"),
+        "SHELLEXECUTEINFOW":    ("<shellapi.h>", "shell32.lib"),
         # Wintrust
         "WinVerifyTrust":       ("<wintrust.h>", "wintrust.lib"),
         # Psapi
@@ -1222,10 +1389,173 @@ class BuildValidationAgent(BaseAgent):
         "NtQueryInformationProcess": ("<winternl.h>", None),
     }
 
-    def _patch_missing_headers_deterministic(self, project, log) -> int:
+    def _patch_missing_include_guards(self, project, log) -> int:
         """
-        Scan project source files for C3861 'identifier not found' symbols that
-        can be resolved by adding a known #include.  Injects the include (and
+        Add include guards to project headers that have none.
+
+        Legacy projects can include the same physical header through multiple
+        relative paths. If the header lacks a guard, the pipeline's copied build
+        tree can expose duplicate typedef/default-argument errors even though a
+        hand-built baseline happened to pass. This is generic and local to the
+        header content; set AUTO_PATCH_HEADER_GUARDS=0 to disable.
+        """
+        if os.getenv("AUTO_PATCH_HEADER_GUARDS", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return 0
+
+        header_paths: set[Path] = set()
+        for raw in getattr(project, "header_files", []) or []:
+            p = Path(str(raw))
+            if p.exists() and p.suffix.lower() in {".h", ".hpp", ".hh", ".hxx"}:
+                header_paths.add(p.resolve())
+
+        root = Path(str(getattr(project, "root_dir", "") or ""))
+        if root.exists() and root.is_dir():
+            for pattern in ("*.h", "*.hpp", "*.hh", "*.hxx"):
+                for p in root.rglob(pattern):
+                    try:
+                        if p.stat().st_size <= 512 * 1024:
+                            header_paths.add(p.resolve())
+                    except OSError:
+                        continue
+
+        patched = 0
+        for path in sorted(header_paths, key=lambda p: str(p).lower()):
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            first_lines = "\n".join(content.lstrip().splitlines()[:20])
+            if "#pragma once" in first_lines or re.search(r'^\s*#\s*ifndef\b', first_lines, re.MULTILINE):
+                continue
+            if not re.search(r'\b(typedef|struct|class|enum|extern|void|int|BOOL|DWORD|HRESULT)\b', content):
+                continue
+
+            digest = hashlib.sha1(str(path).lower().encode("utf-8")).hexdigest()[:10].upper()
+            stem = re.sub(r'[^A-Za-z0-9]+', '_', path.stem).upper().strip("_") or "HEADER"
+            guard = f"LLMALMORPH_{stem}_{digest}_"
+            new_content = f"#ifndef {guard}\n#define {guard}\n\n{content.rstrip()}\n\n#endif /* {guard} */\n"
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+            except OSError as exc:
+                log.warning("include_guard_patch_write_failed", file=str(path), error=str(exc))
+
+        if patched:
+            log.info("missing_include_guards_patched", headers=patched)
+        return patched
+
+    def _patch_missing_local_includes(self, project, original_source_path: str, log) -> int:
+        """
+        Restore missing quoted local headers by searching the sample tree.
+
+        Some configs point to a build subdirectory while a required local header
+        sits in a sibling copy/source tree. The original project may compile via
+        its IDE project file, but the flattened pipeline build sees
+        ``fatal error: cannot open include file``. This copies the matching
+        header into the including file's directory inside the temporary build.
+        """
+        if os.getenv("AUTO_RESTORE_LOCAL_INCLUDES", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return 0
+
+        source_files = [Path(str(p)) for p in (getattr(project, "source_files", []) or [])]
+        if not source_files:
+            return 0
+
+        include_re = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
+        missing: list[tuple[Path, str]] = []
+        for src in source_files:
+            try:
+                content = src.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for include_name in include_re.findall(content):
+                include_path = src.parent / include_name
+                if include_path.exists():
+                    continue
+                # Existing include dirs can already satisfy it; avoid copying.
+                if any((Path(str(d)) / include_name).exists() for d in getattr(project, "include_dirs", []) or []):
+                    continue
+                missing.append((src, include_name))
+
+        if not missing:
+            return 0
+
+        search_roots: list[Path] = []
+        for raw in [original_source_path, getattr(project, "root_dir", "")]:
+            p = Path(str(raw))
+            if p.exists():
+                p = p if p.is_dir() else p.parent
+                for parent in [p, *p.parents[:5]]:
+                    if parent.exists() and parent not in search_roots:
+                        search_roots.append(parent)
+
+        copied = 0
+        for src, include_name in missing:
+            include_basename = Path(include_name).name.lower()
+            candidates: list[Path] = []
+            for root in search_roots:
+                try:
+                    for cand in root.rglob(Path(include_name).name):
+                        if cand.is_file() and cand.name.lower() == include_basename:
+                            candidates.append(cand)
+                except OSError:
+                    continue
+            if not candidates:
+                continue
+
+            # Prefer headers from the nearest common ancestry / shortest path.
+            candidates = sorted(
+                {c.resolve() for c in candidates},
+                key=lambda c: (len(c.parts), len(str(c))),
+            )
+            target = src.parent / include_name
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(candidates[0], target)
+                copied += 1
+                log.info(
+                    "missing_local_include_restored",
+                    include=include_name,
+                    target=str(target),
+                    source=str(candidates[0]),
+                )
+            except OSError as exc:
+                log.warning(
+                    "missing_local_include_restore_failed",
+                    include=include_name,
+                    target=str(target),
+                    error=str(exc),
+                )
+
+        return copied
+
+    @staticmethod
+    def _extract_missing_header_symbols(error_text: str) -> set[str]:
+        """Extract identifiers that the compiler says are undeclared/missing."""
+        symbols: set[str] = set()
+        patterns = [
+            r"error\s+C3861:\s*'([^']+)':\s*identifier not found",
+            r"error\s+C2065:\s*'([^']+)':\s*undeclared identifier",
+            r"'([^']+)'\s+was not declared in this scope",
+            r"use of undeclared identifier\s+'([^']+)'",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, error_text or "", re.IGNORECASE):
+                symbol = match.group(1).strip()
+                if re.fullmatch(r"[A-Za-z_]\w*", symbol):
+                    symbols.add(symbol)
+        return symbols
+
+    def _patch_missing_headers_deterministic(
+        self,
+        project,
+        log,
+        candidate_symbols: Optional[set[str]] = None,
+    ) -> int:
+        """
+        Scan project source files for identifiers that can be resolved by
+        adding a known or SDK-discovered #include.  Injects the include (and
         optional #pragma comment lib) at the top of the affected file, just
         after the last existing #include line, without touching any other code.
 
@@ -1233,10 +1563,30 @@ class BuildValidationAgent(BaseAgent):
         """
         import re as _re
 
+        try:
+            from automation.win32_header_index import headers_for_symbols
+        except Exception:  # noqa: BLE001 - SDK index is best-effort only
+            headers_for_symbols = None  # type: ignore[assignment]
+
         source_files: list[str] = getattr(project, "source_files", []) or []
+        root_dir = Path(str(getattr(project, "root_dir", "") or ""))
+        if root_dir.exists() and root_dir.is_dir():
+            # ProjectDetector can occasionally under-report source files for
+            # old VS/DSP projects or materialized variant trees. The compiler
+            # command may still compile those files, so the deterministic
+            # header patcher must discover them from the build root too.
+            discovered = []
+            for pattern in ("*.c", "*.cc", "*.cpp", "*.cxx", "*.C", "*.CPP"):
+                try:
+                    discovered.extend(str(p) for p in root_dir.rglob(pattern))
+                except OSError:
+                    continue
+            source_files = list(dict.fromkeys([*source_files, *discovered]))
         if not source_files:
             return 0
 
+        max_dynamic_headers = max(0, int(os.environ.get("DYNAMIC_HEADER_PATCH_MAX", "8")))
+        candidate_symbols = set(candidate_symbols or set())
         patched_count = 0
         for src_path in source_files:
             try:
@@ -1244,9 +1594,67 @@ class BuildValidationAgent(BaseAgent):
             except OSError:
                 continue
 
-            # Find all identifiers in this file that are in the missing-header map
             needed: dict[str, tuple[str, str | None]] = {}
+
+            # Prefer SDK-derived symbol -> header knowledge so new Win32 API
+            # families do not require per-sample rules in this agent.
+            if headers_for_symbols and max_dynamic_headers and candidate_symbols:
+                identifiers = {
+                    symbol for symbol in candidate_symbols
+                    if _re.search(r'\b' + _re.escape(symbol) + r'\b', content)
+                }
+                try:
+                    dynamic_headers = headers_for_symbols(identifiers)
+                except Exception as dyn_exc:  # noqa: BLE001
+                    dynamic_headers = {}
+                    log.debug("dynamic_header_index_lookup_failed", error=str(dyn_exc))
+
+                existing_includes = {
+                    inc.lower()
+                    for inc in _re.findall(
+                        r'^\s*#\s*include\s+[<"]([^>"]+)[>"]',
+                        content,
+                        _re.MULTILINE,
+                    )
+                }
+                has_windows_h = "windows.h" in existing_includes
+                windows_transitive_headers = {
+                    "fileapi.h",
+                    "libloaderapi.h",
+                    "processthreadsapi.h",
+                    "winbase.h",
+                    "wingdi.h",
+                    "winnt.h",
+                    "winreg.h",
+                    "winuser.h",
+                    "wtypes.h",
+                }
+                grouped_headers: dict[str, set[str]] = {}
+                for symbol, hdr in dynamic_headers.items():
+                    short_hdr = hdr.strip("<>").strip('"').lower()
+                    if short_hdr in existing_includes or short_hdr in content.lower():
+                        continue
+                    if has_windows_h and short_hdr in windows_transitive_headers:
+                        continue
+                    # winsock.h is usually the wrong direction for modern SDK
+                    # builds; the compiler's include-order mitigation handles
+                    # winsock2.h when it is genuinely needed.
+                    if short_hdr == "winsock.h":
+                        continue
+                    grouped_headers.setdefault(hdr, set()).add(symbol)
+
+                for hdr, symbols in sorted(
+                    grouped_headers.items(),
+                    key=lambda item: (-len(item[1]), item[0].lower()),
+                ):
+                    needed[hdr] = (hdr, None)
+                    if len(needed) >= max_dynamic_headers:
+                        break
+
+            # Fallback for curated mappings that also carry optional lib hints.
             for api, (hdr, lib) in self._MISSING_HEADER_MAP.items():
+                if candidate_symbols and api not in candidate_symbols:
+                    continue
                 if _re.search(r'\b' + _re.escape(api) + r'\b', content):
                     # Only add if the header is not already present
                     if hdr.strip("<>") not in content and hdr.strip('"') not in content:
@@ -1292,6 +1700,603 @@ class BuildValidationAgent(BaseAgent):
                             file=src_path, error=str(write_err))
 
         return patched_count
+
+    @staticmethod
+    def _extract_exact_function_declarations(content: str) -> list[str]:
+        """Extract exact declarations from top-level function definitions."""
+        declarations: list[str] = []
+        lines = content.splitlines()
+        i = 0
+        brace_depth = 0
+        control_keywords = {"if", "for", "while", "switch", "else", "do", "return", "sizeof", "For", "iFor", "jFor"}
+        while i < len(lines):
+            stripped = lines[i].strip()
+            current_depth = brace_depth
+            brace_depth += lines[i].count('{') - lines[i].count('}')
+            if current_depth != 0:
+                i += 1
+                continue
+            if (
+                not stripped
+                or stripped.startswith(('#', '//', '/*'))
+                or stripped.endswith(';')
+                or '(' not in stripped
+            ):
+                i += 1
+                continue
+
+            sig_parts = [stripped]
+            j = i
+            while '{' not in sig_parts[-1] and j + 1 < len(lines):
+                j += 1
+                part = lines[j].strip()
+                sig_parts.append(part)
+                if part.endswith(';'):
+                    break
+
+            joined = ' '.join(part for part in sig_parts if part).strip()
+            if '{' not in joined or ';' in joined.split('{', 1)[0]:
+                i += 1
+                continue
+
+            signature = joined.split('{', 1)[0].strip()
+            if signature.startswith(('if ', 'for ', 'while ', 'switch ')):
+                i += 1
+                continue
+            if not re.search(r'\b[A-Za-z_]\w*\s*\([^;{}]*\)\s*$', signature):
+                i += 1
+                continue
+            name_match = re.search(r'\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*$', signature)
+            if name_match and name_match.group(1) in control_keywords:
+                i += 1
+                continue
+            if name_match:
+                prefix = signature[:name_match.start(1)].strip()
+                if not prefix or prefix.endswith(('=', ',', '(', '!', '&&', '||')):
+                    i += 1
+                    continue
+            if name_match and name_match.group(1) in {"main", "WinMain", "wWinMain", "DllMain", "_DllMain", "_start"}:
+                body_depth = 0
+                k = j
+                while k < len(lines):
+                    body_depth += lines[k].count('{') - lines[k].count('}')
+                    if body_depth <= 0 and '{' in lines[j]:
+                        break
+                    k += 1
+                i = max(i + 1, k + 1)
+                brace_depth = 0
+                continue
+
+            declarations.append(signature + ';')
+            body_depth = 0
+            k = j
+            while k < len(lines):
+                body_depth += lines[k].count('{') - lines[k].count('}')
+                if body_depth <= 0 and '{' in lines[j]:
+                    break
+                k += 1
+            i = max(i + 1, k + 1)
+            brace_depth = 0
+
+        return declarations
+
+    def _normalize_generated_forward_declarations(self, project, log) -> int:
+        """
+        Replace function-reordering forward declaration blocks with exact
+        signatures extracted from the current definitions.
+        """
+        marker = "/* Forward declarations (auto-generated for function reordering) */"
+        patched = 0
+        for src_path in getattr(project, "source_files", []) or []:
+            try:
+                path = Path(src_path)
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if marker not in content:
+                continue
+
+            declarations = self._extract_exact_function_declarations(content)
+            if not declarations:
+                continue
+
+            lines = content.splitlines()
+            start = next((idx for idx, line in enumerate(lines) if marker in line), None)
+            if start is None:
+                continue
+            end = start + 1
+            while end < len(lines):
+                stripped = lines[end].strip()
+                if not stripped:
+                    end += 1
+                    break
+                if not stripped.endswith(';'):
+                    break
+                end += 1
+
+            replacement = [marker] + declarations + [""]
+            new_lines = lines[:start] + replacement + lines[end:]
+            new_content = "\n".join(new_lines)
+            if content.endswith("\n"):
+                new_content += "\n"
+            if new_content == content:
+                continue
+
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info("generated_forward_declarations_normalized", file=path.name, declarations=len(declarations))
+            except OSError as exc:
+                log.warning("generated_forward_declarations_normalize_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    def _normalize_generated_declaration_includes(self, project, log) -> int:
+        """
+        Move generated *_declarations.h includes below local type declarations
+        when a source file also carries generated function-reordering forward
+        declarations. This avoids prototypes in generated headers referencing
+        project-local types before they are defined.
+        """
+        marker = "/* Forward declarations (auto-generated for function reordering) */"
+        include_re = re.compile(r'^\s*#\s*include\s+"[^"]*_declarations\.h"\s*$', re.MULTILINE)
+        patched = 0
+        for src_path in getattr(project, "source_files", []) or []:
+            try:
+                path = Path(src_path)
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if marker not in content or "_declarations.h" not in content:
+                continue
+
+            includes = [m.group(0) for m in include_re.finditer(content)]
+            if not includes:
+                continue
+
+            marker_pos = content.find(marker)
+            before_marker = content[:marker_pos]
+            after_marker = content[marker_pos:]
+            cleaned_before = include_re.sub("", before_marker)
+            # Collapse excessive blank lines left by include removal.
+            cleaned_before = re.sub(r'\n{3,}', '\n\n', cleaned_before)
+            include_block = "\n".join(dict.fromkeys(includes))
+            new_content = cleaned_before.rstrip() + "\n\n" + include_block + "\n\n" + after_marker.lstrip()
+            if new_content == content:
+                continue
+
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info("generated_declaration_include_relocated", file=path.name, includes=len(includes))
+            except OSError as exc:
+                log.warning("generated_declaration_include_relocate_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    def _dedupe_typedef_blocks(self, project, log) -> int:
+        """Remove repeated typedef struct/union/enum blocks with the same tag."""
+        typedef_re = re.compile(
+            r'(?P<block>typedef\s+(?P<kind>struct|union|enum)\s+(?P<tag>_[A-Za-z_]\w*|[A-Za-z_]\w*)\s*\{.*?\}\s*[^;]*;)',
+            re.DOTALL,
+        )
+        patched = 0
+        for src_path in getattr(project, "source_files", []) or []:
+            try:
+                path = Path(src_path)
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            seen: set[tuple[str, str]] = set()
+            duplicate_count = 0
+
+            def _replace(match: re.Match) -> str:
+                nonlocal duplicate_count
+                key = (match.group("kind"), match.group("tag"))
+                if key in seen:
+                    duplicate_count += 1
+                    return ""
+                seen.add(key)
+                return match.group("block")
+
+            new_content = typedef_re.sub(_replace, content)
+            if duplicate_count == 0 or new_content == content:
+                continue
+            new_content = re.sub(r'\n{3,}', '\n\n', new_content)
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info("duplicate_typedef_blocks_removed", file=path.name, duplicates=duplicate_count)
+            except OSError as exc:
+                log.warning("duplicate_typedef_block_remove_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    def _normalize_sdk_tag_alias_typedefs(self, project, log) -> int:
+        """
+        Remove local incomplete ``typedef struct tagX X;`` aliases when ``X`` is
+        a known SDK type, and rewrite accidental ``tagX`` value declarations to
+        use ``X``.  This fixes LLM/autofix attempts that shadow Win32 typedefs
+        such as CHOOSECOLOR with a function-local incomplete tag.
+        """
+        try:
+            from automation.win32_header_index import headers_for_symbols
+        except Exception:  # noqa: BLE001
+            headers_for_symbols = None  # type: ignore[assignment]
+
+        typedef_re = re.compile(
+            r'^[ \t]*typedef\s+struct\s+tag(?P<alias>[A-Za-z_]\w*)\s+(?P=alias)\s*;\s*$',
+            re.MULTILINE,
+        )
+        patched = 0
+        for src_path in getattr(project, "source_files", []) or []:
+            try:
+                path = Path(src_path)
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            aliases = {m.group("alias") for m in typedef_re.finditer(content)}
+            if not aliases:
+                continue
+
+            sdk_aliases: set[str] = set()
+            if headers_for_symbols:
+                try:
+                    sdk_aliases = set(headers_for_symbols(aliases).keys())
+                except Exception:
+                    sdk_aliases = set()
+            if not sdk_aliases:
+                continue
+
+            def _remove_typedef(match: re.Match) -> str:
+                alias = match.group("alias")
+                return "" if alias in sdk_aliases else match.group(0)
+
+            new_content = typedef_re.sub(_remove_typedef, content)
+            for alias in sdk_aliases:
+                new_content = re.sub(r'\btag' + re.escape(alias) + r'\b', alias, new_content)
+            new_content, removed_dupes = self._remove_duplicate_sdk_local_declarations(
+                new_content,
+                sdk_aliases,
+            )
+            new_content = re.sub(r'\n{3,}', '\n\n', new_content)
+
+            if new_content == content:
+                continue
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info(
+                    "sdk_tag_alias_typedefs_normalized",
+                    file=path.name,
+                    aliases=sorted(sdk_aliases),
+                    duplicate_declarations_removed=removed_dupes,
+                )
+            except OSError as exc:
+                log.warning("sdk_tag_alias_typedef_normalize_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    def _normalize_sdk_symbol_shadowing(self, project, log) -> int:
+        """
+        Rename local function-pointer variables that shadow SDK function names.
+
+        LLM fixes sometimes introduce a variable with the exact name of a
+        Windows API function. If that function is declared by SDK headers, the
+        local variable collides. Use the SDK symbol index to detect and rename
+        only those local variables in their file.
+        """
+        try:
+            from automation.win32_header_index import headers_for_symbols
+        except Exception:  # noqa: BLE001
+            headers_for_symbols = None  # type: ignore[assignment]
+        if not headers_for_symbols:
+            return 0
+
+        var_decl_re = re.compile(
+            r'(?P<type>\b[A-Za-z_]\w*_t\b)\s+(?P<name>[A-Za-z_]\w*)\s*=\s*(?:NULL|nullptr|0)\s*;'
+        )
+        patched = 0
+        for src_path in getattr(project, "source_files", []) or []:
+            try:
+                path = Path(src_path)
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            names = {m.group("name") for m in var_decl_re.finditer(content)}
+            if not names:
+                continue
+            try:
+                sdk_names = set(headers_for_symbols(names).keys())
+            except Exception:
+                sdk_names = set()
+            if not sdk_names:
+                continue
+
+            new_content = content
+            renamed: list[str] = []
+            for name in sorted(sdk_names, key=len, reverse=True):
+                replacement = f"p_{name}"
+                if re.search(r'\b' + re.escape(replacement) + r'\b', new_content):
+                    continue
+                new_content = re.sub(r'\b' + re.escape(name) + r'\b', replacement, new_content)
+                renamed.append(name)
+
+            if renamed and new_content != content:
+                try:
+                    path.write_text(new_content, encoding="utf-8")
+                    patched += 1
+                    log.info("sdk_symbol_shadowing_normalized", file=path.name, symbols=renamed)
+                except OSError as exc:
+                    log.warning("sdk_symbol_shadowing_write_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    def _normalize_nt_header_local_conflicts(self, project, log) -> int:
+        """
+        Remove winternl.h when a file carries its own NT enum/type subset.
+
+        Old samples often define PROCESSINFOCLASS locally because they need
+        values absent from the SDK enum. Adding winternl.h creates redefinition
+        errors while still not replacing the custom values. Prefer local types.
+        """
+        include_re = re.compile(r'^\s*#\s*include\s*<winternl\.h>\s*\n?', re.IGNORECASE | re.MULTILINE)
+        local_processinfo_re = re.compile(
+            r'\b(?:typedef\s+)?enum\s+(?:_PROCESSINFOCLASS|PROCESSINFOCLASS)\b|\benum\s+PROCESSINFOCLASS\b'
+        )
+        patched = 0
+        for src_path in getattr(project, "source_files", []) or []:
+            try:
+                path = Path(src_path)
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if "<winternl.h>" not in content.lower():
+                continue
+            if not local_processinfo_re.search(content):
+                continue
+            if "NtQueryInformationProcess" not in content and "ZwQueryInformationProcess" not in content:
+                continue
+
+            new_content = include_re.sub("", content)
+            if new_content == content:
+                continue
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info("nt_header_local_conflict_normalized", file=path.name, removed="<winternl.h>")
+            except OSError as exc:
+                log.warning("nt_header_local_conflict_write_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    def _neutralize_mingw_sdk_shadow_headers(self, project, log) -> int:
+        """
+        Prevent local MinGW runtime headers from shadowing the Windows SDK in
+        MSVC builds.
+
+        Some source bundles carry MinGW copies of ``windows.h`` / ``_mingw.h``.
+        When the pipeline compiles with MSVC and adds the temporary project
+        directory to the include path, those local headers can be selected
+        before the SDK headers and then fail on MinGW-only dependencies such as
+        ``_mingw_mac.h``.  This is a build-tree normalization only: rename the
+        local MinGW headers out of the include search path so MSVC resolves the
+        real SDK headers.
+        """
+        root = Path(str(getattr(project, "root_dir", "") or ""))
+        if not root.exists() or not root.is_dir():
+            return 0
+
+        neutralized = 0
+        shadow_names = {"windows.h", "_mingw.h", "mingw.h"}
+        for header in list(root.rglob("*.h")):
+            if header.name.lower() not in shadow_names:
+                continue
+            try:
+                content = header.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            probe = content[:4096].lower()
+            if "mingw-w64 runtime" not in probe and "_mingw" not in probe:
+                continue
+
+            disabled = header.with_name(header.name + ".msvc_disabled")
+            suffix = 1
+            while disabled.exists():
+                disabled = header.with_name(f"{header.name}.msvc_disabled.{suffix}")
+                suffix += 1
+            try:
+                header.rename(disabled)
+                neutralized += 1
+                log.info(
+                    "mingw_sdk_shadow_header_neutralized",
+                    header=str(header),
+                    moved_to=str(disabled),
+                )
+            except OSError as exc:
+                log.warning(
+                    "mingw_sdk_shadow_header_neutralize_failed",
+                    header=str(header),
+                    error=str(exc),
+                )
+
+        return neutralized
+
+    def _normalize_sdk_typedef_redefinitions(self, project, log) -> int:
+        """
+        Remove local typedef struct/union/enum definitions that redefine types
+        already provided by the Windows SDK.
+
+        This is intentionally symbol-driven.  It extracts aliases from local
+        typedef blocks, asks the SDK symbol index which aliases are SDK-owned,
+        and removes only those local blocks.  It fixes generated/copy-pasted
+        declarations like ``typedef struct _X { ... } X, *PX;`` colliding with
+        winnt.h without relying on sample-specific type names.
+        """
+        typedef_re = re.compile(
+            r'(?P<block>\btypedef\s+(?P<kind>struct|union|enum)\s+'
+            r'(?P<tag>_[A-Za-z_]\w*|tag[A-Za-z_]\w*|[A-Za-z_]\w*)\s*'
+            r'\{.*?\}\s*(?P<aliases>[^;{}]+)\s*;\s*)',
+            re.DOTALL,
+        )
+        patched = 0
+
+        for src_path in getattr(project, "source_files", []) or []:
+            try:
+                path = Path(src_path)
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            matches = list(typedef_re.finditer(content))
+            if not matches:
+                continue
+
+            aliases_by_match: dict[int, set[str]] = {}
+            all_aliases: set[str] = set()
+            for idx, match in enumerate(matches):
+                raw_aliases = match.group("aliases")
+                aliases = {
+                    m.group(1)
+                    for m in re.finditer(r'\*?\s*([A-Za-z_]\w*)\b', raw_aliases)
+                }
+                # Pointer aliases such as PLUID_AND_ATTRIBUTES are useful for
+                # lookup too, but the non-pointer alias is the key collision.
+                aliases_by_match[idx] = aliases
+                all_aliases.update(aliases)
+
+            if not all_aliases:
+                continue
+
+            sdk_aliases = self._sdk_declares_symbols(all_aliases)
+            if not sdk_aliases:
+                continue
+
+            removed = 0
+
+            def _replace(match: re.Match) -> str:
+                nonlocal removed
+                idx = matches.index(match)
+                aliases = aliases_by_match.get(idx, set())
+                if aliases & sdk_aliases:
+                    removed += 1
+                    return ""
+                return match.group("block")
+
+            # Avoid list.index() surprises on duplicated match objects by
+            # replacing from the end with recorded spans.
+            new_content = content
+            for idx, match in reversed(list(enumerate(matches))):
+                aliases = aliases_by_match.get(idx, set())
+                if not (aliases & sdk_aliases):
+                    continue
+                new_content = new_content[:match.start()] + "" + new_content[match.end():]
+                removed += 1
+
+            if removed == 0 or new_content == content:
+                continue
+            new_content = re.sub(r'\n{3,}', '\n\n', new_content)
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info(
+                    "sdk_typedef_redefinitions_normalized",
+                    file=path.name,
+                    removed_blocks=removed,
+                    sdk_aliases=sorted(sdk_aliases)[:20],
+                )
+            except OSError as exc:
+                log.warning("sdk_typedef_redefinition_write_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    @staticmethod
+    def _sdk_declares_symbols(symbols: set[str]) -> set[str]:
+        """Return the subset of names declared by local Windows SDK headers."""
+        if not symbols:
+            return set()
+        try:
+            from automation.win32_header_index import _find_sdk_version_roots  # type: ignore
+        except Exception:  # noqa: BLE001
+            return set()
+
+        wanted = {s for s in symbols if re.fullmatch(r"[A-Za-z_]\w*", s)}
+        if not wanted:
+            return set()
+        found: set[str] = set()
+        # Look for typedef aliases, struct/union/enum tags, and defines.  This
+        # deliberately includes big umbrella headers such as winnt.h because
+        # typedef redefinition diagnostics usually point there.
+        patterns = {
+            name: re.compile(
+                rf'(\btypedef\b[^;{{}}]*(?:\{{[^}}]*\}}[^;]*)?\b{re.escape(name)}\b\s*(?:[,;])|'
+                rf'\b(?:struct|union|enum)\s+{re.escape(name)}\b|'
+                rf'^\s*#\s*define\s+{re.escape(name)}\b)',
+                re.DOTALL | re.MULTILINE,
+            )
+            for name in wanted
+        }
+        priority_headers = {
+            "windows.h", "winnt.h", "windef.h", "minwindef.h", "basetsd.h",
+            "ntdef.h", "winbase.h", "processthreadsapi.h", "securitybaseapi.h",
+            "winternl.h",
+        }
+        for root in _find_sdk_version_roots():
+            try:
+                headers = [p for p in Path(root).glob("*.h") if p.name.lower() in priority_headers]
+            except OSError:
+                continue
+            for hdr in headers:
+                if found >= wanted:
+                    return found
+                try:
+                    text = hdr.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                for name, pat in patterns.items():
+                    if name not in found and pat.search(text):
+                        found.add(name)
+        return found
+
+    @staticmethod
+    def _remove_duplicate_sdk_local_declarations(content: str, sdk_aliases: set[str]) -> tuple[str, int]:
+        if not sdk_aliases:
+            return content, 0
+
+        aliases = "|".join(re.escape(alias) for alias in sorted(sdk_aliases, key=len, reverse=True))
+        decl_re = re.compile(rf'^(?P<indent>\s*)(?P<type>{aliases})\s+(?P<name>[A-Za-z_]\w*)\s*;\s*$')
+        lines = content.splitlines()
+        out: list[str] = []
+        brace_depth = 0
+        seen_by_depth: dict[int, set[tuple[str, str]]] = {}
+        removed = 0
+
+        for line in lines:
+            current_depth = brace_depth
+            for depth in list(seen_by_depth):
+                if depth > current_depth:
+                    seen_by_depth.pop(depth, None)
+
+            match = decl_re.match(line)
+            if match:
+                key = (match.group("type"), match.group("name"))
+                seen_here = seen_by_depth.setdefault(current_depth, set())
+                if key in seen_here:
+                    removed += 1
+                    brace_depth += line.count('{') - line.count('}')
+                    continue
+                seen_here.add(key)
+
+            out.append(line)
+            brace_depth += line.count('{') - line.count('}')
+
+        new_content = "\n".join(out)
+        if content.endswith("\n"):
+            new_content += "\n"
+        return new_content, removed
 
     def _format_detailed_error(self, error_message: str, fix_stats: dict, error_category: str) -> str:
         """Format detailed error report with fix statistics."""
