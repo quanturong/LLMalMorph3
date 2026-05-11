@@ -91,5 +91,5 @@ class DeepSeekProvider(LLMProviderInterface):
         loop = asyncio.get_running_loop()
         return await asyncio.wait_for(
             loop.run_in_executor(None, self._sync_call, request, model),
-            timeout=request.timeout_s + 5,
+            timeout=(request.timeout_s + 5) if request.timeout_s is not None else None,
         )

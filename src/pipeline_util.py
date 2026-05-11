@@ -1,41 +1,32 @@
 import os
 import time
-import requests
 
 from ollama_api import ollama_chat_api
 from parse_llm_generated_code import parse_code
 
 
-def mistral_generate(system_prompt, user_prompt, model="codestral-2508"):
+def mistral_generate(system_prompt, user_prompt, model="devstral-small-2:24b"):
     """
-    Generate code using Mistral API (Codestral).
+    Generate code using the shared Ollama backend.
     
     Args:
         system_prompt: System prompt
         user_prompt: User prompt
-        model: Model name (default: "codestral-2508")
+        model: Model name (default: "devstral-small-2:24b")
     
     Returns:
         Generated text response
     
-    Raises:
-        ValueError: If MISTRAL_API_KEY is not set
-        requests.RequestException: If API call fails
     """
-    API_KEY = os.environ.get("MISTRAL_API_KEY")
-    if not API_KEY:
-        raise ValueError("Missing MISTRAL_API_KEY in environment")
-
-    url = "https://api.mistral.ai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    data = {"model": model, "messages": messages}
-    resp = requests.post(url, json=data, headers=headers)
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    return ollama_chat_api(
+        os.getenv("OLLAMA_MODEL", os.getenv("LLM_CLOUD_MODEL", "devstral-small-2:24b")),
+        system_prompt,
+        user_prompt,
+        seed=42,
+        base_url=os.getenv("OLLAMA_BASE_URL", os.getenv("CLOUD_URL", "https://qxdhstvip7o8az-11434.proxy.runpod.net/")),
+        timeout=int(os.getenv("OLLAMA_TIMEOUT_S", os.getenv("LLM_REQUEST_TIMEOUT_S", "600"))),
+        num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "65536")),
+    )
 
 def get_llm_name_from_input(llm_input):
     llm_name_to_model_name = {

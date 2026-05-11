@@ -133,12 +133,12 @@ class OpenAICompatibleProvider(LLMProviderInterface):
                 body["response_format"] = {"type": "json_object"}
 
         start = time.monotonic()
-        deadline = start + max(1.0, float(request.timeout_s))
+        deadline = (start + request.timeout_s) if request.timeout_s is not None else None
         resp: Optional[requests.Response] = None
         try:
             resp = requests.post(
                 endpoint, headers=headers, json=body,
-                timeout=(30, request.timeout_s),  # (connect, read-between-chunks)
+                timeout=(30, request.timeout_s),  # (connect, read-between-chunks); None = no read timeout
                 stream=True,
             )
             resp.raise_for_status()
@@ -172,7 +172,7 @@ class OpenAICompatibleProvider(LLMProviderInterface):
             usage_completion = 0
             try:
                 for raw_line in resp.iter_lines(decode_unicode=True):
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         raise LLMTimeoutError(
                             f"{self._provider_name} total timeout after {request.timeout_s}s"
                         )
@@ -208,7 +208,7 @@ class OpenAICompatibleProvider(LLMProviderInterface):
             usage_completion = 0
             try:
                 for raw_line in resp.iter_lines(decode_unicode=True):
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         raise LLMTimeoutError(
                             f"{self._provider_name} total timeout after {request.timeout_s}s"
                         )
@@ -253,5 +253,5 @@ class OpenAICompatibleProvider(LLMProviderInterface):
         loop = asyncio.get_running_loop()
         return await asyncio.wait_for(
             loop.run_in_executor(None, self._sync_call, request, model),
-            timeout=request.timeout_s + 5,
+            timeout=(request.timeout_s + 5) if request.timeout_s is not None else None,
         )

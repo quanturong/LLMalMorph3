@@ -2,7 +2,7 @@
 *.key
 *.pem
 .env
-.env.local
+
 .env.*
 !.env.example
 config.json
@@ -53,9 +53,10 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
-*.md
+
 # Output directories
 samples/
+30Samples/
 output/
 example_output/
 selected_samples/*/llm_generated/
@@ -79,6 +80,7 @@ artifacts_*/
 batch_compile_output/
 production_runs/
 test_results/
+work/
 work_*/
 
 # Deprecated and archived content
@@ -97,14 +99,34 @@ storage/
 fix_history_global.json
 compile_test_50_v*_results.json
 src/automation/_win32_header_index_cache.json
+src/automation/_win32_type_cache.json
+src/automation/msvc_doc_cache.json
 
-# Build artifacts
+# Build and IDE artifacts from native samples
 *.obj
 *.o
 *.exe
 *.dll
 *.so
 *.dylib
+*.pdb
+*.ipdb
+*.iobj
+*.ncb
+*.opt
+*.plg
+*.suo
+*.sdf
+*.aps
+*.layout
+*.depend
+*.cbp
+*.7z
+*.zip
+*.rar
+Release/
+Debug/
+
 # SQLite state databases
 *.db
 # Pytest cache

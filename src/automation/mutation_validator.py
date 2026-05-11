@@ -186,21 +186,21 @@ class _FeatureExtractor:
     def extract(self, code: str, language: str = "c") -> Optional[CodeFeatures]:
         """Parse code and extract structural features."""
         parser = self._get_parser(language)
-        if not parser:
-            return None
-
-        tree = parser.parse(bytes(code, 'utf-8'))
-        root = tree.root_node
         feats = CodeFeatures()
-        feats.ast_node_count = self._count_nodes(root)
 
         # Line-level analysis
         lines = code.split('\n')
         feats.total_lines = len(lines)
         self._classify_lines(lines, feats)
 
-        # AST walk
-        self._walk(root, code, feats)
+        # AST walk when tree-sitter is available. Regex extraction below is
+        # still useful by itself and must run in production environments where
+        # tree-sitter-c/cpp is not installed.
+        if parser:
+            tree = parser.parse(bytes(code, 'utf-8'))
+            root = tree.root_node
+            feats.ast_node_count = self._count_nodes(root)
+            self._walk(root, code, feats)
 
         # Regex-based supplementary extraction (catches things AST may
         # represent differently across tree-sitter versions)
@@ -580,6 +580,11 @@ class _FeatureExtractor:
             r'(?:\s*[*&])?(?:\s+|[*&]+))+'
             r'([A-Za-z_]\w*)\s*(?:=|;|,|\))'
         )
+        array_decl_re = re.compile(
+            r'^\s*(?:const\s+|volatile\s+|static\s+|register\s+)*'
+            r'(?:char|wchar_t|WCHAR|unsigned\s+char|BYTE|uint8_t|unsigned\s+BYTE)'
+            r'\s+([A-Za-z_]\w*)\s*\[[^\]]+\]\s*(?:=|;|,|\))'
+        )
         keyword_types = {
             "if", "for", "while", "switch", "return", "sizeof", "catch",
             "else", "do", "case", "break", "continue",
@@ -590,7 +595,7 @@ class _FeatureExtractor:
         for line_no, line in enumerate(code.splitlines(), 1):
             code_line = re.sub(r'//.*$', '', line)
             depth_at_line = brace_depth
-            match = decl_re.match(code_line)
+            match = array_decl_re.match(code_line) or decl_re.match(code_line)
             if match:
                 var_name = match.group(1)
                 first_word = code_line.strip().split(None, 1)[0] if code_line.strip() else ""
@@ -1014,7 +1019,10 @@ class MutationValidator:
 
     def __init__(self):
         self._extractor = _FeatureExtractor()
-        self._available = _HAS_TREE_SITTER
+        # Regex checks are always available. Tree-sitter, when installed, adds
+        # deeper AST features but is not required for the validator to catch
+        # common generated-code regressions.
+        self._available = True
 
     @property
     def available(self) -> bool:
@@ -1038,10 +1046,6 @@ class MutationValidator:
             If passed is True, failure_reason is None.
             If passed is False, failure_reason describes the first check that failed.
         """
-        if not self._available:
-            logger.debug("mutation_validator_unavailable_passthrough")
-            return True, None
-
         orig_feats = self._extractor.extract(original_code, language)
         mut_feats = self._extractor.extract(mutated_code, language)
 

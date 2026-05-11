@@ -55,7 +55,7 @@ class MistralProvider(LLMProviderInterface):
                         timeout=request.timeout_s,
                     ),
                 ),
-                timeout=request.timeout_s + 5,
+                timeout=(request.timeout_s + 5) if request.timeout_s is not None else None,
             )
         except asyncio.TimeoutError:
             raise LLMTimeoutError(f"Mistral call timed out after {request.timeout_s}s")

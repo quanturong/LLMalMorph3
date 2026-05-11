@@ -52,24 +52,33 @@ def build_provider(
         logger.info("LLM provider: DeepSeekProvider(model=%s)", cloud_model)
 
     elif mode in ("cloud_only", "mistral"):
-        if cloud_provider in ("runpod", "openai_compatible", "salad"):
+        if cloud_provider in ("salad", "ollama", "runpod", "openai_compatible"):
+            from .ollama_provider import OllamaProvider
+
+            resolved_key = api_key or os.getenv("OLLAMA_API_KEY", "") or os.getenv("SALAD_API_KEY", "") or os.getenv("RUNPOD_API_KEY", "")
+            resolved_url = cloud_base_url or os.getenv("OLLAMA_BASE_URL", "") or os.getenv("SALAD_URL", "") or os.getenv("CLOUD_URL", "")
+            resolved_timeout = int(os.getenv("OLLAMA_TIMEOUT_S") or 0) or None
+            resolved_num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "65536"))
+            provider = OllamaProvider(
+                model=cloud_model or "devstral-small-2:24b",
+                base_url=resolved_url or "https://kumquat-arugula-lrhfn9s87dmw86ut.salad.cloud",
+                api_key=resolved_key,
+                timeout_s=resolved_timeout,
+                num_ctx=resolved_num_ctx,
+            )
+            logger.info("LLM provider: OllamaProvider(remote=%s, model=%s)", resolved_url, cloud_model or "devstral-small-2:24b")
+        elif cloud_provider in ("runpod", "openai_compatible"):
             from .openai_compatible_provider import OpenAICompatibleProvider
 
-            if cloud_provider == "salad":
-                resolved_key = api_key or os.getenv("SALAD_API_KEY", "") or os.getenv("RUNPOD_API_KEY", "")
-                resolved_url = cloud_base_url or os.getenv("SALAD_URL", "") or os.getenv("CLOUD_URL", "")
-                prov_name = "salad"
-            else:
-                resolved_key = api_key or os.getenv("RUNPOD_API_KEY", "")
-                resolved_url = cloud_base_url or os.getenv("CLOUD_URL", "")
-                prov_name = "runpod"
+            resolved_key = api_key or os.getenv("RUNPOD_API_KEY", "")
+            resolved_url = cloud_base_url or os.getenv("CLOUD_URL", "")
             provider = OpenAICompatibleProvider(
                 api_key=resolved_key,
                 base_url=resolved_url,
-                default_model=cloud_model or "Qwen/Qwen2.5-Coder-32B-Instruct",
-                provider_name=prov_name,
+                default_model=cloud_model or "devstral-small-2:24b",
+                provider_name="runpod",
             )
-            logger.info("LLM provider: %s(OpenAI-compatible, model=%s)", prov_name, cloud_model)
+            logger.info("LLM provider: runpod(OpenAI-compatible, model=%s)", cloud_model or "devstral-small-2:24b")
         else:
             from .mistral_provider import MistralProvider
             resolved_key = api_key or os.getenv("MISTRAL_API_KEY", "")
@@ -205,16 +214,22 @@ def _build_hybrid(
         from .deepseek_provider import DeepSeekProvider
         resolved_key = api_key or os.getenv("DEEPSEEK_API_KEY", "")
         primary = DeepSeekProvider(api_key=resolved_key, default_model=cloud_model or "deepseek-chat")
-    elif cloud_provider in ("runpod", "openai_compatible", "salad"):
+    elif cloud_provider in ("salad", "ollama", "runpod", "openai_compatible"):
+        from .ollama_provider import OllamaProvider
+        resolved_key = api_key or os.getenv("OLLAMA_API_KEY", "") or os.getenv("SALAD_API_KEY", "")
+        resolved_url = cloud_base_url or os.getenv("OLLAMA_BASE_URL", "") or os.getenv("SALAD_URL", "") or os.getenv("CLOUD_URL", "")
+        primary = OllamaProvider(
+            model=cloud_model or "devstral-small-2:24b",
+            base_url=resolved_url or "https://kumquat-arugula-lrhfn9s87dmw86ut.salad.cloud",
+            api_key=resolved_key,
+            timeout_s=(int(os.getenv("OLLAMA_TIMEOUT_S") or 0) or None),
+            num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "65536")),
+        )
+    elif cloud_provider in ("runpod", "openai_compatible"):
         from .openai_compatible_provider import OpenAICompatibleProvider
-        if cloud_provider == "salad":
-            resolved_key = api_key or os.getenv("SALAD_API_KEY", "") or os.getenv("RUNPOD_API_KEY", "")
-            resolved_url = cloud_base_url or os.getenv("SALAD_URL", "") or os.getenv("CLOUD_URL", "")
-            prov_name = "salad"
-        else:
-            resolved_key = api_key or os.getenv("RUNPOD_API_KEY", "")
-            resolved_url = cloud_base_url or os.getenv("CLOUD_URL", "")
-            prov_name = "runpod"
+
+        resolved_key = api_key or os.getenv("RUNPOD_API_KEY", "")
+        resolved_url = cloud_base_url or os.getenv("CLOUD_URL", "")
 
         # Build list of all cloud URLs for racing
         all_urls = [resolved_url] if resolved_url else []
@@ -228,19 +243,19 @@ def _build_hybrid(
                 OpenAICompatibleProvider(
                     api_key=resolved_key,
                     base_url=url,
-                    default_model=cloud_model or "Qwen/Qwen2.5-Coder-32B-Instruct",
-                    provider_name=f"{prov_name}_{i}",
+                    default_model=cloud_model or "devstral-small-2:24b",
+                    provider_name=f"runpod_{i}",
                 )
                 for i, url in enumerate(all_urls)
             ]
-            primary = _RacePrimaryProvider(race_providers, label=f"{prov_name}_race")
-            logger.info("Hybrid primary: racing %d %s endpoints", len(all_urls), prov_name)
+            primary = _RacePrimaryProvider(race_providers, label="runpod_race")
+            logger.info("Hybrid primary: racing %d runpod endpoints", len(all_urls))
         else:
             primary = OpenAICompatibleProvider(
                 api_key=resolved_key,
                 base_url=resolved_url,
-                default_model=cloud_model or "Qwen/Qwen2.5-Coder-32B-Instruct",
-                provider_name=prov_name,
+                default_model=cloud_model or "devstral-small-2:24b",
+                provider_name="runpod",
             )
     elif cloud_provider == "local":
         from .ollama_provider import OllamaProvider
@@ -255,21 +270,26 @@ def _build_hybrid(
         from .deepseek_provider import DeepSeekProvider
         fallback_key = os.getenv("DEEPSEEK_API_KEY", "")
         fallback = DeepSeekProvider(api_key=fallback_key, default_model=fallback_model or "deepseek-chat")
-    elif fallback_provider in ("runpod", "openai_compatible", "salad"):
+    elif fallback_provider in ("salad", "ollama", "runpod", "openai_compatible"):
+        from .ollama_provider import OllamaProvider
+        fallback_key = os.getenv("OLLAMA_API_KEY", "") or os.getenv("SALAD_API_KEY", "")
+        fallback_url = os.getenv("OLLAMA_BASE_URL", "") or os.getenv("SALAD_URL", "") or os.getenv("CLOUD_URL", "")
+        fallback = OllamaProvider(
+            model=fallback_model or "devstral-small-2:24b",
+            base_url=fallback_url or "https://kumquat-arugula-lrhfn9s87dmw86ut.salad.cloud",
+            api_key=fallback_key,
+            timeout_s=(int(os.getenv("OLLAMA_TIMEOUT_S") or 0) or None),
+            num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "65536")),
+        )
+    elif fallback_provider in ("runpod", "openai_compatible"):
         from .openai_compatible_provider import OpenAICompatibleProvider
-        if fallback_provider == "salad":
-            fallback_key = os.getenv("SALAD_API_KEY", "") or os.getenv("RUNPOD_API_KEY", "")
-            fallback_url = os.getenv("SALAD_URL", "") or os.getenv("CLOUD_URL", "")
-            fb_prov_name = "salad"
-        else:
-            fallback_key = os.getenv("RUNPOD_API_KEY", "")
-            fallback_url = os.getenv("CLOUD_URL", "")
-            fb_prov_name = "runpod"
+        fallback_key = os.getenv("RUNPOD_API_KEY", "")
+        fallback_url = os.getenv("CLOUD_URL", "")
         fallback = OpenAICompatibleProvider(
             api_key=fallback_key,
             base_url=fallback_url,
-            default_model=fallback_model or "Qwen/Qwen2.5-Coder-32B-Instruct",
-            provider_name=fb_prov_name,
+            default_model=fallback_model or "devstral-small-2:24b",
+            provider_name="runpod",
         )
     elif fallback_provider == "local":
         from .ollama_provider import OllamaProvider

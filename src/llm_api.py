@@ -262,15 +262,69 @@ class OllamaProvider(LLMProvider):
         self,
         model: str = "qwen2.5-coder:7b-instruct-q4_K_M",
         base_url: str = "http://localhost:11434",
-        timeout: int = 300,
+        timeout: int = 600,
+        api_key: Optional[str] = None,
+        num_ctx: Optional[int] = 65536,
     ):
-        if not OLLAMA_AVAILABLE:
-            raise LLMAPIError("Ollama is not available. Install with: pip install ollama")
         self.model = model
-        self.base_url = base_url
-        self.timeout = timeout
-        self.client = ollama.Client(host=base_url, timeout=timeout)
-        logger.info(f"Ollama provider initialized with model: {model}, timeout: {timeout}s")
+        self.base_url = base_url.rstrip("/")
+        self.timeout = int(timeout)
+        self.api_key = api_key or os.getenv("OLLAMA_API_KEY") or os.getenv("SALAD_API_KEY", "")
+        self.num_ctx = int(num_ctx or os.getenv("OLLAMA_NUM_CTX", "65536"))
+        self._use_http = bool(self.api_key) or "salad.cloud" in self.base_url or not self.base_url.startswith(("http://localhost", "http://127.0.0.1"))
+        self.client = None
+        if not self._use_http:
+            if not OLLAMA_AVAILABLE:
+                raise LLMAPIError("Ollama is not available. Install with: pip install ollama")
+            self.client = ollama.Client(host=base_url, timeout=timeout)
+        logger.info(f"Ollama provider initialized with model: {model}, timeout: {timeout}s, http_mode={self._use_http}")
+
+    def _build_headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    @staticmethod
+    def _strip_think_tags(text: str) -> str:
+        content = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+        if '<think>' in content:
+            content = re.sub(r'<think>.*', '', content, flags=re.DOTALL).strip()
+        return content
+
+    def _chat_http(self, messages: list, model: str, temperature: float = 0.3, seed: Optional[int] = 42, timeout: Optional[int] = None) -> str:
+        base = self.base_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        endpoint = f"{base}/api/chat"
+        options = {
+            "temperature": temperature,
+            "num_ctx": self.num_ctx,
+        }
+        if seed is not None:
+            options["seed"] = seed
+        data: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": options,
+        }
+        try:
+            resp = requests.post(endpoint, headers=self._build_headers(), json=data, timeout=timeout or self.timeout)
+            resp.raise_for_status()
+            result = resp.json()
+            content = result["message"]["content"]
+            return self._strip_think_tags(content)
+        except requests.exceptions.HTTPError as e:
+            code = getattr(e.response, "status_code", None)
+            text = getattr(e.response, "text", "")
+            raise LLMAPIRequestError(f"HTTP {code}: {text}")
+        except requests.exceptions.Timeout:
+            raise LLMAPIRequestError(f"Request timeout after {timeout or self.timeout} seconds")
+        except requests.exceptions.RequestException as e:
+            raise LLMAPIRequestError(f"Request failed: {str(e)}")
+        except (KeyError, TypeError, ValueError) as e:
+            raise LLMAPIRequestError(f"Invalid Ollama response format: {str(e)}")
 
     @retry_on_failure(max_retries=3, delay=1.0, backoff=2.0)
     def generate(
@@ -286,24 +340,26 @@ class OllamaProvider(LLMProvider):
     ) -> str:
         model = model or self.model
         start = time.time()
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
         try:
-            resp = self.client.chat(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                options={
-                    "temperature": temperature,
-                    "top_k": top_k,
-                    "top_p": top_p,
-                    "seed": seed,
-                },
-            )
+            if self._use_http:
+                content = self._chat_http(messages, model=model, temperature=temperature, seed=seed, timeout=kwargs.get("timeout"))
+            else:
+                resp = self.client.chat(
+                    model=model,
+                    messages=messages,
+                    options={
+                        "temperature": temperature,
+                        "top_k": top_k,
+                        "top_p": top_p,
+                        "seed": seed,
+                    },
+                )
+                content = self._strip_think_tags(resp["message"]["content"])
             elapsed = time.time() - start
-            content = re.sub(r'<think>.*?</think>', '', resp["message"]["content"], flags=re.DOTALL).strip()
-            if '<think>' in content:
-                content = re.sub(r'<think>.*', '', content, flags=re.DOTALL).strip()
             logger.info(f"Ollama call successful. Model: {model}, Time: {elapsed:.2f}s")
             return content
         except Exception as e:
@@ -313,13 +369,17 @@ class OllamaProvider(LLMProvider):
         model = model or self.model
         start = time.time()
         try:
-            resp = self.client.chat(
-                model=model,
-                messages=messages,
-                options={"seed": seed},
-            )
+            if self._use_http:
+                resp_text = self._chat_http(messages, model=model, seed=seed, timeout=kwargs.get("timeout"))
+                content = resp_text
+            else:
+                resp = self.client.chat(
+                    model=model,
+                    messages=messages,
+                    options={"seed": seed},
+                )
+                content = self._strip_think_tags(resp["message"]["content"])
             elapsed = time.time() - start
-            content = re.sub(r'<think>.*?</think>', '', resp["message"]["content"], flags=re.DOTALL).strip()
             logger.info(f"Ollama multi-turn call successful. Model: {model}, Time: {elapsed:.2f}s")
             return content
         except Exception as e:
@@ -553,6 +613,8 @@ class RaceLLMProvider(LLMProvider):
 # Factory
 # =========================
 def get_llm_provider(model_name: str, api_key: Optional[str] = None) -> LLMProvider:
+    backend_hint = (os.getenv("LLM_BACKEND") or os.getenv("FRAMEWORK_LLM_PROVIDER") or "").strip().lower()
+
     # Mistral models
     if model_name.startswith("codestral-") or model_name == "codestral-latest" or model_name.startswith("mistral-"):
         return MistralAPIProvider(api_key=api_key)
@@ -563,17 +625,34 @@ def get_llm_provider(model_name: str, api_key: Optional[str] = None) -> LLMProvi
     runpod_url = os.getenv("CLOUD_URL")
     if runpod_url:
         runpod_key = api_key or os.getenv("RUNPOD_API_KEY", "ollama")
+        ollama_timeout = int(os.getenv("LLM_REQUEST_TIMEOUT_S", os.getenv("AUTOFIX_LLM_TIMEOUT_S", "600")))
+        ollama_num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "65536"))
+        if backend_hint == "ollama" or "salad.cloud" in runpod_url:
+            return OllamaProvider(base_url=runpod_url, api_key=runpod_key, model=model_name, timeout=ollama_timeout, num_ctx=ollama_num_ctx)
+
+        if "salad.cloud" in runpod_url:
+            # Check for secondary cloud URLs for parallel race
+            cloud_urls_raw = os.getenv("CLOUD_URLS", "")  # comma-separated
+            extra_urls = [u.strip().rstrip("/") for u in cloud_urls_raw.split(",") if u.strip()]
+            if extra_urls:
+                providers = [
+                    OllamaProvider(base_url=runpod_url, api_key=runpod_key, model=model_name, timeout=ollama_timeout, num_ctx=ollama_num_ctx)
+                ]
+                for url in extra_urls:
+                    providers.append(OllamaProvider(base_url=url, api_key=runpod_key, model=model_name, timeout=ollama_timeout, num_ctx=ollama_num_ctx))
+                logger.info(f"Building RaceLLMProvider with {len(providers)} Ollama endpoints")
+                return RaceLLMProvider(providers, label="cloud_race")
+            return OllamaProvider(base_url=runpod_url, api_key=runpod_key, model=model_name, timeout=ollama_timeout, num_ctx=ollama_num_ctx)
         # Check for secondary cloud URLs for parallel race
         cloud_urls_raw = os.getenv("CLOUD_URLS", "")  # comma-separated
         extra_urls = [u.strip().rstrip("/") for u in cloud_urls_raw.split(",") if u.strip()]
         if extra_urls:
-            providers = [OpenAICompatibleProvider(base_url=runpod_url, api_key=runpod_key, model=model_name)]
+            providers = [OllamaProvider(base_url=runpod_url, api_key=runpod_key, model=model_name, timeout=ollama_timeout, num_ctx=ollama_num_ctx)]
             for url in extra_urls:
-                # Each extra endpoint uses the same API key (SaladCloud)
-                providers.append(OpenAICompatibleProvider(base_url=url, api_key=runpod_key, model=model_name))
+                providers.append(OllamaProvider(base_url=url, api_key=runpod_key, model=model_name, timeout=ollama_timeout, num_ctx=ollama_num_ctx))
             logger.info(f"Building RaceLLMProvider with {len(providers)} endpoints")
             return RaceLLMProvider(providers, label="cloud_race")
-        return OpenAICompatibleProvider(base_url=runpod_url, api_key=runpod_key, model=model_name)
+        return OllamaProvider(base_url=runpod_url, api_key=runpod_key, model=model_name, timeout=ollama_timeout, num_ctx=ollama_num_ctx)
     # Default: local Ollama
     return OllamaProvider(model=model_name)
 
@@ -637,7 +716,7 @@ class HybridLLMProvider:
                 if cloud_model.startswith("deepseek-"):
                     resolved_type = "deepseek"
                 elif os.getenv("CLOUD_URL"):
-                    resolved_type = "runpod"
+                    resolved_type = "salad" if "salad.cloud" in os.getenv("CLOUD_URL", "") else "runpod"
                 else:
                     resolved_type = "mistral"
 
@@ -645,13 +724,17 @@ class HybridLLMProvider:
                 deepseek_key = api_key or os.getenv("DEEPSEEK_API_KEY")
                 self.cloud_provider = DeepSeekProvider(api_key=deepseek_key)
                 logger.info(f"☁️ Cloud provider: DeepSeek ({cloud_model})")
-            elif resolved_type in ("runpod", "openai_compatible"):
+            elif resolved_type in ("runpod", "openai_compatible", "salad", "ollama"):
                 runpod_url = os.getenv("CLOUD_URL", "")
                 runpod_key = api_key or os.getenv("RUNPOD_API_KEY", "ollama")
-                self.cloud_provider = OpenAICompatibleProvider(
-                    base_url=runpod_url, api_key=runpod_key, model=cloud_model
+                self.cloud_provider = OllamaProvider(
+                    base_url=runpod_url,
+                    api_key=runpod_key,
+                    model=cloud_model,
+                    timeout=int(os.getenv("LLM_REQUEST_TIMEOUT_S", os.getenv("AUTOFIX_LLM_TIMEOUT_S", "600"))),
+                    num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "65536")),
                 )
-                logger.info(f"☁️ Cloud provider: RunPod/OpenAI-compat ({cloud_model}) → {runpod_url}")
+                logger.info(f"☁️ Cloud provider: Ollama ({cloud_model}) → {runpod_url}")
             else:
                 self.cloud_provider = MistralAPIProvider(api_key=api_key)
                 logger.info(f"☁️ Cloud provider: Mistral ({cloud_model})")

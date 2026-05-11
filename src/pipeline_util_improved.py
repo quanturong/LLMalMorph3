@@ -32,8 +32,8 @@ def get_llm_name_from_input(llm_input: str) -> str:
         "deepseek_33b": "deepseek-coder:33b-instruct",
         "deepseek_v2_16b": "deepseek-coder-v2:16b-lite-instruct-q4_0",
         "starcoder2": "starcoder2:instruct",
-        "codestral": "codestral-latest",
-        "codestral-2508": "codestral-2508",
+        "codestral": "devstral-small-2:24b",
+        "codestral-2508": "devstral-small-2:24b",
         "codellama_7b": "codellama:7b-instruct",
         "codegemma_7b": "codegemma:7b-instruct",
         "codellama_13b": "codellama:13b-instruct",
@@ -201,8 +201,8 @@ def run_llm(
     provider = get_llm_provider(llm_name, api_key=api_key)
     
     # Normalize model name
-    if llm_name.startswith("codestral-") or llm_name == "codestral-latest":
-        model = llm_name.replace(":", "-")
+    if llm_name.startswith("codestral-") or llm_name == "codestral-latest" or llm_name.startswith("mistral-"):
+        model = os.getenv("OLLAMA_MODEL", os.getenv("LLM_CLOUD_MODEL", "devstral-small-2:24b"))
     else:
         model = llm_name
     
@@ -274,7 +274,7 @@ def run_experiment_trial(
     """
     try:
         # Determine if we should use warmup (only for Ollama)
-        use_warmup = not (llm.startswith("codestral-") or llm == "codestral-latest")
+        use_warmup = True
         
         llm_response, model_response_time = run_llm(
             llm,

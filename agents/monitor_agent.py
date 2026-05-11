@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Set
@@ -33,6 +34,8 @@ from contracts.messages import (
     JobClosedEvent,
     JobCreatedEvent,
     JobFailedEvent,
+    SamplePreparedEvent,
+    VariantGeneratedEvent,
 )
 from workflows.state_machine import JobStateMachine
 
@@ -44,6 +47,17 @@ _STUCK_JOB_TIMEOUT_S = 600  # 10 minutes without progress → stuck
 _LONG_RUNNING_TIMEOUT_S = 1800  # 30 min for MUTATING / BUILD_VALIDATING
 _LONG_RUNNING_STATES = frozenset({"MUTATING", "BUILD_VALIDATING", "EXECUTION_MONITORING"})
 _STUCK_CHECK_INTERVAL_S = 60
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        logger.warning("invalid_int_env", name=name, value=os.environ.get(name), default=default)
+        return default
+
+
+_MAX_BUILD_RETRIES = _int_env("MAX_BUILD_RETRIES", 2)
 
 
 class MonitorAgent(BaseAgent):
@@ -74,7 +88,8 @@ class MonitorAgent(BaseAgent):
         super().__init__(ctx)
         self._sm = JobStateMachine()
         self._output_base_dir = output_base_dir or ctx.work_dir
-        self._stuck_timeout_s = stuck_timeout_s
+        # If configured timeout is non-positive, disable stuck-job detection
+        self._stuck_timeout_s = stuck_timeout_s if stuck_timeout_s and stuck_timeout_s > 0 else None
 
         # Track last event time per job
         self._job_last_event: Dict[str, float] = {}
@@ -206,30 +221,31 @@ class MonitorAgent(BaseAgent):
                            error=data.get("error_code"))
 
         elif "auto_fix_attempts" in data and "compiled_artifact_id" not in data:
-            # BuildFailedEvent — auto-fix exhausted, close the job immediately
-            # (Bug #19: no agent has BUILD_FAILED in activates_on, so we must
-            #  handle it here to prevent the pipeline from hanging.)
+            # BuildFailedEvent - auto-fix exhausted for this build attempt.
+            # Re-arm the build stage a small number of times before making the
+            # job terminal, otherwise transient compiler/worker failures become
+            # unrecoverable FAILED rows.
             self._job_last_status[job_id] = "BUILD_FAILED"
             auto_fix = data.get("auto_fix_attempts", 0)
-            logger.warning("build_failed_closing_job", job_id=job_id,
+            logger.warning("build_failed_observed", job_id=job_id,
                            auto_fix_attempts=auto_fix)
             if self._ctx.state_store:
                 state = await self._ctx.state_store.get(job_id)
                 if state and not state.current_status.is_terminal():
-                    try:
-                        self._sm.transition(state, JobStatus.FAILED, "MonitorAgent")
-                        await self._ctx.state_store.save(state)
-                    except Exception:
-                        pass  # state may already be terminal
-            fail_evt = JobFailedEvent(
-                job_id=job_id,
-                sample_id=data.get("sample_id", ""),
-                correlation_id=data.get("correlation_id", ""),
-                failure_stage="BUILD_VALIDATION",
-                error_message=data.get("error_message", "Build failed after auto-fix exhausted")[:500],
-            )
-            await self._ctx.broker.publish(Topic.EVENTS_ALL, fail_evt)
-            self._active_jobs.discard(job_id)
+                    error_message = data.get(
+                        "error_message",
+                        "Build failed after auto-fix exhausted",
+                    )
+                    state.add_error(
+                        "BuildValidationAgent",
+                        "BUILD_FAILED",
+                        error_message[:1000],
+                        state.build_retry_count < _MAX_BUILD_RETRIES,
+                    )
+                    recovered = await self._retry_build_failed_job(state, data)
+                    if recovered:
+                        return
+                    await self._close_build_failed_job(state, data)
 
         else:
             # Progress event — update status tracking
@@ -322,13 +338,17 @@ class MonitorAgent(BaseAgent):
                         self._active_jobs.discard(job_id)
                         continue
 
-            # Use longer timeout for long-running states
-            timeout = (_LONG_RUNNING_TIMEOUT_S
-                       if actual_status in _LONG_RUNNING_STATES
-                       else self._stuck_timeout_s)
+                # If stuck-job detection disabled, skip
+                if not self._stuck_timeout_s:
+                    continue
 
-            if idle_s > timeout:
-                stuck_jobs.append(job_id)
+                # Use longer timeout for long-running states
+                timeout = (_LONG_RUNNING_TIMEOUT_S
+                           if actual_status in _LONG_RUNNING_STATES
+                           else self._stuck_timeout_s)
+
+                if idle_s > timeout:
+                    stuck_jobs.append(job_id)
 
         for job_id in stuck_jobs:
             actual = self._job_last_status.get(job_id, "unknown")
@@ -353,6 +373,20 @@ class MonitorAgent(BaseAgent):
         status = state.current_status
         logger.info("attempting_recovery", job_id=job_id, status=status.value)
 
+        if status == JobStatus.MUTATING:
+            recovered = await self._recover_stuck_mutating_job(state)
+            if recovered:
+                self._job_last_event[job_id] = time.monotonic()
+                self._job_last_status[job_id] = JobStatus.SAMPLE_READY.value
+                return
+
+        if status == JobStatus.VARIANT_READY:
+            recovered = await self._recover_stuck_variant_ready_job(state)
+            if recovered:
+                self._job_last_event[job_id] = time.monotonic()
+                self._job_last_status[job_id] = JobStatus.VARIANT_READY.value
+                return
+
         # If job is stuck in a "doing" state, escalate
         # If stuck in a "ready" state, the agent that should claim it might be dead
         if state.retry_count >= 5:
@@ -370,6 +404,257 @@ class MonitorAgent(BaseAgent):
         else:
             # Reset the tracking timer to give agents more time
             self._job_last_event[job_id] = time.monotonic()
+
+    async def _retry_build_failed_job(self, state: JobState, data: dict) -> bool:
+        """Requeue a failed build from the latest variant artifact."""
+        if state.build_retry_count >= _MAX_BUILD_RETRIES:
+            logger.warning(
+                "build_retry_exhausted",
+                job_id=state.job_id,
+                build_retry_count=state.build_retry_count,
+                max_build_retries=_MAX_BUILD_RETRIES,
+            )
+            return False
+
+        variant_artifact_id = state.variant_artifact_id or self._latest_artifact_for_job(
+            state.job_id,
+            "variant_source",
+        )
+        if not variant_artifact_id:
+            logger.warning("build_retry_missing_variant_artifact", job_id=state.job_id)
+            return False
+
+        payload = None
+        if self._ctx.artifact_store:
+            payload = await self._ctx.artifact_store.get_json(variant_artifact_id)
+
+        source_artifact_id = (
+            state.source_artifact_id
+            or (payload or {}).get("source_artifact_id")
+            or self._latest_artifact_for_job(state.job_id, "source_parse_result")
+        )
+        mutation_artifact_id = (
+            state.mutation_artifact_id
+            or (payload or {}).get("mutation_artifact_id")
+            or self._latest_artifact_for_job(state.job_id, "mutation_result")
+        )
+        if not source_artifact_id or not mutation_artifact_id:
+            logger.warning(
+                "build_retry_missing_parent_artifacts",
+                job_id=state.job_id,
+                source_artifact_id=source_artifact_id,
+                mutation_artifact_id=mutation_artifact_id,
+            )
+            return False
+
+        state.build_retry_count += 1
+        state.source_artifact_id = source_artifact_id
+        state.mutation_artifact_id = mutation_artifact_id
+        state.variant_artifact_id = variant_artifact_id
+        state.compiled_artifact_id = None
+        state.agent_in_charge = None
+        state.transition_to(
+            JobStatus.VARIANT_READY,
+            triggered_by="MonitorAgent",
+            reason=f"retry build after BUILD_FAILED ({state.build_retry_count}/{_MAX_BUILD_RETRIES})",
+        )
+        await self._ctx.state_store.save(state)
+
+        event = VariantGeneratedEvent(
+            job_id=state.job_id,
+            sample_id=state.sample_id,
+            correlation_id=state.correlation_id,
+            variant_artifact_id=variant_artifact_id,
+            source_artifact_id=source_artifact_id,
+            mutation_artifact_id=mutation_artifact_id,
+            project_name=(payload or {}).get("project_name", state.project_name),
+            language=(payload or {}).get("language", state.language),
+            num_files_generated=int((payload or {}).get("num_files_generated", 0) or 0),
+        )
+        await self._ctx.broker.publish(Topic.EVENTS_ALL, event)
+        self._job_last_event[state.job_id] = time.monotonic()
+        self._job_last_status[state.job_id] = JobStatus.VARIANT_READY.value
+        logger.info(
+            "build_retry_requeued",
+            job_id=state.job_id,
+            build_retry_count=state.build_retry_count,
+            variant_artifact_id=variant_artifact_id,
+        )
+        return True
+
+    async def _recover_stuck_variant_ready_job(self, state: JobState) -> bool:
+        """Re-publish VariantGeneratedEvent for a VARIANT_READY job.
+
+        BuildValidationAgent self-activates from VariantGeneratedEvent. If the
+        event is lost after the state reaches VARIANT_READY, the job can sit in
+        ready state forever. This recovery reconstructs the event from the
+        persisted state and latest artifacts.
+        """
+        variant_artifact_id = state.variant_artifact_id or self._latest_artifact_for_job(
+            state.job_id,
+            "variant_source",
+        )
+        if not variant_artifact_id:
+            logger.warning("variant_ready_recovery_missing_variant_artifact", job_id=state.job_id)
+            return False
+
+        payload = None
+        if self._ctx.artifact_store:
+            payload = await self._ctx.artifact_store.get_json(variant_artifact_id)
+
+        source_artifact_id = (
+            state.source_artifact_id
+            or (payload or {}).get("source_artifact_id")
+            or self._latest_artifact_for_job(state.job_id, "source_parse_result")
+        )
+        mutation_artifact_id = (
+            state.mutation_artifact_id
+            or (payload or {}).get("mutation_artifact_id")
+            or self._latest_artifact_for_job(state.job_id, "mutation_result")
+        )
+        if not source_artifact_id or not mutation_artifact_id:
+            logger.warning(
+                "variant_ready_recovery_missing_parent_artifacts",
+                job_id=state.job_id,
+                source_artifact_id=source_artifact_id,
+                mutation_artifact_id=mutation_artifact_id,
+            )
+            return False
+
+        state.source_artifact_id = source_artifact_id
+        state.mutation_artifact_id = mutation_artifact_id
+        state.variant_artifact_id = variant_artifact_id
+        state.agent_in_charge = None
+        await self._ctx.state_store.save(state)
+
+        event = VariantGeneratedEvent(
+            job_id=state.job_id,
+            sample_id=state.sample_id,
+            correlation_id=state.correlation_id,
+            variant_artifact_id=variant_artifact_id,
+            source_artifact_id=source_artifact_id,
+            mutation_artifact_id=mutation_artifact_id,
+            project_name=(payload or {}).get("project_name", state.project_name),
+            language=(payload or {}).get("language", state.language),
+            num_files_generated=int((payload or {}).get("num_files_generated", 0) or 0),
+        )
+        await self._ctx.broker.publish(Topic.EVENTS_ALL, event)
+        logger.info(
+            "variant_ready_recovery_republished",
+            job_id=state.job_id,
+            variant_artifact_id=variant_artifact_id,
+        )
+        return True
+
+    async def _close_build_failed_job(self, state: JobState, data: dict) -> None:
+        error_message = data.get(
+            "error_message",
+            "Build failed after auto-fix exhausted",
+        )
+        try:
+            if not state.current_status.is_terminal():
+                self._sm.transition(
+                    state,
+                    JobStatus.FAILED,
+                    "MonitorAgent",
+                    reason="build failed after retries exhausted",
+                )
+            await self._ctx.state_store.save(state)
+        except Exception:
+            pass
+
+        fail_evt = JobFailedEvent(
+            job_id=state.job_id,
+            sample_id=data.get("sample_id", state.sample_id),
+            correlation_id=data.get("correlation_id", state.correlation_id),
+            failure_stage="BUILD_VALIDATION",
+            error_message=error_message[:500],
+        )
+        await self._ctx.broker.publish(Topic.EVENTS_ALL, fail_evt)
+        self._active_jobs.discard(state.job_id)
+        self._job_last_status[state.job_id] = JobStatus.FAILED.value
+
+    async def _recover_stuck_mutating_job(self, state: JobState) -> bool:
+        """Re-arm a MUTATING job whose activation event was lost after claim.
+
+        MutationAgent self-activates from SamplePreparedEvent only when the DB
+        status is SAMPLE_READY. If the previous event was consumed after CAS
+        moved the job to MUTATING, republishing alone is not enough: the claim
+        would fail. We persist the source artifact, move the job back to the
+        ready state, then publish a fresh SamplePreparedEvent.
+        """
+        source_artifact_id = state.source_artifact_id
+        if not source_artifact_id:
+            source_artifact_id = self._latest_source_artifact_for_job(state.job_id)
+            if source_artifact_id:
+                state.source_artifact_id = source_artifact_id
+
+        if not source_artifact_id:
+            logger.warning("mutating_recovery_missing_source_artifact",
+                           job_id=state.job_id)
+            return False
+
+        payload = None
+        if self._ctx.artifact_store:
+            payload = await self._ctx.artifact_store.get_json(source_artifact_id)
+
+        num_source_files = 0
+        num_functions_selected = 0
+        if payload:
+            num_source_files = len(payload.get("source_files", []))
+            num_functions_selected = len(payload.get("functions", []))
+            state.project_name = payload.get("project_name", state.project_name)
+            state.language = payload.get("language", state.language)
+
+        # Use transition_to directly here: MUTATING -> SAMPLE_READY is a
+        # recovery rewind, not a normal workflow transition.
+        state.transition_to(
+            JobStatus.SAMPLE_READY,
+            triggered_by="MonitorAgent",
+            reason="recovery rewind for stuck MUTATING job",
+        )
+        state.agent_in_charge = None
+        await self._ctx.state_store.save(state)
+
+        event = SamplePreparedEvent(
+            job_id=state.job_id,
+            sample_id=state.sample_id,
+            correlation_id=state.correlation_id,
+            source_artifact_id=source_artifact_id,
+            requested_strategies=state.requested_strategies,
+            num_source_files=num_source_files,
+            num_functions_selected=num_functions_selected,
+            language=state.language,
+            project_name=state.project_name,
+        )
+        await self._ctx.broker.publish(Topic.EVENTS_ALL, event)
+        logger.info("mutating_recovery_republished_sample_ready",
+                    job_id=state.job_id,
+                    source_artifact_id=source_artifact_id,
+                    functions=num_functions_selected)
+        return True
+
+    def _latest_source_artifact_for_job(self, job_id: str) -> str:
+        return self._latest_artifact_for_job(job_id, "source_parse_result")
+
+    def _latest_artifact_for_job(self, job_id: str, artifact_type: str) -> str:
+        if not self._ctx.artifact_store:
+            return ""
+        try:
+            artifacts = self._ctx.artifact_store.list_for_job(job_id)
+        except Exception as exc:
+            logger.warning("artifact_lookup_failed",
+                           job_id=job_id, artifact_type=artifact_type, error=str(exc))
+            return ""
+
+        matching = [
+            a for a in artifacts
+            if a.get("type") == artifact_type
+        ]
+        if not matching:
+            return ""
+        matching.sort(key=lambda a: a.get("created_at", ""))
+        return str(matching[-1].get("artifact_id", ""))
 
     # ──────────────────────────────────────────────────────────────────────
     # Query helpers

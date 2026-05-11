@@ -153,11 +153,22 @@ class SamplePrepAgent(BaseAgent):
         if self._ctx.artifact_store:
             artifact_id = await self._ctx.artifact_store.store_json(
                 job_id=job_id,
+                sample_id=data["sample_id"],
                 artifact_type="source_parse_result",
                 data=source_payload,
             )
         else:
             artifact_id = f"source_{job_id[:8]}"
+
+        if self._ctx.state_store:
+            state = await self._ctx.state_store.get(job_id)
+            if state:
+                state.source_artifact_id = artifact_id
+                state.project_name = target_project.name
+                state.language = language
+                state.requested_strategies = requested_strategies
+                state.num_functions = int(num_functions or 0)
+                await self._ctx.state_store.save(state)
 
         # ── 5. Emit event ─────────────────────────────────────────────────
         event = SamplePreparedEvent(

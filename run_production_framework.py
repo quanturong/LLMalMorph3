@@ -140,7 +140,7 @@ def _resolve_config(config: dict[str, Any], root: Path) -> dict[str, Any]:
 
     llm_cfg.setdefault("enabled", False)
     llm_cfg.setdefault("mode", os.getenv("FRAMEWORK_LLM_MODE", "mistral"))
-    llm_cfg.setdefault("cloud_provider", os.getenv("FRAMEWORK_LLM_PROVIDER", "mistral"))
+    llm_cfg.setdefault("cloud_provider", os.getenv("FRAMEWORK_LLM_PROVIDER", "ollama"))
     llm_cfg.setdefault("cache_ttl_s", 3600)
 
     runtime["timestamp"] = timestamp
@@ -198,15 +198,11 @@ async def _build_llm_provider(cfg: dict[str, Any], redis_client):
 
     if mode == "deepseek" and not api_key:
         raise ValueError("DEEPSEEK_API_KEY is required when llm.enabled=true and llm.mode=deepseek")
-    if cloud_provider in ("runpod", "openai_compatible", "salad") and not api_key:
-        # Allow "none" or "dummy" for Ollama endpoints that don't need auth
-        raise ValueError(f"{cloud_provider.upper()} API key is required when llm.cloud_provider={cloud_provider}. "
-                         f"Use api_key='none' for endpoints without authentication.")
-    if cloud_provider in ("runpod", "openai_compatible", "salad") and not (
-        cloud_base_url or os.getenv("CLOUD_URL", "") or os.getenv("SALAD_URL", "")
+    if cloud_provider in ("runpod", "openai_compatible", "salad", "ollama") and not (
+        cloud_base_url or os.getenv("CLOUD_URL", "") or os.getenv("SALAD_URL", "") or os.getenv("OLLAMA_BASE_URL", "")
     ):
         raise ValueError("CLOUD_URL (or llm.cloud_base_url) is required when llm.cloud_provider={cloud_provider}")
-    if mode in ("mistral", "cloud_only") and cloud_provider != "deepseek" and not api_key:
+    if mode in ("mistral", "cloud_only") and cloud_provider not in ("deepseek", "runpod", "openai_compatible", "salad", "ollama") and not api_key:
         raise ValueError("MISTRAL_API_KEY is required when llm.enabled=true and llm.mode uses mistral/cloud_only")
     if cloud_provider == "azure" and not api_key:
         raise ValueError("AZURE_OPENAI_API_KEY is required when llm.cloud_provider=azure")
@@ -216,12 +212,12 @@ async def _build_llm_provider(cfg: dict[str, Any], redis_client):
         redis_client=redis_client,
         cache_ttl_s=int(llm_cfg.get("cache_ttl_s", 3600)),
         local_model=llm_cfg.get("local_model", "qwen2.5-coder:7b-instruct-q4_K_M"),
-        cloud_model=llm_cfg.get("cloud_model"),
+        cloud_model=llm_cfg.get("cloud_model", "devstral-small-2:24b"),
         cloud_base_url=cloud_base_url,
         api_key=api_key,
         cloud_provider=cloud_provider,
         fallback_provider=llm_cfg.get("fallback_provider", "deepseek"),
-        fallback_model=llm_cfg.get("fallback_model", "deepseek-chat"),
+        fallback_model=llm_cfg.get("fallback_model", llm_cfg.get("cloud_model", "devstral-small-2:24b")),
         cloud_extra_urls=llm_cfg.get("cloud_extra_urls", []),
     )
 
@@ -248,9 +244,19 @@ def _export_llm_env_vars(cfg: dict[str, Any]) -> None:
     cloud_base_url = llm_cfg.get("cloud_base_url", "")
     api_key = llm_cfg.get("api_key", "")
     cloud_provider = llm_cfg.get("cloud_provider", "")
+    ollama_timeout_s = int(llm_cfg.get("ollama_timeout_s", 600))
+    ollama_num_ctx = int(llm_cfg.get("ollama_num_ctx", 65536))
+    backend_name = "ollama" if cloud_provider in ("runpod", "openai_compatible", "salad", "ollama") else cloud_provider
 
-    if cloud_base_url and not os.environ.get("RUNPOD_BASE_URL"):
-        os.environ["RUNPOD_BASE_URL"] = cloud_base_url
+    if cloud_base_url:
+        if not os.environ.get("RUNPOD_BASE_URL"):
+            os.environ["RUNPOD_BASE_URL"] = cloud_base_url
+        if not os.environ.get("CLOUD_URL"):
+            os.environ["CLOUD_URL"] = cloud_base_url
+        if not os.environ.get("OLLAMA_BASE_URL"):
+            os.environ["OLLAMA_BASE_URL"] = cloud_base_url
+        if not os.environ.get("LLM_BACKEND"):
+            os.environ["LLM_BACKEND"] = backend_name or "ollama"
 
     if api_key and cloud_provider in ("runpod", "openai_compatible") and not os.environ.get("RUNPOD_API_KEY"):
         os.environ["RUNPOD_API_KEY"] = api_key
@@ -261,12 +267,16 @@ def _export_llm_env_vars(cfg: dict[str, Any]) -> None:
         # Also set RUNPOD env vars for legacy code paths that check them
         if not os.environ.get("RUNPOD_API_KEY"):
             os.environ["RUNPOD_API_KEY"] = api_key
+        if not os.environ.get("OLLAMA_API_KEY"):
+            os.environ["OLLAMA_API_KEY"] = api_key
 
-    if cloud_base_url and cloud_provider in ("salad",) and not os.environ.get("CLOUD_URL"):
+    if cloud_base_url and cloud_provider == "salad" and not os.environ.get("SALAD_URL"):
+        os.environ["SALAD_URL"] = cloud_base_url
+    # RunPod/OpenAI-compatible/Ollama: ALWAYS override the backend hints when configured.
+    if cloud_base_url and cloud_provider in ("runpod", "openai_compatible", "ollama"):
         os.environ["CLOUD_URL"] = cloud_base_url
-    # RunPod/OpenAI-compatible: ALWAYS override CLOUD_URL (may be stale from .env)
-    if cloud_base_url and cloud_provider in ("runpod", "openai_compatible"):
-        os.environ["CLOUD_URL"] = cloud_base_url
+        os.environ["OLLAMA_BASE_URL"] = cloud_base_url
+        os.environ["LLM_BACKEND"] = "ollama"
 
     # Export the cloud model name so the auto-fixer uses the correct model
     cloud_model = llm_cfg.get("cloud_model", "")
@@ -274,13 +284,23 @@ def _export_llm_env_vars(cfg: dict[str, Any]) -> None:
         os.environ["LLM_CLOUD_MODEL"] = cloud_model
         os.environ["CLOUD_MODEL"] = cloud_model
     fixer_model = llm_cfg.get("fixer_model", "") or cloud_model
-    if fixer_model and cloud_provider in ("runpod", "openai_compatible"):
+    if fixer_model and not os.environ.get("FIXER_MODEL"):
         os.environ["FIXER_MODEL"] = fixer_model
-    # DeepSeek: export FIXER_MODEL so src/llm_api.py auto-fixer routes to DeepSeek
-    if fixer_model and cloud_provider == "deepseek":
-        os.environ["FIXER_MODEL"] = fixer_model
-        if not os.environ.get("DEEPSEEK_API_KEY") and llm_cfg.get("api_key"):
-            os.environ["DEEPSEEK_API_KEY"] = llm_cfg["api_key"]
+    if cloud_provider == "deepseek" and not os.environ.get("DEEPSEEK_API_KEY") and llm_cfg.get("api_key"):
+        os.environ["DEEPSEEK_API_KEY"] = llm_cfg["api_key"]
+
+    # Only export explicit LLM timeout env vars when a positive timeout is configured.
+    # Setting timeout to 0 or a non-positive value in config disables exporting these env vars
+    # so downstream code can decide its own defaults or behave without a hard 600s client timeout.
+    if ollama_timeout_s > 0:
+        if not os.environ.get("OLLAMA_TIMEOUT_S"):
+            os.environ["OLLAMA_TIMEOUT_S"] = str(ollama_timeout_s)
+        if not os.environ.get("LLM_REQUEST_TIMEOUT_S"):
+            os.environ["LLM_REQUEST_TIMEOUT_S"] = str(ollama_timeout_s)
+        if not os.environ.get("AUTOFIX_LLM_TIMEOUT_S"):
+            os.environ["AUTOFIX_LLM_TIMEOUT_S"] = str(ollama_timeout_s)
+    if not os.environ.get("OLLAMA_NUM_CTX"):
+        os.environ["OLLAMA_NUM_CTX"] = str(ollama_num_ctx)
 
     # Parallel race: export extra cloud URLs for RaceLLMProvider
     extra_urls = llm_cfg.get("cloud_extra_urls", [])
@@ -365,7 +385,9 @@ async def run_production(config_path: Path, dry_run: bool = False) -> int:
     # - MonitorAgent: passive health monitor + job submission (replaces CoordinatorAgent)
     # - All worker agents: self-activating via EVENTS_ALL subscription
     # - No central routing — agents claim jobs via atomic CAS
-    monitor = MonitorAgent(ctx)
+    # Allow disabling or overriding the stuck-job detection timeout via config
+    stuck_timeout = float(cfg["runtime"].get("stuck_job_timeout_s", 600))
+    monitor = MonitorAgent(ctx, stuck_timeout_s=stuck_timeout)
     agents = [
         monitor,
         SamplePrepAgent(ctx),

@@ -794,6 +794,8 @@ _strategy_prompt_base = {
         "- NEVER use 'static' keyword on local variables that call functions (e.g. `static X p = GetProcAddress(...)` is INVALID in C).\n"
         "- NEVER create a local variable with the same name as a Windows API. Use opaque names like _p0, _p1 instead.\n"
         "- NEVER encode #define constants (e.g. CSIDL_INTERNET_CACHE is a compile-time constant, not a string).\n"
+        "- NEVER wrap generated stack strings in an extra `{ ... }` block if they are used later; the variable goes out of scope.\n"
+        "- Declare generated `_s0`, `_s1`, etc. in the same lexical scope as every use, before the first use.\n"
         "- Variable names must NOT collide with existing variables. Use _s0, _s1, _s2, etc.\n\n"
         "CORRECT PATTERN (stack-built strings — preferred, heuristic-safe):\n"
         "```\n"

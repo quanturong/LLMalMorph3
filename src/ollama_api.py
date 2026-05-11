@@ -1,84 +1,65 @@
-import os
-import requests
 import json
+import os
 
-# Try to import ollama for backward compatibility
-try:
-    import ollama
-    from openai import OpenAI
-    OLLAMA_AVAILABLE = True
-except ImportError:
-    OLLAMA_AVAILABLE = False
+import requests
 
-API_KEY = os.getenv("MISTRAL_API_KEY")  # lấy từ biến môi trường
-BASE_URL = "https://api.mistral.ai/v1/chat/completions"
 
-def ollama_chat_api(model_name, system_prompt, user_prompt, seed=42):
-    """
-    Gọi Mistral API (Codestral) thay cho Ollama local.
-    Maintains backward compatibility with existing code.
-    """
-    
-    print("=>=>=> Using Mistral API (model:", model_name, ", seed:", seed, ")")
+DEFAULT_OLLAMA_BASE_URL = os.getenv(
+    "OLLAMA_BASE_URL",
+    os.getenv("CLOUD_URL", "https://qxdhstvip7o8az-11434.proxy.runpod.net/"),
+).rstrip("/")
+DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", os.getenv("LLM_CLOUD_MODEL", "devstral-small-2:24b"))
+DEFAULT_OLLAMA_TIMEOUT_S = int(os.getenv("OLLAMA_TIMEOUT_S", os.getenv("LLM_REQUEST_TIMEOUT_S", "600")))
+DEFAULT_OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "65536"))
 
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
 
-    data = {
-        "model": model_name,
+def _resolve_model_name(model_name):
+    if not model_name:
+        return DEFAULT_OLLAMA_MODEL
+    lowered = model_name.lower()
+    if lowered.startswith(("codestral", "mistral")):
+        return DEFAULT_OLLAMA_MODEL
+    return model_name
+
+
+def _build_endpoint(base_url=None):
+    base = (base_url or DEFAULT_OLLAMA_BASE_URL).rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return f"{base}/api/chat"
+
+
+def ollama_chat_api(model_name, system_prompt, user_prompt, seed=42, base_url=None, timeout=None, num_ctx=None):
+    """Call Ollama chat directly and return the assistant text content."""
+    payload = {
+        "model": _resolve_model_name(model_name),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.7,
-        "top_p": 0.9,
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "num_ctx": int(num_ctx or DEFAULT_OLLAMA_NUM_CTX),
+        },
     }
 
-    response = requests.post(BASE_URL, headers=headers, data=json.dumps(data))
-
-    if response.status_code != 200:
-        raise Exception(f"API call failed: {response.status_code}, {response.text}")
-
-    result = response.json()
-    return result["choices"][0]["message"]["content"]
+    endpoint = _build_endpoint(base_url)
+    response = requests.post(endpoint, json=payload, timeout=timeout or DEFAULT_OLLAMA_TIMEOUT_S)
+    response.raise_for_status()
+    return response.json()["message"]["content"]
 
 
 def ollama_generate_api(model_name, prompt):
-    """
-    Generate API - for backward compatibility.
-    Uses Mistral API instead of Ollama.
-    """
-    print('*'*10, f'Generating code using model {model_name}', '*'*10)
-    # Use chat API with empty system prompt
-    return ollama_chat_api(model_name, "", prompt, seed=42)
+    """Generate API wrapper kept for backward compatibility."""
+    return ollama_chat_api(model_name or DEFAULT_OLLAMA_MODEL, "", prompt, seed=42)
 
 
 def ollama_openai_chat_api(openai_client, model_name, system_prompt, user_prompt):
-    """
-    OpenAI-compatible API - for backward compatibility.
-    Uses Mistral API instead of Ollama.
-    """
-    print('*'*10, f'Generating with {model_name}', '*'*10)
-    return ollama_chat_api(model_name, system_prompt, user_prompt, seed=42)
+    """OpenAI-compatible wrapper kept for backward compatibility."""
+    return ollama_chat_api(model_name or DEFAULT_OLLAMA_MODEL, system_prompt, user_prompt, seed=42)
 
 
 def print_model_names():
-    """
-    Mistral API không có list model như Ollama,
-    nên bạn chỉ cần gọi thủ công tên model.
-    Ví dụ: codestral-2508, codestral-latest
-    """
-    print("Available models: codestral-2508, codestral-latest")
-    
-    # Try to list Ollama models if available
-    if OLLAMA_AVAILABLE:
-        try:
-            models = ollama.list()['models']
-            print("\nOllama models (if using local Ollama):")
-            for model in models:
-                print(f"  - {model['name']}")
-        except Exception:
-            pass
+    print(f"Available model: {DEFAULT_OLLAMA_MODEL}")
 

@@ -446,6 +446,7 @@ class MutationAgent(BaseAgent):
 
         # ── 3. Mutate each function via LLM ────────────────────────────────
         mutated_functions = []
+        mutation_failure_details = []
         failed_count = 0
 
         for i, func in enumerate(selected):
@@ -453,6 +454,12 @@ class MutationAgent(BaseAgent):
             func_body = func.get("body", "")
             if not func_body.strip():
                 log.warning("skipping_empty_function", name=func_name)
+                mutation_failure_details.append({
+                    "name": func_name,
+                    "file": func.get("file", ""),
+                    "gate": "input",
+                    "reason": "empty function body",
+                })
                 failed_count += 1
                 continue
 
@@ -502,6 +509,7 @@ class MutationAgent(BaseAgent):
                 file_context=file_context,
                 strategy=effective_strategy,
                 source_file=func_file,
+                failure_details=mutation_failure_details,
             )
 
             if mutated_body is not None:
@@ -568,6 +576,7 @@ class MutationAgent(BaseAgent):
                 "success_rate": len(mutated_functions) / len(selected) * 100 if selected else 0,
                 "total_vendor_skipped": len(skipped_vendor),
             },
+            "mutation_failures": mutation_failure_details,
             "vendor_skipped_functions": skipped_vendor,
             "mutation_policy": {
                 "strategy_capabilities": _mutation_policy.capabilities_for(effective_strategy).__dict__,
@@ -838,7 +847,6 @@ class MutationAgent(BaseAgent):
                 temperature=0.1,
                 max_tokens=8192,
                 response_format="text",
-                timeout_s=120,
             )
             response = await self._ctx.llm_provider.generate(request)
             raw = re.sub(r'<think>.*?</think>', '', response.content, flags=re.DOTALL).strip()
@@ -890,10 +898,18 @@ class MutationAgent(BaseAgent):
         file_context: str = "",
         strategy: str = "strat_1",
         source_file: str = "",
+        failure_details: list | None = None,
     ) -> str | None:
         """Call LLM to mutate a single function. Returns mutated body or None."""
         if self._ctx.llm_provider is None:
             logger.warning("no_llm_provider_available")
+            if failure_details is not None:
+                failure_details.append({
+                    "name": func_name,
+                    "file": source_file,
+                    "gate": "llm_provider",
+                    "reason": "no LLM provider available",
+                })
             return None
 
         # Build mutation prompt (optimized)
@@ -1005,7 +1021,9 @@ class MutationAgent(BaseAgent):
                 _struct_rule = (
                     "NEVER add #include directives, extern declarations, forward function declarations, "
                     "global variable declarations, or typedef/struct definitions — these already exist in scope. "
-                    "ALL variable declarations must be LOCAL inside the function body."
+                    "ALL variable declarations must be LOCAL inside the function body. "
+                    "Do not wrap generated _s0/_s1 stack strings in an extra brace block if they are used later; "
+                    "declare them in the same lexical scope as every use."
                 )
             system_prompt = (f"You are a {lang_label} software protection specialist. "
                              f"{_role_desc} "
@@ -1053,6 +1071,7 @@ class MutationAgent(BaseAgent):
                     strategy=strategy, max_tokens=_max_tokens)
 
         # Retry loop
+        last_failure: dict | None = None
         for attempt in range(retry_attempts):
             try:
                 request = LLMRequest(
@@ -1061,7 +1080,6 @@ class MutationAgent(BaseAgent):
                     temperature=_temperature,
                     max_tokens=_max_tokens,
                     response_format="text",
-                    timeout_s=300,
                 )
                 response = await self._ctx.llm_provider.generate(request)
                 raw_output = response.content
@@ -1098,6 +1116,13 @@ class MutationAgent(BaseAgent):
                 if not extracted:
                     logger.warning("llm_no_code_extracted", attempt=attempt + 1,
                                    raw_len=len(raw_output), raw_start=raw_output[:200] if raw_output else "(empty)")
+                    last_failure = {
+                        "name": func_name,
+                        "file": source_file,
+                        "gate": "extract_code",
+                        "attempt": attempt + 1,
+                        "reason": "LLM response did not contain extractable code",
+                    }
                     continue
 
                 # Reject outputs that are predominantly comments/reasoning
@@ -1108,6 +1133,13 @@ class MutationAgent(BaseAgent):
                 if _code_lines and len(_comment_lines) / len(_code_lines) > 0.5:
                     logger.warning("llm_output_mostly_comments", attempt=attempt + 1,
                                    total=len(_code_lines), comments=len(_comment_lines))
+                    last_failure = {
+                        "name": func_name,
+                        "file": source_file,
+                        "gate": "extract_code",
+                        "attempt": attempt + 1,
+                        "reason": "LLM output was mostly comments/prose",
+                    }
                     continue
 
                 # Strip interleaved LLM prose from C/C++ code (reasoning text
@@ -1162,6 +1194,13 @@ class MutationAgent(BaseAgent):
                     )
                     logger.warning("mutation_validation_failed", attempt=attempt + 1,
                                    name=func_name, reason=_fail_reason[:200] if _fail_reason else "")
+                    last_failure = {
+                        "name": func_name,
+                        "file": source_file,
+                        "gate": "regex_validation",
+                        "attempt": attempt + 1,
+                        "reason": (_fail_reason or "regex validation failed")[:500],
+                    }
                     if _fail_reason and attempt + 1 < retry_attempts:
                         _feedback = (
                             f"\n\n--- PREVIOUS ATTEMPT FAILED ---\n{_fail_reason}\n"
@@ -1180,6 +1219,13 @@ class MutationAgent(BaseAgent):
                         logger.warning("mutation_ast_validation_failed", attempt=attempt + 1,
                                        name=func_name,
                                        reason=_ast_reason[:200] if _ast_reason else "")
+                        last_failure = {
+                            "name": func_name,
+                            "file": source_file,
+                            "gate": "structural_validation",
+                            "attempt": attempt + 1,
+                            "reason": (_ast_reason or "structural validation failed")[:500],
+                        }
                         if _ast_reason and attempt + 1 < retry_attempts:
                             _feedback = (
                                 f"\n\n--- PREVIOUS ATTEMPT FAILED (AST check) ---\n{_ast_reason}\n"
@@ -1196,6 +1242,13 @@ class MutationAgent(BaseAgent):
                                        attempt=attempt + 1,
                                        name=func_name,
                                        reason=_sig_reason[:200] if _sig_reason else "")
+                        last_failure = {
+                            "name": func_name,
+                            "file": source_file,
+                            "gate": "signature_validation",
+                            "attempt": attempt + 1,
+                            "reason": (_sig_reason or "signature validation failed")[:500],
+                        }
                         if _sig_reason and attempt + 1 < retry_attempts:
                             _feedback = (
                                 f"\n\n--- PREVIOUS ATTEMPT FAILED (signature type check) ---\n{_sig_reason}\n"
@@ -1221,6 +1274,13 @@ class MutationAgent(BaseAgent):
                                        attempt=attempt + 1,
                                        name=func_name,
                                        reason=_syn_feedback[:200] if _syn_feedback else "")
+                        last_failure = {
+                            "name": func_name,
+                            "file": source_file,
+                            "gate": "compiler_syntax_check",
+                            "attempt": attempt + 1,
+                            "reason": (_syn_feedback or "compiler syntax check failed")[:500],
+                        }
                         if _syn_feedback and attempt + 1 < retry_attempts:
                             _feedback = (
                                 f"\n\n--- PREVIOUS ATTEMPT FAILED (compiler check) ---\n"
@@ -1238,7 +1298,21 @@ class MutationAgent(BaseAgent):
                 logger.warning("llm_mutation_error", name=func_name,
                                error=str(e), error_type=type(e).__name__,
                                attempt=attempt + 1)
+                last_failure = {
+                    "name": func_name,
+                    "file": source_file,
+                    "gate": "exception",
+                    "attempt": attempt + 1,
+                    "reason": f"{type(e).__name__}: {str(e)}"[:500],
+                }
 
+        if failure_details is not None:
+            failure_details.append(last_failure or {
+                "name": func_name,
+                "file": source_file,
+                "gate": "unknown",
+                "reason": f"mutation failed after {retry_attempts} attempts",
+            })
         return None
 
     # ──────────────────────────────────────────────────────────────────────

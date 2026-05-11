@@ -33,7 +33,7 @@ class LLMRequest(BaseModel):
     max_tokens: int = 2048
     response_format: str = "json_object"  # enforce JSON output when supported
     seed: Optional[int] = None
-    timeout_s: int = 60
+    timeout_s: Optional[int] = None
 
 
 class LLMResponse(BaseModel):

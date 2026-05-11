@@ -78,6 +78,10 @@ _GCC_ACTIONABLE: List[re.Pattern] = [
     # Argument count wrong (mutation changed call signature)
     re.compile(r"too many arguments to (function|built-in function)", re.I),
     re.compile(r"too few arguments to (function|built-in function)", re.I),
+    # Generated stack strings/buffers escaped their scope. Limit this to bland
+    # generated names so project-specific unresolved symbols remain ignored.
+    re.compile(r"['`]_[swb]\d+['`].*(was not declared|undeclared)", re.I),
+    re.compile(r"(was not declared|undeclared identifier).*['`]_[swb]\d+['`]", re.I),
 ]
 
 _MSVC_ACTIONABLE: List[re.Pattern] = [
@@ -86,6 +90,7 @@ _MSVC_ACTIONABLE: List[re.Pattern] = [
     re.compile(r"C2106", re.I),          # '=': left operand must be l-value (void)
     re.compile(r"C2660", re.I),          # function: does not take N arguments
     re.compile(r"C2198", re.I),          # too few arguments
+    re.compile(r"C2065:\s*'_[swb]\d+'\s*:\s*undeclared identifier", re.I),
 ]
 
 # Clang messages are GCC-compatible

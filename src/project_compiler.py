@@ -3132,6 +3132,44 @@ FILE * __cdecl __iob_func(void) {
                                                         f"(was {_orig_lines}). Rejecting."
                                                     )
                                                     _write_ok = False
+
+                                            # Preserve BSD queue element typedefs.  LLM fixes for
+                                            # C2065/C2371 can accidentally delete the element typedef
+                                            # that owns TAILQ_ENTRY and then "fix" cursor variables to
+                                            # the list-head pointer type.  That compiles poorly and
+                                            # breaks TAILQ_FOREACH semantics.
+                                            if _write_ok:
+                                                _queue_typedef_removed = (
+                                                    re.search(
+                                                        r'typedef\s+struct\s+\w*\s*\{[^}]*\b(?:TAILQ_ENTRY|STAILQ_ENTRY|LIST_ENTRY|SLIST_ENTRY)\s*\(',
+                                                        source_code,
+                                                        re.DOTALL,
+                                                    )
+                                                    and not re.search(
+                                                        r'typedef\s+struct\s+\w*\s*\{[^}]*\b(?:TAILQ_ENTRY|STAILQ_ENTRY|LIST_ENTRY|SLIST_ENTRY)\s*\(',
+                                                        fixed_code,
+                                                        re.DOTALL,
+                                                    )
+                                                )
+                                                if _queue_typedef_removed:
+                                                    logger.warning(
+                                                        "      ❌ VALIDATION GATE: Fix removed a BSD queue element typedef. Rejecting."
+                                                    )
+                                                    _write_ok = False
+
+                                            if _write_ok:
+                                                _bad_queue_cursor = re.search(
+                                                    r'\b(P[A-Za-z_]\w*?_LIST)\s+([A-Za-z_]\w*)\s*=\s*(?:NULL|nullptr|0)\s*;'
+                                                    r'(?:(?!\n\s*\}).)*?\b(?:TAILQ_FOREACH|STAILQ_FOREACH|LIST_FOREACH|SLIST_FOREACH)\s*\(\s*\2\s*,',
+                                                    fixed_code,
+                                                    re.DOTALL,
+                                                )
+                                                if _bad_queue_cursor:
+                                                    logger.warning(
+                                                        "      ❌ VALIDATION GATE: Fix changed a BSD queue cursor to a list-head pointer "
+                                                        f"({_bad_queue_cursor.group(1)} {_bad_queue_cursor.group(2)}). Rejecting."
+                                                    )
+                                                    _write_ok = False
                                             
                                             if _write_ok:
                                                 # Write fixed code back

@@ -81,13 +81,12 @@ def _resolve_fixer_model() -> str:
     """
     cloud_url = os.environ.get("CLOUD_URL", "")
     if cloud_url:
-        # CLOUD_URL is set -> use a generic model name so get_llm_provider
-        # routes through OpenAICompatibleProvider instead of DeepSeek.
+        # CLOUD_URL is set -> use the configured fixer/cloud model when available.
         return (
             os.environ.get("FIXER_MODEL")
             or os.environ.get("LLM_CLOUD_MODEL")
             or os.environ.get("CLOUD_MODEL")
-            or "qwen3-coder:30b"
+            or "devstral-small-2:24b"
         )
     return "deepseek-chat"
 
@@ -124,6 +123,18 @@ class BuildValidationAgent(BaseAgent):
 
     async def handle_event(self, data: dict, claimed_state) -> None:
         """Build command data from event + state."""
+        if claimed_state and self._ctx.state_store:
+            claimed_state.variant_artifact_id = (
+                data.get("variant_artifact_id") or claimed_state.variant_artifact_id
+            )
+            claimed_state.source_artifact_id = (
+                data.get("source_artifact_id") or claimed_state.source_artifact_id
+            )
+            claimed_state.mutation_artifact_id = (
+                data.get("mutation_artifact_id") or claimed_state.mutation_artifact_id
+            )
+            await self._ctx.state_store.save(claimed_state)
+
         cmd_data = {
             "job_id": data["job_id"],
             "sample_id": data.get("sample_id", ""),
@@ -842,6 +853,13 @@ class BuildValidationAgent(BaseAgent):
             log.warning("missing_local_include_patch_failed", error=str(_li_exc))
 
         try:
+            parent_includes = self._normalize_parent_local_includes(project, log)
+            if parent_includes:
+                fix_stats["error_categories"].append("parent_local_includes_normalized")
+        except Exception as _pi_exc:
+            log.warning("parent_local_include_normalize_failed", error=str(_pi_exc))
+
+        try:
             normalized = self._normalize_generated_forward_declarations(project, log)
             if normalized:
                 fix_stats["error_categories"].append("generated_forward_decls_normalized")
@@ -891,11 +909,53 @@ class BuildValidationAgent(BaseAgent):
             log.warning("mingw_sdk_shadow_header_normalize_failed", error=str(_mw_exc))
 
         try:
+            corecrt_headers = self._normalize_missing_corecrt_headers(project, log)
+            if corecrt_headers:
+                fix_stats["error_categories"].append("corecrt_headers_normalized")
+        except Exception as _ch_exc:
+            log.warning("corecrt_header_normalize_failed", error=str(_ch_exc))
+
+        try:
             sdk_typedefs = self._normalize_sdk_typedef_redefinitions(project, log)
             if sdk_typedefs:
                 fix_stats["error_categories"].append("sdk_typedef_redefinitions_normalized")
         except Exception as _tr_exc:
             log.warning("sdk_typedef_redefinition_normalize_failed", error=str(_tr_exc))
+
+        try:
+            local_redecls = self._normalize_conflicting_local_redeclarations(project, log)
+            if local_redecls:
+                fix_stats["error_categories"].append("conflicting_local_redeclarations_removed")
+        except Exception as _lr_exc:
+            log.warning("conflicting_local_redeclaration_normalize_failed", error=str(_lr_exc))
+
+        try:
+            scoped_strings = self._normalize_generated_string_scope_blocks(project, log)
+            if scoped_strings:
+                fix_stats["error_categories"].append("generated_string_scopes_normalized")
+        except Exception as _gs_exc:
+            log.warning("generated_string_scope_normalize_failed", error=str(_gs_exc))
+
+        try:
+            win_macros = self._normalize_legacy_windows_version_macros(project, log)
+            if win_macros:
+                fix_stats["error_categories"].append("legacy_windows_macros_normalized")
+        except Exception as _wm_exc:
+            log.warning("legacy_windows_macro_normalize_failed", error=str(_wm_exc))
+
+        try:
+            nt_peb = self._normalize_nt_peb_fallback_types(project, log)
+            if nt_peb:
+                fix_stats["error_categories"].append("nt_peb_fallback_types_added")
+        except Exception as _np_exc:
+            log.warning("nt_peb_fallback_type_normalize_failed", error=str(_np_exc))
+
+        try:
+            localized_dups = self._localize_duplicate_global_symbols(project, log)
+            if localized_dups:
+                fix_stats["error_categories"].append("duplicate_global_symbols_localized")
+        except Exception as _dg_exc:
+            log.warning("duplicate_global_symbol_localize_failed", error=str(_dg_exc))
 
         _fixer_model = (fixer_model or _resolve_fixer_model()).strip()
         log.info("autofix_model_selected", model=_fixer_model)
@@ -936,6 +996,32 @@ class BuildValidationAgent(BaseAgent):
         except Exception as e:
             log.warning("compile_exception_standard", error=str(e))
             fix_stats["error_categories"].append("exception_standard")
+
+        if last_result and not getattr(last_result, "success", False):
+            try:
+                deterministic_patches = self._apply_deterministic_build_normalizers(project, log)
+                if deterministic_patches:
+                    fix_stats["error_categories"].append("post_autofix_deterministic_normalized")
+                    log.info(
+                        "compile_attempt_post_autofix_deterministic",
+                        patches=deterministic_patches,
+                    )
+                    result = compiler.compile_project(
+                        project=project,
+                        output_dir=output_dir,
+                        output_name=f"{output_name}_deterministic",
+                        max_fix_attempts=0,
+                        auto_fix=False,
+                        preserve_function_names=preserve_funcs,
+                        auto_generate_headers=auto_generate_project_headers,
+                    )
+                    last_result = result
+                    if result and result.success:
+                        log.info("compile_success_post_autofix_deterministic")
+                        fix_stats["final_error_count"] = 0
+                        return result, fix_stats
+            except Exception as _pd_exc:
+                log.warning("post_autofix_deterministic_retry_failed", error=str(_pd_exc))
 
         # Deterministic dynamic header retry: use the compiler's own missing
         # identifier diagnostics to look up SDK headers, then recompile once
@@ -2091,7 +2177,11 @@ class BuildValidationAgent(BaseAgent):
             return 0
 
         neutralized = 0
-        shadow_names = {"windows.h", "_mingw.h", "mingw.h"}
+        shadow_names = {
+            "windows.h", "_mingw.h", "mingw.h",
+            "stdio.h", "stdlib.h", "string.h", "wchar.h", "time.h",
+            "ctype.h", "stdint.h", "inttypes.h", "errno.h", "stddef.h",
+        }
         for header in list(root.rglob("*.h")):
             if header.name.lower() not in shadow_names:
                 continue
@@ -2125,6 +2215,35 @@ class BuildValidationAgent(BaseAgent):
 
         return neutralized
 
+    def _normalize_missing_corecrt_headers(self, project, log) -> int:
+        """Replace private CRT implementation headers with public CRT headers."""
+        include_re = re.compile(
+            r'^\s*#\s*include\s*[<"]corecrt_wstdio\.h[>"]\s*$',
+            re.IGNORECASE | re.MULTILINE,
+        )
+        patched = 0
+        files = list(getattr(project, "source_files", []) or []) + list(getattr(project, "header_files", []) or [])
+        for file_path in files:
+            path = Path(file_path)
+            if path.suffix.lower() not in {".h", ".hpp", ".c", ".cc", ".cpp", ".cxx"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if "corecrt_wstdio.h" not in content:
+                continue
+            new_content, count = include_re.subn("#include <stdio.h>", content)
+            if count == 0 or new_content == content:
+                continue
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info("corecrt_private_header_normalized", file=path.name, replacements=count)
+            except OSError as exc:
+                log.warning("corecrt_private_header_write_failed", file=str(path), error=str(exc))
+        return patched
+
     def _normalize_sdk_typedef_redefinitions(self, project, log) -> int:
         """
         Remove local typedef struct/union/enum definitions that redefine types
@@ -2156,8 +2275,16 @@ class BuildValidationAgent(BaseAgent):
                 continue
 
             aliases_by_match: dict[int, set[str]] = {}
+            protected_match_indexes: set[int] = set()
             all_aliases: set[str] = set()
             for idx, match in enumerate(matches):
+                block = match.group("block")
+                if re.search(r'\b(?:TAILQ_ENTRY|STAILQ_ENTRY|LIST_ENTRY|SLIST_ENTRY|TAILQ_HEAD|STAILQ_HEAD|LIST_HEAD|SLIST_HEAD)\s*\(', block):
+                    # BSD queue element/head typedefs commonly use generic names
+                    # like STRING/PSTRING that also exist in SDK headers.  They
+                    # are project-local data structures, not SDK redefinitions.
+                    protected_match_indexes.add(idx)
+                    continue
                 raw_aliases = match.group("aliases")
                 aliases = {
                     m.group(1)
@@ -2190,6 +2317,8 @@ class BuildValidationAgent(BaseAgent):
             # replacing from the end with recorded spans.
             new_content = content
             for idx, match in reversed(list(enumerate(matches))):
+                if idx in protected_match_indexes:
+                    continue
                 aliases = aliases_by_match.get(idx, set())
                 if not (aliases & sdk_aliases):
                     continue
@@ -2297,6 +2426,526 @@ class BuildValidationAgent(BaseAgent):
         if content.endswith("\n"):
             new_content += "\n"
         return new_content, removed
+
+    def _apply_deterministic_build_normalizers(self, project, log) -> int:
+        """Run build-tree deterministic normalizers and return patched file count."""
+        total = 0
+        normalizers = (
+            self._normalize_parent_local_includes,
+            self._neutralize_mingw_sdk_shadow_headers,
+            self._normalize_missing_corecrt_headers,
+            self._normalize_sdk_typedef_redefinitions,
+            self._normalize_conflicting_local_redeclarations,
+            self._normalize_bsd_queue_foreach_cursor_types,
+            self._normalize_generated_string_scope_blocks,
+            self._normalize_legacy_windows_version_macros,
+            self._normalize_nt_peb_fallback_types,
+            self._localize_duplicate_global_symbols,
+        )
+        for normalizer in normalizers:
+            try:
+                total += int(normalizer(project, log) or 0)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "deterministic_build_normalizer_failed",
+                    normalizer=getattr(normalizer, "__name__", str(normalizer)),
+                    error=str(exc),
+                )
+        return total
+
+    def _normalize_conflicting_local_redeclarations(self, project, log) -> int:
+        """Remove unused generated locals that are redeclared with a real type later.
+
+        LLM fixes sometimes inject a placeholder such as ``HANDLE String;`` at
+        the top of a function, then the original code later declares
+        ``PSTRING String = NULL;`` in the same scope.  MSVC reports C2371.  This
+        removes only the earlier declaration when the name is not used between
+        the two declarations.
+        """
+        decl_re = re.compile(
+            r'^(?P<indent>\s*)'
+            r'(?P<type>(?:const\s+)?(?:struct\s+)?[A-Za-z_]\w*(?:\s*\*)?)'
+            r'\s+(?P<name>[A-Za-z_]\w*)\s*(?:=\s*[^;]*)?;\s*$'
+        )
+        patched = 0
+
+        for src_path in getattr(project, "source_files", []) or []:
+            path = Path(src_path)
+            if path.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            lines = content.splitlines()
+            remove_indexes: set[int] = set()
+            seen_by_depth: dict[int, dict[str, tuple[int, str]]] = {}
+            brace_depth = 0
+
+            for idx, line in enumerate(lines):
+                current_depth = brace_depth
+                for depth in list(seen_by_depth):
+                    if depth > current_depth:
+                        seen_by_depth.pop(depth, None)
+
+                match = decl_re.match(line)
+                if match and current_depth > 0:
+                    name = match.group("name")
+                    typ = re.sub(r'\s+', ' ', match.group("type").replace("*", " *")).strip()
+                    seen_here = seen_by_depth.setdefault(current_depth, {})
+                    previous = seen_here.get(name)
+                    if previous and previous[1] != typ:
+                        prev_idx, _prev_type = previous
+                        between = "\n".join(lines[prev_idx + 1:idx])
+                        if not re.search(rf'\b{re.escape(name)}\b', between):
+                            remove_indexes.add(prev_idx)
+                    seen_here[name] = (idx, typ)
+
+                brace_depth += line.count('{') - line.count('}')
+
+            if not remove_indexes:
+                continue
+
+            new_lines = [line for idx, line in enumerate(lines) if idx not in remove_indexes]
+            new_content = "\n".join(new_lines)
+            if content.endswith("\n"):
+                new_content += "\n"
+            if new_content == content:
+                continue
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info(
+                    "conflicting_local_redeclarations_removed",
+                    file=path.name,
+                    removed=len(remove_indexes),
+                )
+            except OSError as exc:
+                log.warning("conflicting_local_redeclaration_write_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    def _normalize_bsd_queue_foreach_cursor_types(self, project, log) -> int:
+        """Correct BSD queue foreach cursors that were changed to list-head pointers.
+
+        For BSD-style macros, ``TAILQ_FOREACH(var, &head, field)`` expects
+        ``var`` to be an element pointer, not a pointer to the queue head.  LLM
+        fixes sometimes replace ``PNODE var`` with ``PNODE_LIST var`` after an
+        unrelated C2065, which then fails inside the macro expansion with
+        errors like ``left of '.tqe_next' must have class/struct/union``.
+        """
+        foreach_re = re.compile(
+            r'\b(?:TAILQ_FOREACH|STAILQ_FOREACH|LIST_FOREACH|SLIST_FOREACH)\s*\(\s*'
+            r'(?P<var>[A-Za-z_]\w*)\s*,',
+            re.MULTILINE,
+        )
+        decl_re_template = (
+            r'(?m)^(?P<indent>\s*)(?P<type>P[A-Za-z_]\w*?_LIST)\s+'
+            r'(?P<var>{var})\s*=\s*(?:NULL|nullptr|0)\s*;'
+        )
+        patched = 0
+
+        for src_path in getattr(project, "source_files", []) or []:
+            path = Path(src_path)
+            if path.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            new_content = content
+            fixed_vars: list[str] = []
+            for match in foreach_re.finditer(content):
+                var = match.group("var")
+                decl_re = re.compile(decl_re_template.format(var=re.escape(var)))
+                decl = decl_re.search(new_content)
+                if not decl or decl.start() > match.start():
+                    continue
+
+                list_type = decl.group("type")
+                elem_type = re.sub(r'_LIST$', '', list_type)
+                # Only rewrite if the element pointer typedef is visible in this
+                # file.  That avoids inventing project-specific type names.
+                if not re.search(rf'\b{re.escape(elem_type)}\b', new_content):
+                    continue
+
+                replacement = f"{decl.group('indent')}{elem_type} {var} = NULL;"
+                new_content = new_content[:decl.start()] + replacement + new_content[decl.end():]
+                fixed_vars.append(f"{list_type}->{elem_type} {var}")
+
+            if new_content == content:
+                continue
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info(
+                    "bsd_queue_foreach_cursor_types_normalized",
+                    file=path.name,
+                    cursors=fixed_vars[:20],
+                )
+            except OSError as exc:
+                log.warning("bsd_queue_cursor_type_write_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    def _normalize_generated_string_scope_blocks(self, project, log) -> int:
+        """Remove accidental block scopes around generated _sN string buffers.
+
+        LLM mutations sometimes emit:
+
+            {
+                char _s1[5]; ...
+            }
+            Use(_s1);
+
+        The braces make the generated buffers go out of scope, producing C2065.
+        We only unwrap simple blocks containing generated string buffer setup and
+        harmless volatile/dead-code statements, and only when the generated names
+        are referenced immediately after the block.
+        """
+        patched = 0
+        generated_decl_re = re.compile(r'\b(?:char|wchar_t|WCHAR|unsigned\s+char)\s+(_s\d+|_w\d+|_b\d+)\s*\[')
+        allowed_line_re = re.compile(
+            r'^\s*(?:'
+            r'(?:char|wchar_t|WCHAR|unsigned\s+char)\s+_[swb]\d+\s*\[[^\]]+\]\s*;.*|'
+            r'_[swb]\d+\s*\[[^\]]+\]\s*=.*;|'
+            r'for\s*\(.*_[swb]\d+.*\)\s*_[swb]\d+\s*\[[^\]]+\]\s*=.*;|'
+            r'volatile\s+(?:int|DWORD|ULONG|LONG|size_t)\s+_[A-Za-z]\w*\s*=.*;|'
+            r'int\s+_[A-Za-z]\w*\s*=.*;|'
+            r'//.*|/\*.*\*/|\s*)$'
+        )
+
+        for src_path in getattr(project, "source_files", []) or []:
+            path = Path(src_path)
+            if path.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            lines = content.splitlines()
+            remove_indexes: set[int] = set()
+            idx = 0
+            while idx < len(lines):
+                if not re.match(r'^\s*\{\s*$', lines[idx]):
+                    idx += 1
+                    continue
+
+                depth = 1
+                end = idx + 1
+                while end < len(lines) and depth > 0:
+                    depth += lines[end].count('{') - lines[end].count('}')
+                    if depth == 0:
+                        break
+                    end += 1
+                if depth != 0 or end <= idx + 1:
+                    idx += 1
+                    continue
+
+                body = lines[idx + 1:end]
+                if any(('{' in line or '}' in line) for line in body):
+                    idx += 1
+                    continue
+                declared: set[str] = set()
+                body_ok = True
+                for line in body:
+                    declared.update(generated_decl_re.findall(line))
+                    if not allowed_line_re.match(line):
+                        body_ok = False
+                        break
+                if not body_ok or not declared:
+                    idx += 1
+                    continue
+
+                following = "\n".join(lines[end + 1:min(len(lines), end + 25)])
+                if not any(re.search(rf'\b{re.escape(name)}\b', following) for name in declared):
+                    idx += 1
+                    continue
+
+                remove_indexes.add(idx)
+                remove_indexes.add(end)
+                idx = end + 1
+
+            if not remove_indexes:
+                continue
+
+            new_lines = [line for i, line in enumerate(lines) if i not in remove_indexes]
+            new_content = "\n".join(new_lines)
+            if content.endswith("\n"):
+                new_content += "\n"
+            if new_content == content:
+                continue
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info(
+                    "generated_string_scope_blocks_normalized",
+                    file=path.name,
+                    blocks=len(remove_indexes) // 2,
+                )
+            except OSError as exc:
+                log.warning("generated_string_scope_block_write_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    def _normalize_legacy_windows_version_macros(self, project, log) -> int:
+        """Raise stale Windows target macros that break modern SDK headers."""
+        patched = 0
+        macro_re = re.compile(
+            r'^(?P<prefix>\s*#\s*define\s+_WIN32_WINNT\s+)'
+            r'(?P<value>0x[0-9A-Fa-f]+|\d+)(?P<suffix>[^\r\n]*)$',
+            re.MULTILINE,
+        )
+        winver_re = re.compile(
+            r'^(?P<prefix>\s*#\s*define\s+WINVER\s+)'
+            r'(?P<value>0x[0-9A-Fa-f]+|\d+)(?P<suffix>[^\r\n]*)$',
+            re.MULTILINE,
+        )
+        ie_re = re.compile(
+            r'^(?P<prefix>\s*#\s*define\s+_WIN32_IE\s+)'
+            r'(?P<value>0x[0-9A-Fa-f]+|\d+)(?P<suffix>[^\r\n]*)$',
+            re.MULTILINE,
+        )
+        target = "0x0601"
+
+        def _value_is_low(value: str) -> bool:
+            try:
+                return int(value, 0) < int(target, 0)
+            except ValueError:
+                return False
+
+        files = list(getattr(project, "source_files", []) or []) + list(getattr(project, "header_files", []) or [])
+        for file_path in files:
+            path = Path(file_path)
+            if path.suffix.lower() not in {".h", ".hpp", ".c", ".cc", ".cpp", ".cxx"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if "_WIN32_WINNT" not in content and "#include <windows.h>" not in content and "#include \"windows.h\"" not in content:
+                continue
+
+            changed = False
+
+            def _replace_winnt(match: re.Match) -> str:
+                nonlocal changed
+                if _value_is_low(match.group("value")):
+                    changed = True
+                    return f"{match.group('prefix')}0x0601{match.group('suffix')}"
+                return match.group(0)
+
+            def _replace_winver(match: re.Match) -> str:
+                nonlocal changed
+                if _value_is_low(match.group("value")):
+                    changed = True
+                    return f"{match.group('prefix')}0x0601{match.group('suffix')}"
+                return match.group(0)
+
+            new_content = macro_re.sub(_replace_winnt, content)
+            new_content = winver_re.sub(_replace_winver, new_content)
+            if "_WIN32_WINNT" in new_content:
+                ie_match = ie_re.search(new_content)
+                if ie_match:
+                    if _value_is_low(ie_match.group("value")):
+                        new_content = ie_re.sub(
+                            lambda m: f"{m.group('prefix')}0x0601{m.group('suffix')}",
+                            new_content,
+                            count=1,
+                        )
+                        changed = True
+                elif changed:
+                    new_content = macro_re.sub(
+                        lambda m: f"{m.group(0)}\n#define WINVER 0x0601\n#define _WIN32_IE 0x0601",
+                        new_content,
+                        count=1,
+                    )
+
+            if not changed or new_content == content:
+                continue
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info("legacy_windows_version_macros_normalized", file=path.name)
+            except OSError as exc:
+                log.warning("legacy_windows_macro_write_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    def _normalize_parent_local_includes(self, project, log) -> int:
+        """Rewrite ../header.h includes when the header exists beside the file."""
+        include_re = re.compile(
+            r'^(?P<indent>\s*#\s*include\s+")(?P<prefix>(?:\.\./)+)(?P<name>[^"/<>]+\.h)(?P<quote>"\s*)$',
+            re.IGNORECASE | re.MULTILINE,
+        )
+        patched = 0
+        files = list(getattr(project, "source_files", []) or []) + list(getattr(project, "header_files", []) or [])
+        for file_path in files:
+            path = Path(file_path)
+            if path.suffix.lower() not in {".h", ".hpp", ".c", ".cc", ".cpp", ".cxx"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            replacements = 0
+
+            def _replace(match: re.Match) -> str:
+                nonlocal replacements
+                name = match.group("name")
+                if (path.parent / name).exists():
+                    replacements += 1
+                    return f'{match.group("indent")}{name}{match.group("quote")}'
+                return match.group(0)
+
+            new_content = include_re.sub(_replace, content)
+            if replacements == 0 or new_content == content:
+                continue
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info("parent_local_includes_normalized", file=path.name, replacements=replacements)
+            except OSError as exc:
+                log.warning("parent_local_include_write_failed", file=str(path), error=str(exc))
+        return patched
+
+    def _normalize_nt_peb_fallback_types(self, project, log) -> int:
+        """Add minimal nt::PEB typedefs for reflective loaders that use nt::PPEB."""
+        fallback = """
+typedef struct _PEB_LDR_DATA_FALLBACK
+{
+    ULONG Length;
+    BOOLEAN Initialized;
+    PVOID SsHandle;
+    LIST_ENTRY InLoadOrderModuleList;
+    LIST_ENTRY InMemoryOrderModuleList;
+    LIST_ENTRY InInitializationOrderModuleList;
+} PEB_LDR_DATA, *PPEB_LDR_DATA;
+
+typedef struct _PEB_FALLBACK
+{
+    BYTE Reserved1[2];
+    BYTE BeingDebugged;
+    BYTE Reserved2[1];
+    PVOID Reserved3[2];
+    PPEB_LDR_DATA Ldr;
+} PEB, *PPEB;
+
+""".lstrip()
+        patched = 0
+        for src_path in getattr(project, "source_files", []) or []:
+            path = Path(src_path)
+            if path.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if "nt::PPEB" not in content or "PPEB_LDR_DATA" in re.sub(r'nt::PPEB_LDR_DATA', '', content):
+                continue
+
+            ns_match = re.search(r'namespace\s+nt\s*\{\s*', content)
+            if not ns_match:
+                continue
+            insert_at = ns_match.end()
+            new_content = content[:insert_at] + "\n" + fallback + content[insert_at:]
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info("nt_peb_fallback_types_added", file=path.name)
+            except OSError as exc:
+                log.warning("nt_peb_fallback_type_write_failed", file=str(path), error=str(exc))
+        return patched
+
+    def _localize_duplicate_global_symbols(self, project, log) -> int:
+        """Make non-provider duplicate helper functions file-local.
+
+        This fixes link errors such as LNK2005 where a nested module carries
+        private copies of helpers also defined in the root library.  Excluding
+        the whole nested file is risky because it may define unique exports, so
+        only the duplicate helper definitions in non-provider files are made
+        static.
+        """
+        from collections import defaultdict
+
+        source_files = [
+            str(p) for p in (getattr(project, "source_files", []) or [])
+            if str(p).lower().endswith((".c", ".cc", ".cpp", ".cxx"))
+        ]
+        file_functions: dict[str, set[str]] = {}
+        for src in source_files:
+            try:
+                content = Path(src).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            funcs = ProjectCompiler._extract_global_function_defs(content)
+            if funcs:
+                file_functions[src] = funcs
+
+        func_to_files: dict[str, list[str]] = defaultdict(list)
+        for src, funcs in file_functions.items():
+            for fn in funcs:
+                if fn not in {"main", "WinMain", "DllMain", "wWinMain"}:
+                    func_to_files[fn].append(src)
+
+        duplicates = {fn: files for fn, files in func_to_files.items() if len(files) >= 2}
+        if not duplicates:
+            return 0
+
+        def _provider_score(path: str, fn: str) -> tuple[int, int, int]:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            basename = os.path.basename(path).lower()
+            entry_bonus = 1 if fn in getattr(ProjectCompiler, "_ENTRY_POINT_SYMBOLS", set()) else 0
+            return (entry_bonus, size, -len(basename))
+
+        provider_for = {fn: max(files, key=lambda p: _provider_score(p, fn)) for fn, files in duplicates.items()}
+        funcs_by_file: dict[str, set[str]] = defaultdict(set)
+        for fn, files in duplicates.items():
+            for src in files:
+                if provider_for.get(fn) != src:
+                    funcs_by_file[src].add(fn)
+
+        patched = 0
+        for src, funcs in funcs_by_file.items():
+            path = Path(src)
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            new_content = content
+            localized: list[str] = []
+            for fn in sorted(funcs, key=len, reverse=True):
+                pattern = re.compile(
+                    rf'(?m)^(?P<indent>\s*)(?!static\b|extern\b)'
+                    rf'(?P<sig>[\w\s\*\(\),]+?[\s\*]+{re.escape(fn)}\s*\([^;{{}}]*\)\s*)'
+                    rf'(?=\{{)'
+                )
+                new_content, count = pattern.subn(r'\g<indent>static \g<sig>', new_content, count=1)
+                if count:
+                    localized.append(fn)
+
+            if not localized or new_content == content:
+                continue
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info(
+                    "duplicate_global_symbols_localized",
+                    file=path.name,
+                    symbols=localized[:20],
+                )
+            except OSError as exc:
+                log.warning("duplicate_global_symbol_localize_write_failed", file=str(path), error=str(exc))
+
+        return patched
 
     def _format_detailed_error(self, error_message: str, fix_stats: dict, error_category: str) -> str:
         """Format detailed error report with fix statistics."""
