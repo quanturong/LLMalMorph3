@@ -98,7 +98,7 @@ def test_ollama_provider_returns_message_content(monkeypatch):
     monkeypatch.setattr(llm_api.requests, "post", fake_post)
 
     provider = OllamaProvider(
-        base_url="https://qxdhstvip7o8az-11434.proxy.runpod.net/",
+        base_url="https://r9wu0wuqw3guyw-11434.proxy.runpod.net/",
         api_key="",
         model="devstral-small-2:24b",
         timeout=600,
@@ -106,7 +106,7 @@ def test_ollama_provider_returns_message_content(monkeypatch):
     )
 
     assert provider.generate("system", "user", timeout=600) == "hello from ollama"
-    assert captured["url"] == "https://qxdhstvip7o8az-11434.proxy.runpod.net/api/chat"
+    assert captured["url"] == "https://r9wu0wuqw3guyw-11434.proxy.runpod.net/api/chat"
     assert captured["payload"]["model"] == "devstral-small-2:24b"
     assert captured["payload"]["options"]["temperature"] == 0.3
     assert captured["payload"]["options"]["num_ctx"] == 65536
@@ -135,13 +135,13 @@ def test_ollama_chat_api_returns_message_content(monkeypatch):
         "codestral-2508",
         "system",
         "user",
-        base_url="https://qxdhstvip7o8az-11434.proxy.runpod.net/",
+        base_url="https://r9wu0wuqw3guyw-11434.proxy.runpod.net/",
         timeout=600,
         num_ctx=65536,
     )
 
     assert text == "legacy helper ok"
-    assert captured["url"] == "https://qxdhstvip7o8az-11434.proxy.runpod.net/api/chat"
+    assert captured["url"] == "https://r9wu0wuqw3guyw-11434.proxy.runpod.net/api/chat"
     assert captured["payload"]["model"] == "devstral-small-2:24b"
     assert captured["payload"]["stream"] is False
     assert captured["payload"]["options"]["num_ctx"] == 65536

@@ -121,3 +121,32 @@ void f()
     text = src.read_text(encoding="utf-8")
     assert "typedef struct string_" in text
     assert "} STRING, * PSTRING;" in text
+
+
+def test_extra_file_scope_closing_brace_removed(tmp_path):
+    src = tmp_path / "dcc.cpp"
+    src.write_text(
+        """
+DWORD WINAPI FirstThread(LPVOID param)
+{
+    while (1) {
+        break;
+    }
+}
+}
+
+DWORD WINAPI NextThread(LPVOID param)
+{
+    return 0;
+}
+""".lstrip(),
+        encoding="utf-8",
+    )
+    project = SimpleNamespace(source_files=[str(src)], header_files=[], root_dir=str(tmp_path))
+    agent = BuildValidationAgent.__new__(BuildValidationAgent)
+
+    assert agent._normalize_extra_file_scope_closing_braces(project, _Log()) == 1
+    text = src.read_text(encoding="utf-8")
+    assert sum(1 for line in text.splitlines() if line.strip() == "}") == 3
+    assert "DWORD WINAPI FirstThread" in text
+    assert "DWORD WINAPI NextThread" in text

@@ -96,6 +96,36 @@ def _load_win32_knowledge() -> dict:
     except (FileNotFoundError, json.JSONDecodeError) as e:
         logger.warning(f"Could not load win32_knowledge.json: {e}. Using empty tables.")
         _win32_knowledge_cache = {}
+    # Built-in fallback for common Win32 import libraries.  The external JSON is
+    # preferred when present, but production runs should still be able to repair
+    # linker-only failures on a fresh checkout.
+    fallback_symbol_to_lib = {
+        # URLMon
+        "URLDownloadToFile": "urlmon.lib",
+        "URLDownloadToFileA": "urlmon.lib",
+        "URLDownloadToFileW": "urlmon.lib",
+        "URLDownloadToCacheFile": "urlmon.lib",
+        "URLDownloadToCacheFileA": "urlmon.lib",
+        "URLDownloadToCacheFileW": "urlmon.lib",
+        # RPC / UUID
+        "UuidCreate": "rpcrt4.lib",
+        "UuidToStringA": "rpcrt4.lib",
+        "UuidToStringW": "rpcrt4.lib",
+        "RpcStringFreeA": "rpcrt4.lib",
+        "RpcStringFreeW": "rpcrt4.lib",
+        # Debug Help
+        "MiniDumpWriteDump": "dbghelp.lib",
+        "SymInitialize": "dbghelp.lib",
+        "SymCleanup": "dbghelp.lib",
+        # Cabinet / Setup / common shell-adjacent APIs
+        "CreateCompressor": "cabinet.lib",
+        "SetupDiGetClassDevsA": "setupapi.lib",
+        "SetupDiGetClassDevsW": "setupapi.lib",
+        "CommandLineToArgvW": "shell32.lib",
+    }
+    _win32_knowledge_cache.setdefault("symbol_to_lib", {})
+    for symbol, lib in fallback_symbol_to_lib.items():
+        _win32_knowledge_cache["symbol_to_lib"].setdefault(symbol, lib)
     return _win32_knowledge_cache
 
 
@@ -724,6 +754,122 @@ class AutoFixer:
         return None
 
     @classmethod
+    def _insert_after_preamble(cls, lines: List[str], block: str) -> None:
+        """Insert a generated declaration block after includes and top-level defines."""
+        insert_at = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if (
+                not stripped
+                or stripped.startswith("#include")
+                or stripped.startswith("#define")
+                or stripped.startswith("#pragma")
+                or stripped.startswith("//")
+                or stripped.startswith("/*")
+                or stripped.startswith("*")
+            ):
+                insert_at = i + 1
+                continue
+            break
+        lines.insert(insert_at, block.rstrip("\n"))
+
+    @classmethod
+    def _apply_nt_compat_type_fixes(cls, lines: List[str], errors: List[str]) -> int:
+        """Add conservative NT compatibility declarations for legacy Win32 C code.
+
+        These repair compiler diagnostics such as GCC's "unknown type name
+        'UNICODE_STRING'" without asking the LLM to rewrite whole files.
+        """
+        source = "\n".join(lines)
+        needed: set[str] = set()
+        for err in errors:
+            for pat in (
+                r"unknown type name\s+'([^']+)'",
+                r"unknown type name\s+([A-Za-z_]\w*)",
+                r"'([A-Za-z_]\w*)'\s+undeclared",
+                r"([A-Za-z_]\w*)\s+undeclared",
+            ):
+                m = re.search(pat, err)
+                if m:
+                    needed.add(m.group(1))
+
+        nt_symbols = {
+            "UNICODE_STRING",
+            "PUNICODE_STRING",
+            "FILE_INFORMATION_CLASS",
+            "PFILE_INFORMATION_CLASS",
+            "SYSTEM_INFORMATION_CLASS",
+            "SystemProcessesAndThreadsInformation",
+            "SystemProcessInformation",
+        }
+        if not (needed & nt_symbols):
+            return 0
+
+        if "LLMALMORPH_NT_COMPAT_TYPES" in source:
+            return 0
+
+        block = """\
+/* Auto-fix: minimal NT compatibility declarations for legacy Win32 samples. */
+#ifndef LLMALMORPH_NT_COMPAT_TYPES
+#define LLMALMORPH_NT_COMPAT_TYPES
+#ifndef OPTIONAL
+#define OPTIONAL
+#endif
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) ((NTSTATUS)(Status) >= 0)
+#endif
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR Buffer;
+} UNICODE_STRING, *PUNICODE_STRING;
+typedef enum _SYSTEM_INFORMATION_CLASS {
+    SystemProcessInformation = 5,
+    SystemProcessesAndThreadsInformation = 5
+} SYSTEM_INFORMATION_CLASS;
+typedef enum _FILE_INFORMATION_CLASS {
+    FileDirectoryInformation = 1,
+    FileFullDirectoryInformation = 2,
+    FileBothDirectoryInformation = 3
+} FILE_INFORMATION_CLASS, *PFILE_INFORMATION_CLASS;
+#endif
+"""
+        cls._insert_after_preamble(lines, block)
+        logger.info("      🔧 Pattern fix (NT compat): added UNICODE_STRING/FILE_INFORMATION_CLASS declarations")
+        return 1
+
+    @classmethod
+    def _apply_orphaned_dllmain_signature_fix(cls, lines: List[str], errors: List[str]) -> int:
+        """Restore a DllMain signature when mutation leaves only the body block."""
+        fixed = 0
+        candidate_lines: List[int] = []
+        for err in errors:
+            if "expected identifier or" not in err or "'{'" not in err:
+                continue
+            m = re.search(r"[:\(]\s*(\d+)\s*[:\)]", err)
+            if m:
+                candidate_lines.append(int(m.group(1)))
+
+        for line_num in sorted(set(candidate_lines), reverse=True):
+            idx = line_num - 1
+            if idx < 0 or idx >= len(lines) or lines[idx].strip() != "{":
+                continue
+            lookahead = "\n".join(lines[idx:min(len(lines), idx + 90)])
+            if "DLL_PROCESS_ATTACH" not in lookahead or "return TRUE" not in lookahead:
+                continue
+            if re.search(r"\bDllMain\s*\(", "\n".join(lines[max(0, idx - 8):idx])):
+                continue
+            reason_var = "fdwReason"
+            m_switch = re.search(r"\bswitch\s*\(\s*([A-Za-z_]\w*)\s*\)", lookahead)
+            if m_switch:
+                reason_var = m_switch.group(1)
+            signature = f"BOOL APIENTRY DllMain(HINSTANCE hModule, DWORD {reason_var}, LPVOID lpReserved)"
+            lines.insert(idx, signature)
+            fixed += 1
+            logger.info(f"      🔧 Pattern fix (DllMain): restored missing DllMain signature at line {line_num}")
+        return fixed
+
+    @classmethod
     def _find_function_body_start(cls, lines: List[str], usage_line: int) -> Optional[int]:
         """Return the 0-based line index just after the opening '{' of the
         function that contains *usage_line* (1-based).
@@ -1120,6 +1266,15 @@ class AutoFixer:
             logger.info(f"      \U0001f527 Pattern fix (SAL): stripped {_sal_count} SAL annotation(s) (__in/__out/__inout)")
 
         lines = source_code.split('\n')
+
+        # ── 0a. Fix deterministic Win32/NT compatibility patterns ──
+        dllmain_fixes = cls._apply_orphaned_dllmain_signature_fix(lines, errors)
+        if dllmain_fixes:
+            fixes += dllmain_fixes
+
+        nt_fixes = cls._apply_nt_compat_type_fixes(lines, errors)
+        if nt_fixes:
+            fixes += nt_fixes
 
         # ── 0. Fix C2143 "missing ';' before" errors ──
         c2143_fixes: List[Tuple[int, str]] = []  # (line_num, before_what)
@@ -1653,6 +1808,7 @@ class AutoFixer:
         # Map loaded from configs/win32_knowledge.json
         _SYMBOL_TO_LIB = _load_win32_knowledge().get('symbol_to_lib', {})
         lnk_errors: list = []
+        lnk_symbols: list[str] = []
         lnk_missing_libs: set = set()
         lnk_arch_mismatch = False
         for err in errors:
@@ -1663,6 +1819,21 @@ class AutoFixer:
             m = re.search(r'LNK20(?:19|01).*unresolved external symbol\s+(?:__imp_)?(\w+)', err)
             if m:
                 sym = m.group(1)
+                lnk_symbols.append(sym)
+                if sym in _SYMBOL_TO_LIB:
+                    lnk_missing_libs.add(_SYMBOL_TO_LIB[sym])
+                lnk_errors.append(err)
+                continue
+            # GCC/MinGW ld: undefined reference to `Symbol' or `Symbol(args...)'.
+            # Strip C++ signatures down to the candidate function/import name.
+            m = re.search(r"undefined reference to\s+[`'\"]([^`'\"]+)[`'\"]", err)
+            if m:
+                raw_sym = m.group(1).strip()
+                sym = raw_sym.split("(", 1)[0].strip()
+                sym = sym.rsplit("::", 1)[-1].lstrip("_")
+                if sym.startswith("__imp_"):
+                    sym = sym[6:]
+                lnk_symbols.append(sym)
                 if sym in _SYMBOL_TO_LIB:
                     lnk_missing_libs.add(_SYMBOL_TO_LIB[sym])
                 lnk_errors.append(err)
@@ -1675,6 +1846,46 @@ class AutoFixer:
         # Return detected libraries so callers can add them to linker flags.
         if lnk_missing_libs:
             logger.info(f"      \U0001f527 LNK diagnostic: missing libraries detected: {', '.join(sorted(lnk_missing_libs))}")
+
+        # If the current source file declares a file-local callback/helper but
+        # never defines it, add a conservative inert definition.  This repairs
+        # linker-only damage from partial samples/mutations without guessing a
+        # malware-specific implementation.
+        if lnk_symbols:
+            current_code = "\n".join(lines)
+            appended_defs: list[str] = []
+            for sym in dict.fromkeys(lnk_symbols):
+                if not re.match(r'^[A-Za-z_]\w*$', sym):
+                    continue
+                proto_re = re.compile(
+                    r'(?m)^\s*((?:static\s+)?(?:extern\s+)?[A-Za-z_][\w\s\*\&:<>,]*?)\s+'
+                    + re.escape(sym)
+                    + r'\s*\(([^;{}]*)\)\s*;'
+                )
+                proto = proto_re.search(current_code)
+                if not proto:
+                    continue
+                def_re = re.compile(r'\b' + re.escape(sym) + r'\s*\([^;{}]*\)\s*\{')
+                if def_re.search(current_code):
+                    continue
+                ret_type = " ".join(proto.group(1).split())
+                params = proto.group(2).strip()
+                return_stmt = ""
+                ret_lower = ret_type.replace("*", " * ").lower()
+                if not re.search(r'\bvoid\b', ret_lower):
+                    return_stmt = "\n    return 0;"
+                appended_defs.append(
+                    f"\n/* Auto-fix: unresolved declared helper had no local definition. */\n"
+                    f"{ret_type} {sym}({params}) {{{return_stmt}\n}}\n"
+                )
+            if appended_defs:
+                lines.append("")
+                lines.extend(appended_defs)
+                fixes += len(appended_defs)
+                logger.info(
+                    "      \U0001f527 Pattern fix (linker stubs): added %d inert helper definition(s)",
+                    len(appended_defs),
+                )
 
         if fixes > 0:
             return '\n'.join(lines), fixes, lnk_missing_libs

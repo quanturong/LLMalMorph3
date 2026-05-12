@@ -468,6 +468,16 @@ class ProjectCompiler:
                 return p
         return None
 
+    @staticmethod
+    def _msvc_cl_path_targets_arch(cl_path: str, arch: str) -> bool:
+        """Return whether a cl.exe path is for the requested target arch."""
+        p = (cl_path or "").replace("/", "\\").lower()
+        if arch == "x64":
+            return "\\x64\\cl.exe" in p or "\\hostx86\\x64\\cl.exe" in p
+        if arch == "x86":
+            return "\\x86\\cl.exe" in p and "\\hostx86\\x64\\cl.exe" not in p
+        return True
+
     def _find_msvc(self) -> Optional[str]:
         """Find MSVC vcvarsall.bat"""
         for path in self._MSVC_SEARCH_PATHS:
@@ -585,14 +595,19 @@ class ProjectCompiler:
                             logger.info(f"⚠️  cl.exe found but INCLUDE has {len(missing)} non-existent path(s), running vcvarsall...")
                             logger.info(f"   Stale: {missing[0]}")
                         else:
-                            logger.info(f"✓ cl.exe already available in environment")
-                            self.compiler_type = 'msvc'
-                            self.msvc_env = os.environ.copy()  # Use current environment
-                            # Resolve full path to avoid CreateProcess PATH issues
                             cl_full = shutil.which('cl.exe') or 'cl.exe'
-                            compilers['c'] = cl_full
-                            compilers['cpp'] = cl_full
-                            return compilers
+                            if self._msvc_cl_path_targets_arch(cl_full, self.msvc_arch):
+                                logger.info(f"✓ cl.exe already available in environment")
+                                self.compiler_type = 'msvc'
+                                self.msvc_env = os.environ.copy()  # Use current environment
+                                # Resolve full path to avoid CreateProcess PATH issues
+                                compilers['c'] = cl_full
+                                compilers['cpp'] = cl_full
+                                return compilers
+                            logger.info(
+                                "⚠️  cl.exe in environment targets a different arch "
+                                f"({cl_full}); running vcvarsall {self.msvc_arch}..."
+                            )
                     else:
                         logger.info(f"⚠️  cl.exe found but INCLUDE not set, running vcvarsall...")
             except Exception:
@@ -770,6 +785,181 @@ class ProjectCompiler:
         """Add library to link"""
         if lib not in self.libraries:
             self.libraries.append(lib)
+
+    @staticmethod
+    def _discover_local_link_inputs(project, suffixes: tuple[str, ...]) -> list[str]:
+        """Return local linker inputs (.lib/.a/.o/.obj) shipped with a project."""
+        candidates: list[str] = []
+        for attr in ("other_files", "build_files"):
+            candidates.extend(getattr(project, attr, []) or [])
+
+        root_dir = getattr(project, "root_dir", "")
+        if root_dir and os.path.isdir(root_dir):
+            try:
+                for entry in os.listdir(root_dir):
+                    candidates.append(os.path.join(root_dir, entry))
+            except OSError:
+                pass
+
+        seen: set[str] = set()
+        local_inputs: list[str] = []
+        for item in candidates:
+            if not item:
+                continue
+            path = os.path.abspath(str(item))
+            if path in seen or not os.path.isfile(path):
+                continue
+            if path.lower().endswith(suffixes):
+                seen.add(path)
+                local_inputs.append(path)
+        return local_inputs
+
+    @staticmethod
+    def _coff_machine_type(path: str) -> Optional[str]:
+        """Best-effort COFF machine detector for local .lib/.obj inputs."""
+        machine_map = {
+            0x014C: "x86",
+            0x8664: "x64",
+            0x01C0: "arm",
+            0xAA64: "arm64",
+        }
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read(8192)
+        except OSError:
+            return None
+
+        # COFF object starts directly with IMAGE_FILE_HEADER.Machine.
+        if len(data) >= 2:
+            machine = int.from_bytes(data[:2], "little")
+            if machine in machine_map:
+                return machine_map[machine]
+
+        # Import/static libraries are archives.  Member headers are 60 bytes
+        # after the global magic; the first linker member starts with symbol
+        # table bytes, but later object/import members carry a COFF header.
+        if not data.startswith(b"!<arch>\n"):
+            return None
+        offset = 8
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                offset = 8
+                while offset + 60 <= size:
+                    fh.seek(offset)
+                    header = fh.read(60)
+                    if len(header) < 60 or header[58:60] != b"`\n":
+                        break
+                    try:
+                        member_size = int(header[48:58].decode("ascii", errors="ignore").strip() or "0")
+                    except ValueError:
+                        break
+                    member_start = offset + 60
+                    fh.seek(member_start)
+                    member_head = fh.read(min(member_size, 32))
+                    if len(member_head) >= 2:
+                        machine = int.from_bytes(member_head[:2], "little")
+                        if machine in machine_map:
+                            return machine_map[machine]
+                    offset = member_start + member_size + (member_size % 2)
+        except OSError:
+            return None
+        return None
+
+    @classmethod
+    def _detect_local_link_arch(cls, project) -> Optional[str]:
+        """Infer required MSVC architecture from local .lib/.obj dependencies."""
+        counts: dict[str, int] = {}
+        for path in cls._discover_local_link_inputs(project, (".lib", ".obj")):
+            arch = cls._coff_machine_type(path)
+            if arch in ("x86", "x64"):
+                counts[arch] = counts.get(arch, 0) + 1
+        if not counts:
+            return None
+        return max(counts, key=counts.get)
+
+    def _normalize_link_library_name(self, lib: str) -> str:
+        """Normalize a linker library name for the active compiler."""
+        lib = str(lib).strip()
+        if not lib:
+            return lib
+        base = os.path.basename(lib)
+        if self.compiler_type == "gcc":
+            if base.lower().endswith(".lib"):
+                base = base[:-4]
+            if base.lower().startswith("lib") and len(base) > 3:
+                base = base[3:]
+            return base
+        if not base.lower().endswith(".lib") and not os.path.splitext(base)[1]:
+            base += ".lib"
+        return base
+
+    def _add_link_libraries(self, libs) -> list[str]:
+        """Add libraries once, normalized for MSVC or GCC/MinGW."""
+        added: list[str] = []
+        existing = {str(x).lower() for x in self.libraries}
+        for lib in libs or []:
+            norm = self._normalize_link_library_name(lib)
+            if norm and norm.lower() not in existing:
+                self.libraries.append(norm)
+                existing.add(norm.lower())
+                added.append(norm)
+        return added
+
+    def _apply_deterministic_linker_fixes(
+        self,
+        project,
+        error_lines: list[str],
+        language: str,
+        clang_analysis=None,
+    ) -> tuple[int, list[str]]:
+        """Apply non-LLM fixes for linker-only failures."""
+        if not AUTOFIXER_AVAILABLE or not AutoFixer:
+            return 0, []
+        if not any(
+            ("undefined reference to" in e or "LNK2019" in e or "LNK2001" in e)
+            for e in error_lines
+        ):
+            return 0, []
+
+        files_fixed = 0
+        added_libs_total: list[str] = []
+        all_files = list(getattr(project, "source_files", []) or []) + list(getattr(project, "header_files", []) or [])
+        for source_file in all_files:
+            basename = os.path.basename(source_file)
+            stem = os.path.splitext(basename)[0]
+            file_errors = [
+                e for e in error_lines
+                if source_file in e
+                or re.search(r'(?:^|[\\/:\s])' + re.escape(basename) + r'[:\(]', e)
+                or re.search(r'(?:^|[\\/:\s])' + re.escape(stem) + r'\.(?:obj|o)\b', e, re.IGNORECASE)
+            ]
+            if not file_errors:
+                continue
+            try:
+                source_code = Path(source_file).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+
+            fixed_code, fix_count, lnk_libs = AutoFixer.apply_generic_pattern_fixes(
+                source_code,
+                file_errors,
+                language,
+                file_path=source_file,
+                clang_analysis=clang_analysis,
+            )
+            added = self._add_link_libraries(sorted(lnk_libs))
+            if added:
+                added_libs_total.extend(added)
+            if fix_count > 0 and fixed_code != source_code:
+                try:
+                    Path(source_file).write_text(fixed_code, encoding="utf-8")
+                    files_fixed += 1
+                except OSError:
+                    pass
+
+        return files_fixed, added_libs_total
 
     @staticmethod
     def cleanup_build_intermediates(output_dir: str, keep_exe: bool = True) -> int:
@@ -1404,25 +1594,33 @@ FILE * __cdecl __iob_func(void) {
         # Link flags
         compile_cmd.extend(self.link_flags)
         
-        # Auto-detect subsystem based on entry point
+        # Auto-detect subsystem/output mode based on entry point.  A project
+        # with DllMain but no main/WinMain is a DLL; linking it as a WINDOWS
+        # executable creates a bogus _WinMain unresolved external.
         subsystem = 'CONSOLE'
+        has_dllmain = False
+        has_exe_entry = False
         try:
             for src_file in project.source_files:
                 with open(src_file, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
-                    # Check for WinMain or DllMain => GUI/DLL subsystem
-                    if 'WinMain' in content or 'wWinMain' in content:
+                    if re.search(r'\b(?:main|wmain|WinMain|wWinMain)\s*\(', content):
+                        has_exe_entry = True
+                    if re.search(r'\bDllMain\s*\(', content):
+                        has_dllmain = True
+                    # Check for WinMain => GUI subsystem
+                    if re.search(r'\b(?:WinMain|wWinMain)\s*\(', content):
                         subsystem = 'WINDOWS'
                         logger.info(f"   Auto-detected GUI subsystem (WinMain found)")
                         break
-                    if 'DllMain' in content:
-                        subsystem = 'WINDOWS'  # DLLs need WINDOWS subsystem
-                        logger.info(f"   Auto-detected DLL subsystem (DllMain found)")
-                        break
         except Exception as e:
             logger.debug(f"   Could not auto-detect subsystem: {e}")
-        
-        compile_cmd.append(f'/SUBSYSTEM:{subsystem}')
+
+        if has_dllmain and not has_exe_entry:
+            compile_cmd.append('/DLL')
+            logger.info("   Auto-detected DLL target (DllMain without executable entry) → /DLL")
+        else:
+            compile_cmd.append(f'/SUBSYSTEM:{subsystem}')
         
         # Auto-detect UNICODE mode and additional required libraries
         additional_libs = set()
@@ -1722,18 +1920,33 @@ FILE * __cdecl __iob_func(void) {
             except Exception as e:
                 logger.debug(f"   vcpkg detection error: {e}")
         
-        # Add /LIBPATH for directories containing .lib files in the project
+        # Add /LIBPATH for directories containing .lib files in the project,
+        # and pass the libraries themselves to the linker.  Merely adding the
+        # directory is not enough for local static/import libs such as
+        # detours.lib; the linker only searches for libraries named on the
+        # command line.
+        local_libs = self._discover_local_link_inputs(project, ('.lib',))
+        if local_libs:
+            logger.info(
+                "   Local project libraries: %s",
+                ', '.join(os.path.basename(p) for p in local_libs[:10]),
+            )
+
         lib_dirs_added = set()
-        for other_file in getattr(project, 'other_files', []):
-            if other_file.lower().endswith('.lib'):
-                lib_dir = os.path.dirname(other_file)
-                if lib_dir and lib_dir not in lib_dirs_added:
-                    lib_dirs_added.add(lib_dir)
-                    compile_cmd.append(f'/LIBPATH:{lib_dir}')
-                    logger.info(f"   Added /LIBPATH:{lib_dir}")
+        for lib_path in local_libs:
+            lib_dir = os.path.dirname(lib_path)
+            if lib_dir and lib_dir not in lib_dirs_added:
+                lib_dirs_added.add(lib_dir)
+                compile_cmd.append(f'/LIBPATH:{lib_dir}')
+                logger.info(f"   Added /LIBPATH:{lib_dir}")
         # Always add project root as library search path
         if project.root_dir not in lib_dirs_added:
             compile_cmd.append(f'/LIBPATH:{project.root_dir}')
+
+        for lib_path in local_libs:
+            lib_name = os.path.basename(lib_path)
+            if lib_name.lower() not in {str(x).lower() for x in compile_cmd}:
+                compile_cmd.append(lib_name)
         
         # Log command
         logger.info(f"\n📝 MSVC Compilation command:")
@@ -1833,6 +2046,11 @@ FILE * __cdecl __iob_func(void) {
         
         # Link flags
         compile_cmd.extend(self.link_flags)
+
+        # Local static/import libraries and prebuilt objects.
+        for link_input in self._discover_local_link_inputs(project, ('.a', '.lib', '.o', '.obj')):
+            if link_input not in compile_cmd:
+                compile_cmd.append(link_input)
         
         # Libraries
         for lib in self.libraries:
@@ -2064,9 +2282,23 @@ FILE * __cdecl __iob_func(void) {
         if custom_ntdll:
             logger.info(f"   Project has custom ntdll.h (may conflict with SDK)")
 
-        # NOTE: We always use x64 compilation even for projects originally targeting x86.
-        # Modern MSVC 2022 x64 builds are compatible with most old x86 code patterns,
-        # and switching arch at runtime requires re-resolving cl.exe path which is fragile.
+        # Local prebuilt libraries/objects are authoritative for MSVC arch.  If
+        # the project ships an x64 .lib but the agent defaulted to x86, cl/link
+        # will fail later with LNK4272 and unresolved externals.  Switch before
+        # building the command so this works for any sample with bundled libs.
+        if self.compiler_type == 'msvc':
+            local_link_arch = self._detect_local_link_arch(project)
+            if local_link_arch and local_link_arch != self.msvc_arch:
+                logger.info(
+                    "   Local linker inputs require %s; switching MSVC arch from %s",
+                    local_link_arch,
+                    self.msvc_arch,
+                )
+                self.msvc_arch = local_link_arch
+                self.compiler = self._find_compiler('msvc')
+                compiler_cmd = self.compiler['cpp'] if language == 'cpp' else self.compiler['c']
+                self._last_compiler_exe = compiler_cmd
+
         self._project_msvc_env = self.msvc_env
 
         # Rebuild compile_flags per-project to avoid accumulation
@@ -2316,6 +2548,8 @@ FILE * __cdecl __iob_func(void) {
                     _saved_env = self.msvc_env
                     _saved_compiler = self.compiler
                     _saved_flags = list(self.compile_flags)
+                    _saved_link_flags = list(self.link_flags)
+                    _saved_libraries = list(self.libraries)
 
                     try:
                         self.compiler = self._find_compiler(_other_type)
@@ -2357,18 +2591,24 @@ FILE * __cdecl __iob_func(void) {
                                 self.msvc_env = _saved_env
                                 self.compiler = _saved_compiler
                                 self.compile_flags = _saved_flags
+                                self.link_flags = _saved_link_flags
+                                self.libraries = _saved_libraries
                         else:
                             # Couldn't switch, restore
                             self.compiler_type = _saved_type
                             self.msvc_env = _saved_env
                             self.compiler = _saved_compiler
                             self.compile_flags = _saved_flags
+                            self.link_flags = _saved_link_flags
+                            self.libraries = _saved_libraries
                     except Exception as smart_exc:
                         logger.debug(f"   Smart compiler check failed: {smart_exc}")
                         self.compiler_type = _saved_type
                         self.msvc_env = _saved_env
                         self.compiler = _saved_compiler
                         self.compile_flags = _saved_flags
+                        self.link_flags = _saved_link_flags
+                        self.libraries = _saved_libraries
 
         # Build compilation command — branch on compiler type
         if self.compiler_type == 'msvc':
@@ -2749,6 +2989,27 @@ FILE * __cdecl __iob_func(void) {
                                 logger.warning(f"\n⚠️  Project requires WDK/ATL/DirectX headers ({_unfixable_count}/{total_errors} unfixable errors)")
                                 logger.warning(f"   These headers are not available in MinGW. Skipping fix attempts.")
                                 break
+
+                        det_files_fixed, det_added_libs = self._apply_deterministic_linker_fixes(
+                            project,
+                            all_error_lines,
+                            language,
+                            clang_analysis=clang_analysis,
+                        )
+                        if det_files_fixed or det_added_libs:
+                            for lib in det_added_libs:
+                                if self.compiler_type == "gcc":
+                                    lib_arg = f"-l{lib}"
+                                    if lib_arg not in compile_cmd:
+                                        compile_cmd.append(lib_arg)
+                                elif lib not in compile_cmd:
+                                    compile_cmd.append(lib)
+                            logger.info(
+                                "   ✓ Deterministic linker fixes: %d file(s), libs=%s; retrying compilation...",
+                                det_files_fixed,
+                                ", ".join(det_added_libs) if det_added_libs else "none",
+                            )
+                            continue
                         
                         # Use LLM-powered fixer if available
                         if llm_fixer:
@@ -2790,6 +3051,7 @@ FILE * __cdecl __iob_func(void) {
                             # Fix each source file that has errors
                             files_fixed = 0
                             files_skipped_too_large = 0
+                            linker_inputs_changed = False
                             _was_force_vla = getattr(self, '_force_pattern_only_fix', False)
                             
                             # Track previous errors per file for feedback to LLM
@@ -2957,10 +3219,10 @@ FILE * __cdecl __iob_func(void) {
                                             logger.info(f"      ✓ Generic pattern fixes applied: {pattern_fix_count} fix(es)")
                                         # Add missing libraries detected from LNK errors
                                         if lnk_libs:
-                                            new_libs = lnk_libs - set(self.libraries)
-                                            if new_libs:
-                                                self.libraries.extend(sorted(new_libs))
-                                                logger.info(f"      ✓ Added linker libraries: {', '.join(sorted(new_libs))}")
+                                            added_libs = self._add_link_libraries(sorted(lnk_libs))
+                                            if added_libs:
+                                                linker_inputs_changed = True
+                                                logger.info(f"      ✓ Added linker libraries: {', '.join(added_libs)}")
 
                                         # Legacy VLA detection (for the skip-LLM logic below)
                                         # Note: VLA defines may already be added by apply_generic_pattern_fixes above.
@@ -3209,12 +3471,21 @@ FILE * __cdecl __iob_func(void) {
                                     except Exception as e:
                                         logger.error(f"      ❌ Error: {e}")
                             
-                            if files_fixed > 0:
+                            if files_fixed > 0 or linker_inputs_changed:
                                 # Clear VLA-only flag after it's been used for one retry pass
                                 if _was_force_vla:
                                     self._force_pattern_only_fix = False
                                     logger.info(f"   ✓ Pattern-only retry complete, resuming normal mode")
-                                logger.info(f"   ✓ Fixed {files_fixed} file(s), retrying compilation...")
+                                if compilation_attempt >= max_compilation_attempts:
+                                    max_compilation_attempts += 1
+                                    logger.info(
+                                        "   ↺ Successful fix applied on final attempt; "
+                                        "granting one verification/re-fix compile pass"
+                                    )
+                                if linker_inputs_changed and files_fixed == 0:
+                                    logger.info(f"   ✓ Updated linker inputs, retrying compilation...")
+                                else:
+                                    logger.info(f"   ✓ Fixed {files_fixed} file(s), retrying compilation...")
                             elif files_skipped_too_large > 0:
                                 logger.warning(f"   ⚠️  {files_skipped_too_large} file(s) too large for LLM fix")
                                 logger.info(f"   💡 Trying pattern-based fixer as fallback...")

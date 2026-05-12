@@ -370,6 +370,24 @@ class BuildValidationAgent(BaseAgent):
                         log.info("rollback_retry_start", rolled_back=rolled_back)
                         _fixer_model = self._fixer_model or _resolve_fixer_model()
                         try:
+                            post_rollback_patches = self._apply_deterministic_build_normalizers(
+                                project_obj,
+                                log,
+                            )
+                            if post_rollback_patches:
+                                fix_stats.setdefault("error_categories", []).append(
+                                    "rollback_deterministic_normalized"
+                                )
+                                log.info(
+                                    "rollback_deterministic_normalized",
+                                    patches=post_rollback_patches,
+                                )
+                        except Exception as _rb_norm_exc:  # noqa: BLE001
+                            log.warning(
+                                "rollback_deterministic_normalize_failed",
+                                error=str(_rb_norm_exc),
+                            )
+                        try:
                             rb_result = await loop.run_in_executor(
                                 None,
                                 lambda: _run_compile_project_in_process(
@@ -930,6 +948,13 @@ class BuildValidationAgent(BaseAgent):
             log.warning("conflicting_local_redeclaration_normalize_failed", error=str(_lr_exc))
 
         try:
+            extra_braces = self._normalize_extra_file_scope_closing_braces(project, log)
+            if extra_braces:
+                fix_stats["error_categories"].append("extra_file_scope_braces_removed")
+        except Exception as _eb_exc:
+            log.warning("extra_file_scope_brace_normalize_failed", error=str(_eb_exc))
+
+        try:
             scoped_strings = self._normalize_generated_string_scope_blocks(project, log)
             if scoped_strings:
                 fix_stats["error_categories"].append("generated_string_scopes_normalized")
@@ -1167,6 +1192,9 @@ class BuildValidationAgent(BaseAgent):
                             count=rolled,
                             error_files=len(error_files),
                         )
+                        post_rb_patches = self._apply_deterministic_build_normalizers(project, log)
+                        if post_rb_patches:
+                            fix_stats["error_categories"].append("targeted_rollback_deterministic_normalized")
                         try:
                             rb_missing = self._extract_missing_header_symbols(
                                 "\n".join([
@@ -2436,6 +2464,7 @@ class BuildValidationAgent(BaseAgent):
             self._normalize_missing_corecrt_headers,
             self._normalize_sdk_typedef_redefinitions,
             self._normalize_conflicting_local_redeclarations,
+            self._normalize_extra_file_scope_closing_braces,
             self._normalize_bsd_queue_foreach_cursor_types,
             self._normalize_generated_string_scope_blocks,
             self._normalize_legacy_windows_version_macros,
@@ -2523,6 +2552,83 @@ class BuildValidationAgent(BaseAgent):
                 )
             except OSError as exc:
                 log.warning("conflicting_local_redeclaration_write_failed", file=str(path), error=str(exc))
+
+        return patched
+
+    def _normalize_extra_file_scope_closing_braces(self, project, log) -> int:
+        """Remove standalone closing braces that appear at file scope.
+
+        A failed region fix can leave:
+
+            }
+            DWORD WINAPI NextThread(...)
+
+        where the first brace already closed the previous function and the
+        second one is a stray file-scope token.  That produces MSVC C2059/C2143
+        on the brace and blocks later deterministic fixes.  This pass only
+        removes a line containing a bare ``}`` when brace depth is already zero,
+        so it avoids touching valid namespace/extern/function closures.
+        """
+        patched = 0
+
+        for src_path in getattr(project, "source_files", []) or []:
+            path = Path(src_path)
+            if path.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            lines = content.splitlines()
+            remove_indexes: set[int] = set()
+            brace_depth = 0
+            in_block_comment = False
+
+            for idx, line in enumerate(lines):
+                stripped = line.strip()
+
+                if in_block_comment:
+                    if "*/" in stripped:
+                        in_block_comment = False
+                    continue
+                if stripped.startswith("/*") and "*/" not in stripped:
+                    in_block_comment = True
+                    continue
+                if stripped.startswith("#") or stripped.startswith("//"):
+                    continue
+
+                if brace_depth <= 0 and stripped == "}":
+                    remove_indexes.add(idx)
+                    continue
+
+                code = re.sub(r'"(?:[^"\\]|\\.)*"', '""', line)
+                code = re.sub(r"'(?:[^'\\]|\\.)*'", "''", code)
+                code = re.sub(r"//.*", "", code)
+                code = re.sub(r"/\*.*?\*/", "", code)
+                brace_depth += code.count("{") - code.count("}")
+                if brace_depth < 0:
+                    brace_depth = 0
+
+            if not remove_indexes:
+                continue
+
+            new_lines = [line for idx, line in enumerate(lines) if idx not in remove_indexes]
+            new_content = "\n".join(new_lines)
+            if content.endswith("\n"):
+                new_content += "\n"
+            if new_content == content:
+                continue
+            try:
+                path.write_text(new_content, encoding="utf-8")
+                patched += 1
+                log.info(
+                    "extra_file_scope_closing_braces_removed",
+                    file=path.name,
+                    removed=len(remove_indexes),
+                )
+            except OSError as exc:
+                log.warning("extra_file_scope_brace_write_failed", file=str(path), error=str(exc))
 
         return patched
 

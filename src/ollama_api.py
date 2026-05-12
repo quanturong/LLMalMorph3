@@ -6,7 +6,7 @@ import requests
 
 DEFAULT_OLLAMA_BASE_URL = os.getenv(
     "OLLAMA_BASE_URL",
-    os.getenv("CLOUD_URL", "https://qxdhstvip7o8az-11434.proxy.runpod.net/"),
+    os.getenv("CLOUD_URL", "https://r9wu0wuqw3guyw-11434.proxy.runpod.net/"),
 ).rstrip("/")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", os.getenv("LLM_CLOUD_MODEL", "devstral-small-2:24b"))
 DEFAULT_OLLAMA_TIMEOUT_S = int(os.getenv("OLLAMA_TIMEOUT_S", os.getenv("LLM_REQUEST_TIMEOUT_S", "600")))

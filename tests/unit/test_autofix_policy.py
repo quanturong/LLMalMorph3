@@ -302,3 +302,52 @@ int main(void) {
     assert num_fixes >= 1
     assert "project_helpr" not in fixed
     assert "project_helper(7)" in fixed
+
+
+def test_generic_pattern_fix_adds_nt_compat_types_for_gcc_unknown_type_names():
+    source = """\
+#include <windows.h>
+#define NTSTATUS long int
+
+typedef struct _PROCESS_INFO {
+    UNICODE_STRING ImageName;
+} PROCESS_INFO;
+
+typedef NTSTATUS WINAPI (*FNtQueryDirectoryFile)(
+    HANDLE FileHandle,
+    FILE_INFORMATION_CLASS FileInformationClass,
+    PUNICODE_STRING FileName);
+"""
+    errors = [
+        "sample.c:5:5: error: unknown type name 'UNICODE_STRING'",
+        "sample.c:10:5: error: unknown type name 'FILE_INFORMATION_CLASS'",
+        "sample.c:11:5: error: unknown type name 'PUNICODE_STRING'",
+    ]
+
+    fixed, num_fixes, _ = AutoFixer.apply_generic_pattern_fixes(source, errors, "c")
+
+    assert num_fixes >= 1
+    assert "LLMALMORPH_NT_COMPAT_TYPES" in fixed
+    assert "typedef struct _UNICODE_STRING" in fixed
+    assert "FileBothDirectoryInformation = 3" in fixed
+
+
+def test_generic_pattern_fix_restores_orphaned_dllmain_signature():
+    source = """\
+#include <windows.h>
+
+{
+    switch (fdwReason)
+    {
+        case DLL_PROCESS_ATTACH:
+            break;
+    }
+    return TRUE;
+}
+"""
+    errors = ["sample.c:3:1: error: expected identifier or '(' before '{' token"]
+
+    fixed, num_fixes, _ = AutoFixer.apply_generic_pattern_fixes(source, errors, "c")
+
+    assert num_fixes >= 1
+    assert "BOOL APIENTRY DllMain(HINSTANCE hModule, DWORD fdwReason, LPVOID lpReserved)" in fixed

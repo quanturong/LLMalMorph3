@@ -23,7 +23,7 @@ def mistral_generate(system_prompt, user_prompt, model="devstral-small-2:24b"):
         system_prompt,
         user_prompt,
         seed=42,
-        base_url=os.getenv("OLLAMA_BASE_URL", os.getenv("CLOUD_URL", "https://qxdhstvip7o8az-11434.proxy.runpod.net/")),
+        base_url=os.getenv("OLLAMA_BASE_URL", os.getenv("CLOUD_URL", "https://r9wu0wuqw3guyw-11434.proxy.runpod.net/")),
         timeout=int(os.getenv("OLLAMA_TIMEOUT_S", os.getenv("LLM_REQUEST_TIMEOUT_S", "600"))),
         num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "65536")),
     )
